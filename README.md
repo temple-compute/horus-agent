@@ -15,8 +15,10 @@ The target, kind `agent`, works like the SSH target. Each channel primitive (`la
 
 The machine needs Python 3.13 or newer. `uv` downloads it if it is missing.
 
+horus-agent is licensed, not published on PyPI. Install a tagged release from this repository, which needs read access to it:
+
 ```sh
-uv tool install horus-agent
+uv tool install git+https://github.com/temple-compute/horus-agent.git@v0.1.0
 horus-agent register --url https://api.example.com/api/v1 --token <one-time token>
 horus-agent run
 ```
