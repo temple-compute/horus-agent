@@ -83,6 +83,10 @@ class OpRunner:
 
     def __init__(self) -> None:
         """Start with no answered ops and no tracked runs."""
+        # macOS tar adds an AppleDouble "._<name>" file per file it packs
+        # (extended attributes), which then show up as extra items in folder
+        # artifacts. Every command the agent runs inherits this.
+        os.environ.setdefault("COPYFILE_DISABLE", "1")
         self._local = LocalTarget()
         self._answered: OrderedDict[str, OpResult] = OrderedDict()
         self._running: dict[str, asyncio.Task[OpResult]] = {}
