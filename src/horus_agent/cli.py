@@ -18,7 +18,7 @@ import sys
 
 import httpx
 
-from horus_agent import config
+from horus_agent import config, logs
 from horus_agent.daemon import Agent, AgentUnauthorizedError, agent_version
 from horus_agent.protocol import Registration
 
@@ -95,9 +95,18 @@ def main(argv: list[str] | None = None) -> int:
         description="Run Horus tasks on this machine without opening "
         "inbound connections.",
     )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--debug",
+        action="store_true",
+        help="Log every connection, request, op and command (also: "
+        f"{logs.DEBUG_ENV}=1). Secret values are never logged.",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     register = commands.add_parser(
-        "register", help="Register this machine with a one-time token."
+        "register",
+        parents=[common],
+        help="Register this machine with a one-time token.",
     )
     register.add_argument("--url", required=True, help="Broker API URL.")
     register.add_argument(
@@ -108,8 +117,11 @@ def main(argv: list[str] | None = None) -> int:
         default=socket.gethostname(),
         help="Agent name, used as the target's 'agent' field.",
     )
-    commands.add_parser("run", help="Poll for work until stopped.")
+    commands.add_parser(
+        "run", parents=[common], help="Poll for work until stopped."
+    )
     args = parser.parse_args(argv)
+    logs.setup(args.debug)
     if args.command == "register":
         return _register(args.url, args.token, args.name)
     return asyncio.run(_run())

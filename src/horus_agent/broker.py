@@ -21,7 +21,9 @@ from horus_runtime.core.task.exceptions import (
     TargetLostError,
     TaskExecutionError,
 )
+from horus_runtime.logging import horus_logger
 
+from horus_agent.logs import describe_args
 from horus_agent.protocol import (
     IDEMPOTENT_METHODS,
     POLL_WAIT_S,
@@ -78,8 +80,12 @@ class BrokerClient:
             TaskExecutionError: The op failed on the agent, or the broker
                 refused or stayed unreachable.
         """
+        log = horus_logger.log
+        started = time.monotonic()
         while True:
             op = Op(op_id=uuid4().hex, method=method, args=args)
+            tag = f"Op {op.op_id[:8]} {method} on agent {agent!r}"
+            log.debug(f"{tag}: submit {describe_args(args)}")
             status = await self._request(
                 "POST",
                 "agents/ops/",
@@ -93,6 +99,9 @@ class BrokerClient:
                         f"Agent {agent!r} is offline (last seen: "
                         f"{'never' if seen is None else f'{seen:.0f}s ago'})"
                     )
+                log.debug(
+                    f"{tag}: waiting (agent last polled {seen:.0f}s ago)"
+                )
                 status = await self._request(
                     "GET",
                     f"agents/ops/{op.op_id}",
@@ -105,6 +114,11 @@ class BrokerClient:
                 raise TargetLostError(
                     f"Agent {agent!r} restarted while running {method}"
                 )
+            log.debug(f"{tag}: lost on the way; sending it again")
+        log.debug(
+            f"{tag}: {'failed' if status.error else 'done'} after "
+            f"{time.monotonic() - started:.2f}s"
+        )
         if status.error is not None:
             raise TaskExecutionError(
                 f"{method} on agent {agent!r} failed: "

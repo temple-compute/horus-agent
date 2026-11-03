@@ -14,14 +14,18 @@ Every connection goes out from this machine; nothing listens on it.
 import asyncio
 import contextlib
 import importlib.metadata
+import os
+import platform
 import random
 import socket
+import time
 from uuid import uuid4
 
 import httpx
 from horus_runtime.logging import horus_logger
 
 from horus_agent.config import AgentConfig
+from horus_agent.logs import describe_args, describe_result
 from horus_agent.ops import OpRunner
 from horus_agent.protocol import POLL_WAIT_S, Op, OpResult
 
@@ -80,6 +84,14 @@ class Agent:
         """
         results: asyncio.Queue[OpResult] = asyncio.Queue()
         running: set[asyncio.Task[None]] = set()
+        log = horus_logger.log
+        log.debug(
+            f"Agent {self.config.name!r} (id {self.config.agent_id}) "
+            f"version {agent_version()}, session {self.session}, pid "
+            f"{os.getpid()}, user uid {os.getuid()}, host "
+            f"{socket.gethostname()}, {platform.platform()}, Python "
+            f"{platform.python_version()}, cwd {os.getcwd()}"
+        )
         async with httpx.AsyncClient(
             base_url=self.config.url.rstrip("/") + "/",
             headers={"Authorization": f"Bearer {self.config.token}"},
@@ -89,10 +101,15 @@ class Agent:
             try:
                 await self._poll_loop(http, stop, results, running)
             finally:
+                log.debug(
+                    f"Stopping: {len(running)} ops still running, "
+                    f"{results.qsize()} results to deliver"
+                )
                 if running:
                     await asyncio.gather(*running, return_exceptions=True)
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(results.join(), DRAIN_TIMEOUT_S)
+                log.debug(f"Stopped; {results.qsize()} results undelivered")
                 sender.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await sender
@@ -113,12 +130,19 @@ class Agent:
         horus_logger.log.info(
             f"Agent {self.config.name!r} polling {self.config.url}"
         )
+        log = horus_logger.log
         while not stop.is_set():
             if len(self.holding) >= MAX_HOLDING:
                 # Finish some work first; the broker caps the list.
+                log.debug(f"Holding {len(self.holding)} ops; not polling")
                 await _pause(stop, 0.5)
                 continue
             body["holding"] = sorted(self.holding)
+            log.debug(
+                f"Poll: waiting up to {POLL_WAIT_S}s for ops, holding "
+                f"{len(self.holding)}"
+            )
+            started = time.monotonic()
             poll = asyncio.create_task(http.post("agents/me/poll", json=body))
             stopping = asyncio.create_task(stop.wait())
             await asyncio.wait(
@@ -140,8 +164,16 @@ class Agent:
                     )
                 if response.status_code < 400:
                     delay = 1.0
-                    if response.status_code == 200:
-                        for raw in response.json()["ops"]:
+                    waited = time.monotonic() - started
+                    if response.status_code != 200:
+                        log.debug(
+                            f"Poll: no ops (HTTP {response.status_code}) "
+                            f"after {waited:.1f}s"
+                        )
+                    else:
+                        ops = response.json()["ops"]
+                        log.debug(f"Poll: {len(ops)} ops after {waited:.1f}s")
+                        for raw in ops:
                             op = Op.model_validate(raw)
                             self.holding.add(op.op_id)
                             task = asyncio.create_task(
@@ -158,12 +190,23 @@ class Agent:
             delay = min(delay * 2, BACKOFF_MAX_S)
 
     async def _run_one(self, op: Op, results: asyncio.Queue[OpResult]) -> None:
+        log = horus_logger.log
+        tag = f"Op {op.op_id[:8]} {op.method}"
+        log.debug(f"{tag} start (run {op.run_id}): {describe_args(op.args)}")
+        started = time.monotonic()
         result = await self.runner.run(op)
+        took = time.monotonic() - started
         if result.error is not None:
             # Only the method and error: args carry task secrets in env.
             horus_logger.log.warning(
                 f"{op.method} failed: {result.error.type}: "
                 f"{result.error.message}"
+            )
+            log.debug(f"{tag} failed after {took:.2f}s")
+        else:
+            log.debug(
+                f"{tag} done in {took:.2f}s: "
+                f"{describe_result(op.method, result.result)}"
             )
         await results.put(result)
 
@@ -177,6 +220,10 @@ class Agent:
             while not results.empty() and size < MAX_BATCH_BYTES:
                 batch.append(results.get_nowait())
                 size += len(batch[-1].model_dump_json())
+            horus_logger.log.debug(
+                f"Results: posting {len(batch)} ({size} bytes): "
+                f"{', '.join(r.op_id[:8] for r in batch)}"
+            )
             await self._post_results(http, batch)
             for result in batch:
                 self.holding.discard(result.op_id)
@@ -202,6 +249,9 @@ class Agent:
             else:
                 code = response.status_code
                 if code < 400:
+                    horus_logger.log.debug(
+                        f"Results: delivered {len(batch)} (HTTP {code})"
+                    )
                     return
                 # 401 is retried: the poll loop stops the agent on it.
                 if code < 500 and code != 401:

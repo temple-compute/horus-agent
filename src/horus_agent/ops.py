@@ -21,8 +21,10 @@ from typing import Any
 
 from horus_builtin.target.local import LocalTarget
 from horus_runtime.core.target.channel import JobHandle
+from horus_runtime.logging import horus_logger
 
 from horus_agent import blobs
+from horus_agent.logs import safe_url
 from horus_agent.protocol import (
     INLINE_LIMIT,
     Op,
@@ -62,6 +64,7 @@ def _output(name: str, data: bytes) -> dict[str, str]:
     fd, path = tempfile.mkstemp(prefix=f"horus-agent-{name}-")
     with os.fdopen(fd, "wb") as fh:
         fh.write(data)
+    horus_logger.log.debug(f"{name} is {len(data)} bytes; spilled to {path}")
     return {f"{name}_file": path}
 
 
@@ -94,9 +97,16 @@ class OpRunner:
         was lost on the way back) gets the first run's answer.
         """
         if op.op_id in self._answered:
+            horus_logger.log.debug(
+                f"Op {op.op_id[:8]} delivered again; answering from cache"
+            )
             return self._answered[op.op_id]
         task = self._running.get(op.op_id)
-        if task is None:
+        if task is not None:
+            horus_logger.log.debug(
+                f"Op {op.op_id[:8]} delivered again while running; joining it"
+            )
+        else:
             task = asyncio.create_task(self._run(op))
             self._running[op.op_id] = task
         try:
@@ -131,6 +141,10 @@ class OpRunner:
                     JobHandle(pid=args["pid"], job_dir=args["job_dir"])
                 )
                 if code is not None:
+                    horus_logger.log.debug(
+                        f"Job pid {args['pid']} in {args['job_dir']} exited "
+                        f"with {code}"
+                    )
                     for jobs in self._run_jobs.values():
                         jobs.pop(args["job_dir"], None)
                 return code
@@ -194,9 +208,16 @@ class OpRunner:
         env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         _check_env(env)
+        horus_logger.log.debug(
+            f"exec in {cwd or os.getcwd()}: {safe_url(cmd)}"
+        )
         proc = await self._local.run_command_sync(cmd, cwd=cwd, env=env)
         out, err = await proc.communicate()
         returncode = await proc.wait()
+        horus_logger.log.debug(
+            f"exec exited {returncode}: {len(out)} bytes stdout, "
+            f"{len(err)} bytes stderr"
+        )
         return {
             "returncode": returncode,
             **_output("stdout", out),
@@ -213,18 +234,26 @@ class OpRunner:
     ) -> dict[str, Any]:
         _check_env(env)
         pid_file = _path(job_dir) / "pid"
+        log = horus_logger.log
         if pid_file.exists():
             # An earlier delivery of this launch already started the job.
             pid = int(pid_file.read_text().strip())
+            log.debug(f"Job in {job_dir} already started as pid {pid}")
         else:
+            log.debug(
+                f"launch in {cwd or os.getcwd()} (job {job_dir}): "
+                f"{safe_url(cmd)}"
+            )
             handle = await self._local.launch(
                 cmd, cwd=cwd, env=env, job_dir=job_dir
             )
             pid = int(handle.pid or 0)
         if run_id is not None:
             with contextlib.suppress(ProcessLookupError):
-                self._run_jobs.setdefault(run_id, {})[job_dir] = os.getpgid(
-                    pid
+                pgid = os.getpgid(pid)
+                self._run_jobs.setdefault(run_id, {})[job_dir] = pgid
+                log.debug(
+                    f"Job pid {pid} (group {pgid}) belongs to run {run_id}"
                 )
         return {"pid": pid}
 
@@ -250,11 +279,16 @@ class OpRunner:
         A finished job is skipped: its process group id may since belong to
         an unrelated process.
         """
+        log = horus_logger.log
         killed = 0
         for job_dir, pgid in self._run_jobs.pop(run_id or "", {}).items():
             if (Path(job_dir) / "exit_code").exists():
+                log.debug(f"Cancel run {run_id}: {job_dir} already finished")
                 continue
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pgid, signal.SIGKILL)
                 killed += 1
+                log.debug(
+                    f"Cancel run {run_id}: killed group {pgid} ({job_dir})"
+                )
         return killed
