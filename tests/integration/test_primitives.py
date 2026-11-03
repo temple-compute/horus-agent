@@ -224,3 +224,12 @@ async def test_refused_result_batches_are_split(
     made = [str(tmp_path / f"d{i}") for i in range(4)]
     await asyncio.gather(*(target.mkdir(path) for path in made))
     assert all(Path(path).is_dir() for path in made)
+
+
+async def test_commands_run_without_macos_tar_metadata(
+    target: AgentTarget, tmp_path: Path
+) -> None:
+    proc = await target.run_command(
+        'printf %s "$COPYFILE_DISABLE"', cwd=str(tmp_path), detach=False
+    )
+    assert await proc.communicate() == (b"1", b"")
