@@ -39,6 +39,17 @@ Jobs run detached, in their own session, with their output in log files. Stoppin
 
 Proxies: the agent honours `HTTPS_PROXY`, `NO_PROXY` and `SSL_CERT_FILE`.
 
+### Debug logs
+
+`horus-agent run --debug` (or `HORUS_AGENT_DEBUG=1`) logs everything the agent does:
+- every TCP and TLS connection and HTTP request;
+- each poll, with how long it waited and how many ops it got;
+- each op with its arguments, its duration and its result;
+- every command it runs, with a preview of the output;
+- file transfers, job pids, cancels, and results delivered.
+
+Secrets stay out of the log, so it can be shared. Environment variables appear by name only, because they carry task secrets. Presigned URLs lose their query strings, which hold the signatures. Tokens are never logged.
+
 ## Use it in a workflow
 
 ```yaml
