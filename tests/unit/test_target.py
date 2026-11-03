@@ -38,8 +38,8 @@ def fake_task(executor_kind: str) -> Any:
 def test_location_and_validation(target: AgentTarget) -> None:
     assert target.location_id == "agent://lab"
     assert target.access_cost(cast(Any, None)) is None
-    with pytest.raises(ValidationError, match="absolute"):
-        AgentTarget(agent="lab", working_directory="relative")
+    with pytest.raises(ValidationError, match="cannot contain"):
+        AgentTarget(agent="lab", working_directory="a/../b")
 
 
 def test_bind_refuses_external_pickle_executor(target: AgentTarget) -> None:

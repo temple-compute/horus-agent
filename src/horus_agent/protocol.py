@@ -14,9 +14,10 @@ hands each result back to the caller waiting on it. Bytes travel base64
 encoded; anything larger than :data:`INLINE_LIMIT` goes through presigned
 staging URLs instead.
 
-A poll sends ``{"session", "version", "hostname", "holding"}``: the
-agent process's session id (new on each start) and the ids of ops it took
-but has not had an answer accepted for. The broker reports an op ``lost``
+A poll sends ``{"session", "version", "hostname", "work_dir", "holding"}``:
+the agent process's session id (new on each start), the directory tasks run
+in on its machine, and the ids of ops it took but has not had an answer
+accepted for. The broker reports an op ``lost``
 when it was delivered to an older session, or delivered before a poll
 that does not list it.
 
@@ -28,6 +29,7 @@ Route                                     Caller          Answer
 ``POST agents/ops/``                      orchestrator    ``OpStatus``
 ``GET agents/ops/{op_id}?wait=<s>``       orchestrator    ``OpStatus``
 ``POST agents/staging/``                  orchestrator    ``StagingUrls``
+``GET agents/info/{name}``                orchestrator    ``AgentInfo``
 ``POST agents/register``                  agent           ``Registration``
 ``POST agents/me/poll``                   agent           ``{"ops": [Op]}``,
                                                           or 204 when idle
@@ -134,6 +136,15 @@ class Registration(BaseModel):
     agent_id: str
     name: str
     agent_token: str
+
+
+class AgentInfo(BaseModel):
+    """What the broker knows about an agent a run targets."""
+
+    name: str
+    work_dir: str | None = None
+    """The agent's working directory, as it last reported it."""
+    online: bool = False
 
 
 def b64e(data: bytes) -> str:

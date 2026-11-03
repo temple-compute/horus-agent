@@ -11,10 +11,12 @@
 
 import argparse
 import asyncio
+import dataclasses
 import platform
 import signal
 import socket
 import sys
+from pathlib import Path
 
 import httpx
 
@@ -23,17 +25,29 @@ from horus_agent.daemon import Agent, AgentUnauthorizedError, agent_version
 from horus_agent.protocol import Registration
 
 
-def _register(url: str, token: str, name: str) -> int:
+def _work_dir(value: str | None) -> Path:
+    """*value* as an absolute path, created if missing."""
+    path = Path(value).expanduser() if value else config.default_work_dir()
+    path = path.resolve()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _register(
+    url: str, token: str, name: str | None, work_dir: str | None
+) -> int:
+    directory = _work_dir(work_dir)
+    body = {
+        "token": token,
+        "hostname": socket.gethostname(),
+        "os": platform.platform(),
+        "version": agent_version(),
+        "work_dir": str(directory),
+    }
+    if name is not None:
+        body["name"] = name
     response = httpx.post(
-        f"{url.rstrip('/')}/agents/register",
-        json={
-            "token": token,
-            "name": name,
-            "hostname": socket.gethostname(),
-            "os": platform.platform(),
-            "version": agent_version(),
-        },
-        timeout=30.0,
+        f"{url.rstrip('/')}/agents/register", json=body, timeout=30.0
     )
     if response.status_code >= 400:
         try:
@@ -50,25 +64,29 @@ def _register(url: str, token: str, name: str) -> int:
             agent_id=registration.agent_id,
             name=registration.name,
             token=registration.agent_token,
+            work_dir=str(directory),
         ),
         path,
     )
     sys.stdout.write(
         f"Registered as {registration.name!r} (config: {path}).\n"
+        f"Tasks run in {directory}.\n"
         "Start it with: horus-agent run\n"
     )
     return 0
 
 
-async def _run() -> int:
+async def _run(work_dir: str | None) -> int:
     path = config.config_path()
     try:
-        agent = Agent(config.load(path))
+        registered = config.load(path)
     except FileNotFoundError:
         sys.stderr.write(
             f"No registration at {path}. Run horus-agent register first.\n"
         )
         return 1
+    directory = _work_dir(work_dir or registered.work_dir or None)
+    agent = Agent(dataclasses.replace(registered, work_dir=str(directory)))
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -114,14 +132,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     register.add_argument(
         "--name",
-        default=socket.gethostname(),
-        help="Agent name, used as the target's 'agent' field.",
+        help="Agent name, used as the target's 'agent' field, when the "
+        "token does not set one. Default: this machine's hostname.",
     )
-    commands.add_parser(
+    work_dir_help = (
+        "Directory where tasks run on this machine, created if missing. "
+        f"Default: {config.default_work_dir()}."
+    )
+    register.add_argument("--work-dir", help=work_dir_help)
+    run = commands.add_parser(
         "run", parents=[common], help="Poll for work until stopped."
+    )
+    run.add_argument(
+        "--work-dir",
+        help="Use this directory instead of the one given at registration.",
     )
     args = parser.parse_args(argv)
     logs.setup(args.debug)
     if args.command == "register":
-        return _register(args.url, args.token, args.name)
-    return asyncio.run(_run())
+        return _register(args.url, args.token, args.name, args.work_dir)
+    return asyncio.run(_run(args.work_dir))

@@ -90,7 +90,8 @@ class Agent:
             f"version {agent_version()}, session {self.session}, pid "
             f"{os.getpid()}, user uid {os.getuid()}, host "
             f"{socket.gethostname()}, {platform.platform()}, Python "
-            f"{platform.python_version()}, cwd {os.getcwd()}"
+            f"{platform.python_version()}, cwd {os.getcwd()}, tasks run in "
+            f"{self.config.work_dir}"
         )
         async with httpx.AsyncClient(
             base_url=self.config.url.rstrip("/") + "/",
@@ -125,6 +126,7 @@ class Agent:
             "session": self.session,
             "version": agent_version(),
             "hostname": socket.gethostname(),
+            "work_dir": self.config.work_dir or None,
         }
         delay = 1.0
         horus_logger.log.info(

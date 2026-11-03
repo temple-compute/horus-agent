@@ -11,6 +11,7 @@ Config file, the CLI and the agent loop's resilience.
 
 import asyncio
 import random
+import socket
 import stat
 from pathlib import Path
 
@@ -28,6 +29,8 @@ from tests.fake_broker import REGISTRATION_TOKEN, FakeBroker
 def config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "cfg" / "agent.json"
     monkeypatch.setenv(config.CONFIG_ENV, str(path))
+    # The default work dir is under $HOME; keep it out of the real one.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     return path
 
 
@@ -64,6 +67,8 @@ def test_register_writes_config(
             REGISTRATION_TOKEN,
             "--name",
             "box",
+            "--work-dir",
+            str(config_file.parent / "work"),
         ]
     )
     assert code == 0
@@ -71,6 +76,22 @@ def test_register_writes_config(
     assert saved.name == "box"
     assert saved.token.startswith("tca_")
     assert saved.token not in capsys.readouterr().out
+    assert saved.work_dir == str(config_file.parent / "work")
+    assert Path(saved.work_dir).is_dir()
+    assert broker.work_dirs["box"] == saved.work_dir
+
+
+def test_register_defaults_to_hostname_and_home(
+    broker: FakeBroker, config_file: Path, tmp_path: Path
+) -> None:
+    del config_file
+    assert (
+        main(["register", "--url", broker.url, "--token", REGISTRATION_TOKEN])
+        == 0
+    )
+    name, work_dir = next(iter(broker.work_dirs.items()))
+    assert name == socket.gethostname()
+    assert work_dir == str(tmp_path / "home" / "horus-agent")
 
 
 def test_register_with_bad_token(

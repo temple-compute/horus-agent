@@ -45,6 +45,7 @@ class FakeBroker:
         self.results: dict[str, dict[str, Any]] = {}
         self.sessions: dict[str, str] = {}
         self.seen: dict[str, float] = {}
+        self.work_dirs: dict[str, str | None] = {}
         self.blobs: dict[str, bytes] = {}
         self.ops_seen: list[dict[str, Any]] = []
         self.fail_results = 0
@@ -159,6 +160,20 @@ def _handler(broker: FakeBroker) -> type[BaseHTTPRequestHandler]:
             if self._bearer() != RUN_TOKEN:
                 self._reply(401, {"detail": "bad token"})
                 return
+            if url.path.startswith("/agents/info/"):
+                name = url.path.removeprefix("/agents/info/")
+                if name not in broker.queues:
+                    self._reply(404, {"detail": f"No agent named {name!r}"})
+                    return
+                self._reply(
+                    200,
+                    {
+                        "name": name,
+                        "work_dir": broker.work_dirs.get(name),
+                        "online": name in broker.seen,
+                    },
+                )
+                return
             op_id = url.path.removeprefix("/agents/ops/")
             wait = float(parse_qs(url.query).get("wait", ["0"])[0])
             self._reply(200, broker.wait_status(op_id, wait))
@@ -171,12 +186,14 @@ def _handler(broker: FakeBroker) -> type[BaseHTTPRequestHandler]:
                     self._reply(401, {"detail": "Invalid or used token"})
                     return
                 token = f"tca_{uuid4().hex}"
-                broker.add_agent(body["name"], token)
+                name = body.get("name") or body["hostname"]
+                broker.add_agent(name, token)
+                broker.work_dirs[name] = body.get("work_dir")
                 self._reply(
                     201,
                     {
                         "agent_id": uuid4().hex,
-                        "name": body["name"],
+                        "name": name,
                         "agent_token": token,
                     },
                 )
@@ -224,6 +241,8 @@ def _handler(broker: FakeBroker) -> type[BaseHTTPRequestHandler]:
                     return
                 broker.sessions[agent] = body["session"]
                 broker.seen[agent] = time.time()
+                if body.get("work_dir"):
+                    broker.work_dirs[agent] = body["work_dir"]
                 deadline = time.time() + broker.max_wait
                 queue = broker.queues[agent]
                 while not queue and time.time() < deadline:

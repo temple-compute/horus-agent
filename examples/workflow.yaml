@@ -8,7 +8,6 @@ tasks:
     target:
       kind: agent
       agent: lab-server
-      working_directory: /tmp/horus
     executor:
       kind: shell
     runtime:

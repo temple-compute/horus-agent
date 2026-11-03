@@ -21,7 +21,9 @@ horus-agent register --url https://api.example.com/api/v1 --token <one-time toke
 horus-agent run
 ```
 
-`register` stores the agent's credential in `~/.config/horus-agent/agent.json` (mode 0600). To use another location, set `HORUS_AGENT_CONFIG`. `--name` sets the agent name; it defaults to the hostname.
+`register` stores the agent's credential in `~/.config/horus-agent/agent.json` (mode 0600). To use another location, set `HORUS_AGENT_CONFIG`. The agent's name comes from the token when the admin set one in the UI, else from `--name`, else the hostname.
+
+`--work-dir PATH` sets where tasks run on this machine; the default is `~/horus-agent`. It is created if missing, stored in the config, and reported to the broker, so workflows do not set it. `horus-agent run --work-dir PATH` overrides it for one run.
 
 ### Keep it running
 
@@ -55,8 +57,7 @@ Secrets stay out of the log, so it can be shared. Environment variables appear b
 ```yaml
 target:
   kind: agent
-  agent: lab-server          # the name the agent registered with
-  working_directory: /scratch/horus
+  agent: lab-server          # the agent's name
 ```
 
 Slurm on the agent's machine:
@@ -67,13 +68,12 @@ target:
   inner:
     kind: agent
     agent: hpc-login
-    working_directory: /scratch/horus
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
 | `agent` | required | Agent name |
-| `working_directory` | required | Absolute base directory on the agent's machine |
+| `working_directory` | the agent's `--work-dir` | Usually unset. Absolute: used instead of the agent's directory. Relative: taken under it |
 | `offline_timeout` | `900` | Seconds without a poll before the agent's tasks count as lost |
 
 ## Orchestrator configuration

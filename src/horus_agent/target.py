@@ -35,7 +35,7 @@ from horus_runtime.core.task.exceptions import TaskExecutionError
 from pydantic import PrivateAttr, field_validator
 
 from horus_agent import blobs
-from horus_agent.broker import BrokerClient, broker_client
+from horus_agent.broker import BrokerClient, agent_work_dir, broker_client
 from horus_agent.protocol import INLINE_LIMIT, StagingUrls, b64d, b64e
 
 if TYPE_CHECKING:
@@ -117,11 +117,12 @@ class AgentTarget(BaseTarget):
     agent: str
     """Name the agent registered under."""
 
-    working_directory: str
+    working_directory: str | None = None
     """
-    Base directory on the agent's machine where per-task working
-    directories are created. Required, as for SSH: there is no default on
-    an arbitrary machine.
+    Where per-task working directories are created on the agent's machine.
+    Usually left unset: the agent's own directory (``horus-agent register
+    --work-dir``) is used. A relative path is taken under that directory;
+    an absolute one is used as is.
     """
 
     offline_timeout: float = 900.0
@@ -143,11 +144,25 @@ class AgentTarget(BaseTarget):
 
     @field_validator("working_directory")
     @classmethod
-    def _absolute(cls, value: str) -> str:
-        """Reject a relative working directory up front."""
-        if not value.startswith("/"):
-            raise ValueError("working_directory must be an absolute path")
+    def _inside(cls, value: str | None) -> str | None:
+        """Keep a relative working directory inside the agent's own."""
+        if value and not value.startswith("/") and ".." in value.split("/"):
+            raise ValueError(
+                "A relative working_directory cannot contain '..'"
+            )
         return value
+
+    @property
+    def resolved_working_directory(self) -> str:
+        """
+        ``working_directory`` if absolute, else the agent's reported
+        directory (with a relative ``working_directory`` under it).
+        """
+        own = self.working_directory
+        if own and own.startswith("/"):
+            return own
+        base = agent_work_dir(*self._broker_config(), self.agent)
+        return f"{base}/{own}" if own and own != "." else base
 
     @property
     def location_id(self) -> str:
@@ -196,6 +211,11 @@ class AgentTarget(BaseTarget):
     @staticmethod
     def _broker() -> BrokerClient:
         """The broker client configured on this orchestrator."""
+        return broker_client(*AgentTarget._broker_config())
+
+    @staticmethod
+    def _broker_config() -> tuple[str, str]:
+        """The broker URL and token configured on this orchestrator."""
         url = os.environ.get(BROKER_URL_ENV)
         token = os.environ.get(BROKER_TOKEN_ENV)
         key = os.environ.get(BROKER_TOKEN_CONTEXT_KEY_ENV)
@@ -208,7 +228,7 @@ class AgentTarget(BaseTarget):
                 f"{BROKER_URL_ENV} and {BROKER_TOKEN_ENV} (or "
                 f"{BROKER_TOKEN_CONTEXT_KEY_ENV})"
             )
-        return broker_client(url, token)
+        return url, token
 
     async def _call(self, method: str, **args: Any) -> Any:
         """Run *method* on the agent through the broker."""

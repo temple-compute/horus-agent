@@ -28,6 +28,16 @@ class AgentConfig:
     name: str
     token: str
     """The agent's own credential. Never logged."""
+    work_dir: str = ""
+    """
+    Where tasks run on this machine. Empty in configs written before it
+    existed: :func:`default_work_dir` then.
+    """
+
+
+def default_work_dir() -> Path:
+    """``~/horus-agent``: where tasks run unless ``--work-dir`` says else."""
+    return Path.home() / "horus-agent"
 
 
 def config_path() -> Path:

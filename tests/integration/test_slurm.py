@@ -131,7 +131,7 @@ async def test_round_trip(
         for op in broker.ops_seen
     )
     # The job ran in the agent's working directory.
-    assert any(Path(target.working_directory).rglob("result.txt"))
+    assert any(Path(target.resolved_working_directory).rglob("result.txt"))
 
 
 async def test_failed_job_fails_the_task(
@@ -174,6 +174,7 @@ async def test_pending_job_then_runs(
 async def test_cancel_scancels_the_job(
     horus_context: HorusContext,
     target: AgentTarget,
+    broker: FakeBroker,
     slurm_state: Path,
     work: Path,
 ) -> None:
@@ -182,8 +183,15 @@ async def test_cancel_scancels_the_job(
         work, _slurm(target), "sleep 60 && cp ${source} ${result}"
     )
     running = asyncio.create_task(workflow.run(trigger_id="collect"))
+
+    def polling() -> bool:
+        # The target knows the job id once it asks Slurm about the job.
+        return any(
+            "squeue" in op["args"].get("cmd", "") for op in broker.ops_seen
+        )
+
     for _ in range(200):
-        if list(slurm_state.glob("*.started")):
+        if list(slurm_state.glob("*.started")) and polling():
             break
         await asyncio.sleep(0.1)
     else:

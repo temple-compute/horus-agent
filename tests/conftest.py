@@ -64,11 +64,15 @@ def broker(monkeypatch: pytest.MonkeyPatch) -> Generator[FakeBroker]:
 
 
 @pytest.fixture
-async def agent(broker: FakeBroker) -> AsyncGenerator[Agent]:
+async def agent(broker: FakeBroker, tmp_path: Path) -> AsyncGenerator[Agent]:
     """An agent serving *broker* in this event loop."""
     running = Agent(
         AgentConfig(
-            url=broker.url, agent_id="a1", name=AGENT_NAME, token=AGENT_TOKEN
+            url=broker.url,
+            agent_id="a1",
+            name=AGENT_NAME,
+            token=AGENT_TOKEN,
+            work_dir=str(tmp_path / "agent-home"),
         )
     )
     stop = asyncio.Event()

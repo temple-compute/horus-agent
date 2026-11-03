@@ -27,6 +27,7 @@ from horus_agent.logs import describe_args
 from horus_agent.protocol import (
     IDEMPOTENT_METHODS,
     POLL_WAIT_S,
+    AgentInfo,
     Op,
     OpStatus,
     StagingUrls,
@@ -37,6 +38,48 @@ BACKOFF_MAX_S = 30.0
 _CLIENTS: weakref.WeakKeyDictionary[
     asyncio.AbstractEventLoop, dict[tuple[str, str], "BrokerClient"]
 ] = weakref.WeakKeyDictionary()
+
+
+_WORK_DIRS: dict[tuple[str, str], str] = {}
+
+
+def agent_work_dir(url: str, token: str, agent: str) -> str:
+    """
+    The working directory *agent* reported, asked once per process.
+
+    Blocking: target paths are computed synchronously, before any op runs.
+    shortcut: a sync request inside the event loop, once per agent per run;
+    move it into an async setup hook if the runtime grows one.
+
+    Raises:
+        TaskExecutionError: The broker does not know the agent, or the agent
+            has not reported its working directory yet.
+    """
+    key = (url, agent)
+    if key in _WORK_DIRS:
+        return _WORK_DIRS[key]
+    try:
+        response = httpx.get(
+            f"{url.rstrip('/')}/agents/info/{agent}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30.0,
+        )
+    except httpx.TransportError as exc:
+        raise TaskExecutionError(f"Broker unreachable: {exc}") from exc
+    if response.status_code >= 400:
+        raise TaskExecutionError(
+            f"Cannot look up agent {agent!r}: HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+    info = AgentInfo.model_validate(response.json())
+    if not info.work_dir:
+        raise TaskExecutionError(
+            f"Agent {agent!r} has not reported its working directory yet; "
+            "start it with horus-agent run"
+        )
+    horus_logger.log.debug(f"Agent {agent!r} runs tasks in {info.work_dir}")
+    _WORK_DIRS[key] = info.work_dir
+    return info.work_dir
 
 
 def broker_client(url: str, token: str) -> "BrokerClient":
