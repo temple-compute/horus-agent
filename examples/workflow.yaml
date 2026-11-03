@@ -1,0 +1,20 @@
+# Runs one task on the agent registered as "lab-server". The orchestrator
+# needs HORUS_AGENT_BROKER_URL and HORUS_AGENT_BROKER_TOKEN set.
+name: agent-example
+tasks:
+  - id: hello
+    name: Hello
+    kind: horus_task
+    target:
+      kind: agent
+      agent: lab-server
+      working_directory: /tmp/horus
+    executor:
+      kind: shell
+    runtime:
+      kind: command
+      command: "hostname > ${greeting}"
+    outputs:
+      - id: greeting
+        kind: file
+        path: greeting.txt

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Fake sinfo: one idle partition with no time limit.
+case "$*" in
+    *%P\ %l*) echo "debug* infinite" ;;
+    *) echo "idle|1" ;;
+esac

@@ -1,0 +1,11 @@
+#!/bin/bash
+# Fake scancel [--signal=NAME] <id>: signals the job's process group.
+state=$FAKE_SLURM_STATE
+sig=KILL
+for arg in "$@"; do
+    case $arg in --signal=*) sig=${arg#--signal=} ;; *) id=$arg ;; esac
+done
+echo "$*" >> "$state/scancel.log"
+pid=$(cat "$state/$id.pid" 2>/dev/null) || exit 0
+[ "$sig" = KILL ] && touch "$state/$id.cancelled"
+kill "-$sig" -- "-$pid" 2>/dev/null || true

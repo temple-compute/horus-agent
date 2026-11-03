@@ -1,0 +1,90 @@
+#
+# horus_agent
+# Copyright (c) 2026 Temple Compute
+#
+# Commercial use and distribution of this software is prohibited.
+# For commercial use, please contact the author for licensing options.
+#
+"""
+Shared fixtures: a fake broker, a running agent and a Horus context.
+"""
+
+import asyncio
+from collections.abc import AsyncGenerator, Generator
+from pathlib import Path
+
+import pytest
+from horus_runtime.context import HorusContext, _runtime_ctx
+from horus_runtime.registry.auto_registry import AutoRegistry
+
+from horus_agent.config import AgentConfig
+from horus_agent.daemon import Agent
+from horus_agent.target import (
+    BROKER_TOKEN_CONTEXT_KEY_ENV,
+    BROKER_TOKEN_ENV,
+    BROKER_URL_ENV,
+    AgentTarget,
+)
+from tests.fake_broker import RUN_TOKEN, FakeBroker
+
+AGENT_NAME = "lab"
+AGENT_TOKEN = "tca_test"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def init_registry() -> None:
+    """Load every installed plugin, including horus_agent, once."""
+    AutoRegistry.init_registry()
+
+
+@pytest.fixture
+def horus_context() -> Generator[HorusContext]:
+    """A fresh ``HorusContext`` per test."""
+    ctx = HorusContext()
+    ctx.bus.start()
+    token = _runtime_ctx.set(ctx)
+    try:
+        yield ctx
+    finally:
+        _runtime_ctx.reset(token)
+
+
+@pytest.fixture
+def broker(monkeypatch: pytest.MonkeyPatch) -> Generator[FakeBroker]:
+    """A running fake broker the orchestrator side is configured for."""
+    fake = FakeBroker().start()
+    fake.add_agent(AGENT_NAME, AGENT_TOKEN)
+    monkeypatch.setenv(BROKER_URL_ENV, fake.url)
+    monkeypatch.setenv(BROKER_TOKEN_ENV, RUN_TOKEN)
+    monkeypatch.delenv(BROKER_TOKEN_CONTEXT_KEY_ENV, raising=False)
+    try:
+        yield fake
+    finally:
+        fake.stop()
+
+
+@pytest.fixture
+async def agent(broker: FakeBroker) -> AsyncGenerator[Agent]:
+    """An agent serving *broker* in this event loop."""
+    running = Agent(
+        AgentConfig(
+            url=broker.url, agent_id="a1", name=AGENT_NAME, token=AGENT_TOKEN
+        )
+    )
+    stop = asyncio.Event()
+    task = asyncio.create_task(running.serve(stop))
+    try:
+        yield running
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, 10)
+
+
+@pytest.fixture
+def target(tmp_path: Path) -> AgentTarget:
+    """An agent target whose working directory is on this machine."""
+    return AgentTarget(
+        agent=AGENT_NAME,
+        working_directory=str(tmp_path / "agent"),
+        offline_timeout=5.0,
+    )

@@ -1,0 +1,14 @@
+#!/bin/bash
+# Fake squeue -h -j <id> -o "%T|%R|%P": RUNNING/PENDING while the job lives.
+state=$FAKE_SLURM_STATE
+while [ $# -gt 0 ]; do
+    case $1 in -j) id=$2; shift ;; esac
+    shift
+done
+pid=$(cat "$state/$id.pid" 2>/dev/null) || exit 0
+kill -0 "$pid" 2>/dev/null || exit 0
+if [ -e "$state/$id.started" ]; then
+    echo "RUNNING|fakenode1|debug"
+else
+    echo "PENDING|(Resources)|debug"
+fi

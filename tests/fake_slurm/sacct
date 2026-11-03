@@ -1,0 +1,16 @@
+#!/bin/bash
+# Fake sacct -n -X -P -j <id> -o State,ExitCode,Reason.
+state=$FAKE_SLURM_STATE
+while [ $# -gt 0 ]; do
+    case $1 in -j) id=$2; shift ;; esac
+    shift
+done
+[ -e "$state/$id.pid" ] || exit 0
+if [ -e "$state/$id.cancelled" ]; then
+    echo "CANCELLED by $(id -u)|0:15|None"
+elif [ -e "$state/$id.code" ]; then
+    code=$(cat "$state/$id.code")
+    if [ "$code" = 0 ]; then echo "COMPLETED|0:0|None"; else echo "FAILED|$code:0|NonZeroExitCode"; fi
+else
+    echo "RUNNING|0:0|None"
+fi

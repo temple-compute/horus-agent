@@ -1,0 +1,19 @@
+#!/bin/bash
+# Fake sbatch: runs the script as a local background job.
+# State lives in $FAKE_SLURM_STATE; $FAKE_SLURM_PENDING_S delays the start.
+set -euo pipefail
+script=${@: -1}
+state=$FAKE_SLURM_STATE
+mkdir -p "$state"
+exec 9>"$state/lock"; flock 9
+id=$(( $(cat "$state/next" 2>/dev/null || echo 100) + 1 ))
+echo "$id" > "$state/next"
+flock -u 9
+out=$(sed -n 's/^#SBATCH --output=//p' "$script")
+err=$(sed -n 's/^#SBATCH --error=//p' "$script")
+cp "$script" "$state/$id.script"
+echo "$*" > "$state/$id.args"
+setsid bash -c "sleep ${FAKE_SLURM_PENDING_S:-0}; touch '$state/$id.started'; bash '$script'; echo \$? > '$state/$id.code'" \
+    >"$out" 2>"$err" </dev/null &
+echo $! > "$state/$id.pid"
+echo "$id"
