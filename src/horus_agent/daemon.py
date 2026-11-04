@@ -25,7 +25,7 @@ import httpx
 from horus_runtime.logging import horus_logger
 
 from horus_agent.config import AgentConfig
-from horus_agent.logs import describe_args, describe_result
+from horus_agent.logs import describe_args, describe_result, summarize
 from horus_agent.ops import OpRunner
 from horus_agent.protocol import POLL_WAIT_S, Op, OpResult
 
@@ -194,6 +194,8 @@ class Agent:
     async def _run_one(self, op: Op, results: asyncio.Queue[OpResult]) -> None:
         log = horus_logger.log
         tag = f"Op {op.op_id[:8]} {op.method}"
+        if summary := summarize(op.method, op.args):
+            log.info(f"[run {(op.run_id or '-')[:8]}] {summary}")
         log.debug(f"{tag} start (run {op.run_id}): {describe_args(op.args)}")
         started = time.monotonic()
         result = await self.runner.run(op)
@@ -206,6 +208,12 @@ class Agent:
             )
             log.debug(f"{tag} failed after {took:.2f}s")
         else:
+            answer = result.result
+            if op.method == "exec" and isinstance(answer, dict):
+                code = answer.get("returncode")
+                log.info(f"exec exited {code} in {took:.1f}s")
+            elif op.method == "launch" and isinstance(answer, dict):
+                log.info(f"launched pid {answer.get('pid')}")
             log.debug(
                 f"{tag} done in {took:.2f}s: "
                 f"{describe_result(op.method, result.result)}"
