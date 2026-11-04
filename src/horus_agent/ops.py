@@ -145,7 +145,7 @@ class OpRunner:
                     JobHandle(pid=args["pid"], job_dir=args["job_dir"])
                 )
                 if code is not None:
-                    horus_logger.log.debug(
+                    horus_logger.log.info(
                         f"Job pid {args['pid']} in {args['job_dir']} exited "
                         f"with {code}"
                     )

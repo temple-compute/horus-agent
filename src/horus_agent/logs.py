@@ -6,7 +6,7 @@
 # For commercial use, please contact the author for licensing options.
 #
 """
-Logging setup and secret-free descriptions of ops for debug logs.
+Logging setup and secret-free descriptions of ops for the logs.
 
 Debug logs show every connection, request, op and command, but never env
 values (task secrets), tokens, or presigned URL query strings (signatures).
@@ -74,6 +74,35 @@ def _preview(value: str) -> str:
     if len(text) > PREVIEW_CHARS:
         text = text[:PREVIEW_CHARS] + f"… ({len(text)} chars)"
     return safe_url(repr(text))
+
+
+QUIET_METHODS = frozenset({"poll", "read_output"})
+"""Ops repeated every few seconds for each running job: debug level only."""
+
+SUMMARY_CHARS = 200
+
+
+def summarize(method: str, args: dict[str, Any]) -> str | None:
+    """
+    One line naming what an op does, for the info log: the command, or the
+    path it touches. None for the routine job checks in :data:`QUIET_METHODS`.
+    """
+    if method in QUIET_METHODS:
+        return None
+    if "cmd" in args:
+        cmd = " ".join(str(args["cmd"]).split())
+        if len(cmd) > SUMMARY_CHARS:
+            cmd = cmd[:SUMMARY_CHARS] + "…"
+        detail = safe_url(cmd)
+    elif "path" in args:
+        detail = str(args["path"])
+        if isinstance(args.get("data"), str):
+            detail += f" ({_b64_size(args['data'])} bytes)"
+    elif "pid" in args:
+        detail = f"pid {args['pid']} signal {args.get('sig')}"
+    else:
+        detail = ""
+    return f"{method} {detail}".rstrip()
 
 
 def describe_args(args: dict[str, Any]) -> str:

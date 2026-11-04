@@ -98,3 +98,54 @@ def test_debug_flag_and_env(monkeypatch: pytest.MonkeyPatch) -> None:
         for name in ("httpx", "httpcore"):
             logging.getLogger(name).handlers = []
         horus_logger.setup(level="INFO")
+
+
+@pytest.fixture
+def info_lines() -> Generator[list[str]]:
+    """Every info-level line logged during the test (no --debug)."""
+    lines: list[str] = []
+    logs.setup(False)
+    sink = horus_logger.log.add(lambda m: lines.append(str(m)), level="INFO")
+    try:
+        yield lines
+    finally:
+        horus_logger.log.remove(sink)
+
+
+@pytest.mark.usefixtures("agent")
+async def test_info_log_names_every_op_without_secrets(
+    target: AgentTarget, tmp_path: Path, info_lines: list[str]
+) -> None:
+    proc = await target.run_command(
+        f"echo hello; curl -s '{SIGNED}' >/dev/null || true",
+        cwd=str(tmp_path),
+        env={"API_KEY": "s3cr3t-value"},
+        detach=False,
+    )
+    assert await proc.wait() == 0
+    await target.put_file(b"x" * 10, str(tmp_path / "f.txt"))
+    job = await target.run_command("true", cwd=str(tmp_path))
+    assert await job.wait() == 0
+
+    text = "\n".join(info_lines)
+    for expected in (
+        "] exec echo hello; curl -s",
+        "exec exited 0 in",
+        f"] put_file {tmp_path / 'f.txt'} (10 bytes)",
+        "] launch ",
+        "launched pid ",
+        "exited with 0",
+    ):
+        assert expected in text, expected
+    # Routine job checks stay out of the info log.
+    assert "] poll" not in text
+    assert "] read_output" not in text
+    assert "s3cr3t-value" not in text
+    assert "abc123" not in text
+
+
+def test_summarize_shortens_long_commands() -> None:
+    line = logs.summarize("exec", {"cmd": "x" * 500})
+    assert line is not None
+    assert len(line) < 220
+    assert logs.summarize("poll", {"pid": 1, "job_dir": "/j"}) is None

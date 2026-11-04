@@ -43,6 +43,10 @@ Jobs run detached, in their own session, with their output in log files. Stoppin
 
 Proxies: the agent honours `HTTPS_PROXY`, `NO_PROXY` and `SSL_CERT_FILE`.
 
+### Logs
+
+By default the agent logs each op it receives at info level: the command it runs, or the path it reads or writes, with the run it belongs to. It also logs exit codes, the pids of launched jobs, and when each job exits. The status checks it repeats every few seconds for running jobs (`poll`, `read_output`) appear only in debug logs.
+
 ### Debug logs
 
 `horus-agent run --debug` (or `HORUS_AGENT_DEBUG=1`) logs everything the agent does:
