@@ -9,6 +9,7 @@ Shared fixtures: a fake broker, a running agent and a Horus context.
 """
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator, Generator
 from pathlib import Path
 
@@ -34,6 +35,20 @@ AGENT_TOKEN = "tca_test"
 def init_registry() -> None:
     """Load every installed plugin, including horus_agent, once."""
     AutoRegistry.init_registry()
+
+
+@pytest.fixture(autouse=True)
+def process_state() -> Generator[None]:
+    """Undo what ``horus-agent run`` does to the process: env and umask."""
+    environ = dict(os.environ)
+    umask = os.umask(0o022)
+    os.umask(umask)
+    try:
+        yield
+    finally:
+        os.environ.clear()
+        os.environ.update(environ)
+        os.umask(umask)
 
 
 @pytest.fixture

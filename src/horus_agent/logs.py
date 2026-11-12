@@ -7,8 +7,9 @@
 """
 Logging setup and secret-free descriptions of ops for the logs.
 
-Debug logs show every connection, request, op and command, but never env
-values (task secrets), tokens, or presigned URL query strings (signatures).
+Logs show commands and paths, but never env values (task secrets, also
+where a command embeds them), tokens, passwords in URLs or ``key=value``
+pairs, or presigned URL query strings (signatures).
 """
 
 import base64
@@ -16,6 +17,7 @@ import binascii
 import logging
 import os
 import re
+from collections.abc import Iterable
 from typing import Any
 
 from horus_runtime.logging import horus_logger
@@ -29,9 +31,38 @@ PREVIEW_CHARS = 300
 _QUERY = re.compile(r"(https?://[^\s\"'?<>]*)\?[^\s\"'<>)]*")
 
 
+_USERINFO = re.compile(r"://[^/\s@:]+:[^/\s@]+@")
+_CREDENTIAL = re.compile(
+    r"(?i)\b((?:bearer|basic)\s+|[\w.-]*(?:token|secret|passw(?:or)?d|"
+    r"api[_-]?key|access[_-]?key)[\w.-]*\s*[=:]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s;&|'\"]+)"
+)
+MIN_SECRET_CHARS = 6
+"""Shorter env values are not hidden in text: too likely to be common."""
+
+
 def safe_url(url: object) -> str:
     """*url* (or text holding URLs) with URL query strings redacted."""
     return _QUERY.sub(r"\1?<redacted>", str(url))
+
+
+def redact(text: object, secrets: Iterable[str] = ()) -> str:
+    """
+    *text* with every value in *secrets* (an op's env values), URL query
+    strings and passwords, and credential-looking assignments hidden.
+    """
+    out = str(text)
+    for value in sorted(secrets, key=len, reverse=True):
+        if len(value) >= MIN_SECRET_CHARS:
+            out = out.replace(value, "<redacted>")
+    out = _USERINFO.sub("://<redacted>@", out)
+    out = _CREDENTIAL.sub(r"\1<redacted>", out)
+    return safe_url(out)
+
+
+def _env_values(args: dict[str, Any]) -> list[str]:
+    env = args.get("env")
+    return [str(v) for v in env.values()] if isinstance(env, dict) else []
 
 
 class _ToLoguru(logging.Handler):
@@ -39,7 +70,7 @@ class _ToLoguru(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         horus_logger.log.log(
-            record.levelname, f"{record.name}: {safe_url(record.getMessage())}"
+            record.levelname, f"{record.name}: {redact(record.getMessage())}"
         )
 
 
@@ -65,14 +96,14 @@ def _b64_size(value: str) -> int:
     return len(value) * 3 // 4 - value.count("=", -2)
 
 
-def _preview(value: str) -> str:
+def _preview(value: str, secrets: Iterable[str]) -> str:
     try:
         text = base64.b64decode(value).decode(errors="replace")
     except (binascii.Error, ValueError):
         return f"<{_b64_size(value)} bytes>"
     if len(text) > PREVIEW_CHARS:
         text = text[:PREVIEW_CHARS] + f"… ({len(text)} chars)"
-    return safe_url(repr(text))
+    return redact(repr(text), secrets)
 
 
 QUIET_METHODS = frozenset({"poll", "read_output"})
@@ -92,9 +123,9 @@ def summarize(method: str, args: dict[str, Any]) -> str | None:
         cmd = " ".join(str(args["cmd"]).split())
         if len(cmd) > SUMMARY_CHARS:
             cmd = cmd[:SUMMARY_CHARS] + "…"
-        detail = safe_url(cmd)
+        detail = redact(cmd, _env_values(args))
     elif "path" in args:
-        detail = str(args["path"])
+        detail = redact(args["path"])
         if isinstance(args.get("data"), str):
             detail += f" ({_b64_size(args['data'])} bytes)"
     elif "pid" in args:
@@ -107,6 +138,7 @@ def summarize(method: str, args: dict[str, Any]) -> str | None:
 def describe_args(args: dict[str, Any]) -> str:
     """An op's arguments, with env values, signatures and payloads hidden."""
     parts = []
+    secrets = _env_values(args)
     for key, value in args.items():
         if key == "env":
             # Names only: the values are the task's secrets.
@@ -115,12 +147,17 @@ def describe_args(args: dict[str, Any]) -> str:
             parts.append(f"data=<{_b64_size(value)} bytes>")
         else:
             # Commands can hold presigned URLs (curl transfers).
-            parts.append(f"{key}={safe_url(repr(value))}")
+            parts.append(f"{key}={redact(repr(value), secrets)}")
     return " ".join(parts)
 
 
-def describe_result(method: str, value: Any) -> str:
-    """An op's answer: command output previewed, other payloads sized."""
+def describe_result(
+    method: str, value: Any, secrets: Iterable[str] = ()
+) -> str:
+    """
+    An op's answer: command output previewed (with *secrets*, the op's env
+    values, hidden), other payloads sized.
+    """
     if isinstance(value, list):
         return f"{len(value)} entries"
     if not isinstance(value, dict):
@@ -129,7 +166,7 @@ def describe_result(method: str, value: Any) -> str:
     for key, item in value.items():
         if key in ("stdout", "stderr", "data") and isinstance(item, str):
             shown = (
-                _preview(item)
+                _preview(item, secrets)
                 if method == "exec"
                 else f"<{_b64_size(item)} bytes>"
             )

@@ -1,15 +1,21 @@
-# systemd user unit for horus-agent.
+# Hardened system unit for horus-agent; setup in the README, "Run it as a
+# system service". Tasks inherit every restriction below.
 #
-#   cp examples/horus-agent.service ~/.config/systemd/user/
-#   systemctl --user enable --now horus-agent
-#   loginctl enable-linger "$USER"
+#   cp examples/horus-agent.service /etc/systemd/system/
+#   systemctl enable --now horus-agent
 [Unit]
 Description=Horus agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=%h/.local/bin/horus-agent run
+User=horus-agent
+Group=horus-agent
+ExecStart=/opt/horus-agent/bin/horus-agent run
+Environment=HORUS_AGENT_CONFIG=/var/lib/horus-agent/agent.json
+StateDirectory=horus-agent
+StateDirectoryMode=0700
+UMask=0077
 Restart=always
 RestartSec=10
 # Jobs run in their own sessions and outlive the agent; only stop the agent.
@@ -17,5 +23,27 @@ KillMode=process
 # The agent finishes the ops it started before exiting.
 TimeoutStopSec=120
 
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+# Tasks as another user (run_as_via setpriv): use these two lines instead.
+#CapabilityBoundingSet=CAP_SETUID CAP_SETGID
+#AmbientCapabilities=CAP_SETUID CAP_SETGID
+ProtectSystem=strict
+# The work dir: the only place the agent and its tasks can write.
+ReadWritePaths=/srv/horus-agent
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

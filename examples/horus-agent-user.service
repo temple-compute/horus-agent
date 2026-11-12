@@ -1,0 +1,23 @@
+# systemd user unit for horus-agent, for machines where you have no root.
+# With root, use the hardened system unit, horus-agent.service.
+#
+#   cp examples/horus-agent.service ~/.config/systemd/user/
+#   systemctl --user enable --now horus-agent
+#   loginctl enable-linger "$USER"
+[Unit]
+Description=Horus agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/horus-agent run
+Restart=always
+RestartSec=10
+# Jobs run in their own sessions and outlive the agent; only stop the agent.
+KillMode=process
+# The agent finishes the ops it started before exiting.
+TimeoutStopSec=120
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

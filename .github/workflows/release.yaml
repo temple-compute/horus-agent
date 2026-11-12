@@ -7,25 +7,37 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Add required reviewers to this environment in the repository settings.
+    environment: pypi
     permissions:
       contents: write # attach the built files to the release
       id-token: write # PyPI trusted publishing
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0 # uv-dynamic-versioning reads the version from the tag
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v8.2.0
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
 
       - name: Build package
         run: uv build
 
+      - name: Hash-locked requirements
+        # pip install --require-hashes -r requirements.txt installs exactly
+        # the dependencies this release was tested with, and this wheel.
+        run: |
+          uv export --frozen --no-dev --no-emit-project -o requirements.txt
+          wheel=$(ls dist/*.whl)
+          version=$(basename "$wheel" | cut -d- -f2)
+          echo "horus-agent==$version \\" >> requirements.txt
+          echo "    --hash=sha256:$(sha256sum "$wheel" | cut -d' ' -f1)" >> requirements.txt
+
       - name: Attach to the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* requirements.txt --clobber
 
       - name: Upload to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

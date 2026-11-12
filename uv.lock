@@ -218,8 +218,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "horus-runtime", specifier = ">=0.8.4" },
-    { name = "httpx", specifier = ">=0.28" },
+    { name = "horus-runtime", specifier = ">=0.8.4,<0.9" },
+    { name = "httpx", specifier = ">=0.28,<0.29" },
 ]
 
 [package.metadata.requires-dev]

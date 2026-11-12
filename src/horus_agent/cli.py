@@ -11,6 +11,8 @@
 import argparse
 import asyncio
 import dataclasses
+import getpass
+import os
 import platform
 import signal
 import socket
@@ -19,23 +21,63 @@ from pathlib import Path
 
 import httpx
 
-from horus_agent import config, logs
-from horus_agent.daemon import Agent, AgentUnauthorizedError, agent_version
+from horus_agent import config, logs, ops
+from horus_agent.daemon import (
+    Agent,
+    AgentUnauthorizedError,
+    agent_version,
+    broker_tls,
+    check_broker_url,
+)
 from horus_agent.protocol import Registration
+
+TOKEN_ENV = "HORUS_AGENT_TOKEN"
+"""Registration token, when not typed or piped in."""
 
 
 def _work_dir(value: str | None) -> Path:
-    """*value* as an absolute path, created if missing."""
+    """
+    *value* as an absolute path, created if missing, with no access for
+    other users.
+    """
     path = Path(value).expanduser() if value else config.default_work_dir()
     path = path.resolve()
     path.mkdir(parents=True, exist_ok=True)
+    if (mode := path.stat().st_mode) & 0o007:
+        path.chmod(mode & 0o7770)
     return path
 
 
-def _register(
-    url: str, token: str, name: str | None, work_dir: str | None
-) -> int:
-    directory = _work_dir(work_dir)
+def _token(argv_token: str | None) -> str:
+    """The registration token: ``$HORUS_AGENT_TOKEN``, else stdin."""
+    if argv_token:
+        sys.stderr.write(
+            f"--token is visible to other users; pass it on stdin or in "
+            f"{TOKEN_ENV} instead.\n"
+        )
+        return argv_token
+    if token := os.environ.get(TOKEN_ENV):
+        return token
+    if sys.stdin.isatty():
+        return getpass.getpass("Registration token: ").strip()
+    return sys.stdin.readline().strip()
+
+
+def _register(args: argparse.Namespace) -> int:
+    url: str = args.url
+    check_broker_url(url)
+    run_as: str = args.run_as or ""
+    if run_as:
+        # Fails early on a missing user or an unknown method.
+        ops.switch_user(run_as, args.run_as_via)
+    os.umask(ops.JOB_UMASK if run_as else 0o077)
+    token = _token(args.token)
+    if not token:
+        sys.stderr.write("No registration token given.\n")
+        return 1
+    ca_bundle = str(Path(args.ca_bundle).resolve()) if args.ca_bundle else ""
+    directory = _work_dir(args.work_dir)
+    name: str | None = args.name
     body = {
         "token": token,
         "hostname": socket.gethostname(),
@@ -46,7 +88,10 @@ def _register(
     if name is not None:
         body["name"] = name
     response = httpx.post(
-        f"{url.rstrip('/')}/agents/register", json=body, timeout=30.0
+        f"{url.rstrip('/')}/agents/register",
+        json=body,
+        timeout=30.0,
+        verify=broker_tls(ca_bundle),
     )
     if response.status_code >= 400:
         try:
@@ -64,6 +109,10 @@ def _register(
             name=registration.name,
             token=registration.agent_token,
             work_dir=str(directory),
+            run_as=run_as,
+            run_as_via=args.run_as_via,
+            ca_bundle=ca_bundle,
+            job_env=tuple(args.job_env or ()),
         ),
         path,
     )
@@ -84,8 +133,24 @@ async def _run(work_dir: str | None) -> int:
             f"No registration at {path}. Run horus-agent register first.\n"
         )
         return 1
-    directory = _work_dir(work_dir or registered.work_dir or None)
-    agent = Agent(dataclasses.replace(registered, work_dir=str(directory)))
+    if path.stat().st_mode & 0o077:
+        sys.stderr.write(
+            f"{path} holds the agent's token and must be readable by its "
+            f"owner only: chmod 600 {path}\n"
+        )
+        return 1
+    try:
+        check_broker_url(registered.url)
+        os.umask(ops.JOB_UMASK if registered.run_as else 0o077)
+        # Tasks inherit the agent's environment: keep only what they need.
+        keep = ops.job_environment(dict(os.environ), registered.job_env)
+        os.environ.clear()
+        os.environ.update(keep)
+        directory = _work_dir(work_dir or registered.work_dir or None)
+        agent = Agent(dataclasses.replace(registered, work_dir=str(directory)))
+    except (ValueError, KeyError, OSError) as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -119,16 +184,22 @@ def main(argv: list[str] | None = None) -> int:
         help="Log every connection, request, op and command (also: "
         f"{logs.DEBUG_ENV}=1). Secret values are never logged.",
     )
+    common.add_argument(
+        "--allow-root",
+        action="store_true",
+        help="Run as root anyway. Tasks would then run as root too.",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     register = commands.add_parser(
         "register",
         parents=[common],
         help="Register this machine with a one-time token.",
     )
-    register.add_argument("--url", required=True, help="Broker API URL.")
     register.add_argument(
-        "--token", required=True, help="One-time registration token."
+        "--url", required=True, help="Broker API URL (https)."
     )
+    # Kept for old instructions; the token is read from stdin by default.
+    register.add_argument("--token", help=argparse.SUPPRESS)
     register.add_argument(
         "--name",
         help="Agent name, used as the target's 'agent' field, when the "
@@ -139,6 +210,28 @@ def main(argv: list[str] | None = None) -> int:
         f"Default: {config.default_work_dir()}."
     )
     register.add_argument("--work-dir", help=work_dir_help)
+    register.add_argument(
+        "--run-as",
+        metavar="USER",
+        help="Run task commands as this Unix user, not the agent's.",
+    )
+    register.add_argument(
+        "--run-as-via",
+        choices=("sudo", "setpriv"),
+        default="sudo",
+        help="How to switch to --run-as. Default: sudo.",
+    )
+    register.add_argument(
+        "--ca-bundle",
+        metavar="PEM",
+        help="Trust only these CA certificates for the broker.",
+    )
+    register.add_argument(
+        "--job-env",
+        action="append",
+        metavar="NAME",
+        help="Pass this environment variable on to tasks (repeatable).",
+    )
     run = commands.add_parser(
         "run", parents=[common], help="Poll for work until stopped."
     )
@@ -148,6 +241,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
     logs.setup(args.debug)
-    if args.command == "register":
-        return _register(args.url, args.token, args.name, args.work_dir)
-    return asyncio.run(_run(args.work_dir))
+    if os.geteuid() == 0 and not args.allow_root:
+        sys.stderr.write(
+            "Refusing to run as root: run the agent as its own user "
+            "(--allow-root to override).\n"
+        )
+        return 1
+    if args.command == "run":
+        return asyncio.run(_run(args.work_dir))
+    try:
+        return _register(args)
+    except (ValueError, KeyError, OSError) as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1

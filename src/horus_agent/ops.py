@@ -11,7 +11,9 @@ Agent side: run each op on this machine through Horus's own LocalTarget.
 import asyncio
 import contextlib
 import os
+import pwd
 import re
+import shlex
 import signal
 import tempfile
 from collections import OrderedDict
@@ -23,7 +25,7 @@ from horus_runtime.core.target.channel import JobHandle
 from horus_runtime.logging import horus_logger
 
 from horus_agent import blobs
-from horus_agent.logs import safe_url
+from horus_agent.logs import redact
 from horus_agent.protocol import (
     INLINE_LIMIT,
     Op,
@@ -37,6 +39,83 @@ RESULT_CACHE_SIZE = 1024
 """Answered ops remembered, so a redelivered op is answered, not rerun."""
 
 _ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+JOB_ENV = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TERM",
+        "TMPDIR",
+        # The machine's own outbound settings, which tasks need as well.
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        *(
+            name
+            for proxy in ("http_proxy", "https_proxy", "no_proxy", "all_proxy")
+            for name in (proxy, proxy.upper())
+        ),
+    }
+)
+"""Agent environment variables tasks inherit, with ``LC_*``."""
+
+JOB_UMASK = 0o007
+"""Task files are shared with the agent through the work dir's group."""
+
+
+def job_environment(
+    environ: dict[str, str], extra: tuple[str, ...] = ()
+) -> dict[str, str]:
+    """The part of *environ* tasks may see: :data:`JOB_ENV` and *extra*."""
+    keep = JOB_ENV | set(extra)
+    return {
+        name: value
+        for name, value in environ.items()
+        if name in keep or name.startswith("LC_")
+    }
+
+
+def switch_user(user: str, via: str) -> str:
+    """
+    Shell prefix that runs ``sh -c <script>`` as *user*, keeping the
+    environment (task env values never go on a command line).
+
+    ``sudo`` needs a sudoers rule letting the agent run anything as *user*;
+    ``setpriv`` needs CAP_SETUID and CAP_SETGID (systemd
+    ``AmbientCapabilities``) and drops them for the task.
+    """
+    entry = pwd.getpwnam(user)
+    if entry.pw_uid == 0:
+        raise ValueError("Tasks must not run as root")
+    if via == "sudo":
+        argv = ["sudo", "-n", "-E", "-u", user, "--"]
+    elif via == "setpriv":
+        argv = [
+            "setpriv",
+            f"--reuid={entry.pw_uid}",
+            f"--regid={entry.pw_gid}",
+            "--init-groups",
+            "--inh-caps=-all",
+            "--",
+        ]
+    else:
+        raise ValueError(f"run_as_via must be sudo or setpriv, not {via!r}")
+    return shlex.join(
+        [
+            *argv,
+            "env",
+            f"HOME={entry.pw_dir}",
+            f"USER={user}",
+            f"LOGNAME={user}",
+            "/bin/sh",
+            "-c",
+        ]
+    )
 
 
 def _path(path: str) -> Path:
@@ -80,8 +159,11 @@ def _read_from(path: Path, offset: int, limit: int) -> bytes:
 class OpRunner:
     """Runs ops on this machine and remembers recent answers."""
 
-    def __init__(self) -> None:
-        """Start with no answered ops and no tracked runs."""
+    def __init__(self, run_as: str = "", run_as_via: str = "sudo") -> None:
+        """
+        Start with no answered ops and no tracked runs. Task commands run as
+        *run_as* (switching with *run_as_via*), else as the agent's user.
+        """
         # macOS tar adds an AppleDouble "._<name>" file per file it packs
         # (extended attributes), which then show up as extra items in folder
         # artifacts. Every command the agent runs inherits this.
@@ -91,6 +173,39 @@ class OpRunner:
         self._running: dict[str, asyncio.Task[OpResult]] = {}
         self._run_jobs: dict[str, dict[str, int]] = {}
         """Per run: job dir -> process group of each job launched here."""
+        self._switch = switch_user(run_as, run_as_via) if run_as else ""
+
+    def _as_job(self, cmd: str) -> str:
+        """*cmd* as the task user runs it."""
+        if not self._switch:
+            return cmd
+        return f"{self._switch} {shlex.quote(f'umask {JOB_UMASK:03o}; {cmd}')}"
+
+    async def _kill_as_job(self, pgid: int, sig: int) -> None:
+        """Signal the task user's processes in group *pgid*."""
+        if not self._switch:
+            return
+        proc = await asyncio.create_subprocess_shell(
+            self._as_job(f"kill -{int(sig)} -{int(pgid)}"),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+    @staticmethod
+    def _job_pid(pid: int | None, job_dir: str) -> int | None:
+        """*pid*, which must be the job this agent launched in *job_dir*."""
+        if pid is None:
+            return None
+        try:
+            recorded = int((_path(job_dir) / "pid").read_text().strip())
+        except (FileNotFoundError, ValueError):
+            recorded = 0
+        if recorded <= 1 or recorded != pid:
+            raise ValueError(
+                f"No job with pid {pid} was launched in {job_dir}"
+            )
+        return recorded
 
     async def run(self, op: Op) -> OpResult:
         """
@@ -140,8 +255,9 @@ class OpRunner:
             case "launch":
                 return await self._launch(op.run_id, **args)
             case "poll":
+                pid = self._job_pid(args["pid"], args["job_dir"])
                 code = await local.poll(
-                    JobHandle(pid=args["pid"], job_dir=args["job_dir"])
+                    JobHandle(pid=pid, job_dir=args["job_dir"])
                 )
                 if code is not None:
                     horus_logger.log.info(
@@ -154,9 +270,12 @@ class OpRunner:
             case "read_output":
                 return self._read_output(**args)
             case "signal":
+                pid = self._job_pid(args["pid"], args["job_dir"])
+                if pid is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        await self._kill_as_job(os.getpgid(pid), args["sig"])
                 await local.send_signal(
-                    JobHandle(pid=args["pid"], job_dir=args["job_dir"]),
-                    args["sig"],
+                    JobHandle(pid=pid, job_dir=args["job_dir"]), args["sig"]
                 )
                 return None
             case "put_file":
@@ -201,7 +320,7 @@ class OpRunner:
                 await local.remove(str(path))
                 return None
             case "cancel_run":
-                return self._cancel_run(op.run_id)
+                return await self._cancel_run(op.run_id)
         raise ValueError(f"Unknown op: {op.method!r}")
 
     async def _exec(
@@ -211,10 +330,11 @@ class OpRunner:
         env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         _check_env(env)
-        horus_logger.log.debug(
-            f"exec in {cwd or os.getcwd()}: {safe_url(cmd)}"
+        shown = redact(cmd, (env or {}).values())
+        horus_logger.log.debug(f"exec in {cwd or os.getcwd()}: {shown}")
+        proc = await self._local.run_command_sync(
+            self._as_job(cmd), cwd=cwd, env=env
         )
-        proc = await self._local.run_command_sync(cmd, cwd=cwd, env=env)
         out, err = await proc.communicate()
         returncode = await proc.wait()
         horus_logger.log.debug(
@@ -245,10 +365,10 @@ class OpRunner:
         else:
             log.debug(
                 f"launch in {cwd or os.getcwd()} (job {job_dir}): "
-                f"{safe_url(cmd)}"
+                f"{redact(cmd, (env or {}).values())}"
             )
             handle = await self._local.launch(
-                cmd, cwd=cwd, env=env, job_dir=job_dir
+                self._as_job(cmd), cwd=cwd, env=env, job_dir=job_dir
             )
             pid = int(handle.pid or 0)
         if run_id is not None:
@@ -275,7 +395,7 @@ class OpRunner:
             "exited": (base / "exit_code").exists(),
         }
 
-    def _cancel_run(self, run_id: str | None) -> int:
+    async def _cancel_run(self, run_id: str | None) -> int:
         """
         Kill every still-running job this agent launched for *run_id*.
 
@@ -294,4 +414,6 @@ class OpRunner:
                 log.debug(
                     f"Cancel run {run_id}: killed group {pgid} ({job_dir})"
                 )
+            # The group's processes that run as the task user.
+            await self._kill_as_job(pgid, signal.SIGKILL)
         return killed

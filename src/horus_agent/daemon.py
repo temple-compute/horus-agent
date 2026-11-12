@@ -17,10 +17,14 @@ import os
 import platform
 import random
 import socket
+import ssl
 import time
+from urllib.parse import urlsplit
 from uuid import uuid4
 
+import certifi
 import httpx
+import pydantic
 from horus_runtime.logging import horus_logger
 
 from horus_agent.config import AgentConfig
@@ -31,6 +35,8 @@ from horus_agent.protocol import POLL_WAIT_S, Op, OpResult
 BACKOFF_MAX_S = 60.0
 MAX_HOLDING = 1000
 """Ops taken but unanswered before the agent stops taking more."""
+MAX_RUNNING = 64
+"""Ops run at once; the rest wait their turn."""
 MAX_BATCH_BYTES = 8 * 1024 * 1024
 DRAIN_TIMEOUT_S = 30.0
 """How long a stopping agent keeps trying to deliver its last results."""
@@ -48,6 +54,33 @@ def agent_version() -> str:
         return "0+unknown"
 
 
+LOOPBACK = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def check_broker_url(url: str) -> None:
+    """
+    Refuse a broker URL that is not ``https``, except on this machine's
+    loopback (a local TLS proxy, tests).
+
+    Raises:
+        ValueError: *url* would send the token in clear text.
+    """
+    parts = urlsplit(url)
+    if parts.scheme == "https" and parts.hostname:
+        return
+    if parts.scheme == "http" and parts.hostname in LOOPBACK:
+        return
+    raise ValueError(f"The broker URL must start with https://, not {url!r}")
+
+
+def broker_tls(ca_bundle: str = "") -> ssl.SSLContext:
+    """
+    TLS settings for the broker: verify against *ca_bundle* when set, else
+    certifi's CAs. ``SSL_CERT_FILE`` and ``SSL_CERT_DIR`` are ignored.
+    """
+    return ssl.create_default_context(cafile=ca_bundle or certifi.where())
+
+
 async def _pause(stop: asyncio.Event, seconds: float) -> None:
     """Sleep *seconds*, waking early if *stop* is set."""
     with contextlib.suppress(TimeoutError):
@@ -60,7 +93,8 @@ class Agent:
     def __init__(self, config: AgentConfig) -> None:
         """Serve as the agent registered in *config*."""
         self.config = config
-        self.runner = OpRunner()
+        self.runner = OpRunner(config.run_as, config.run_as_via)
+        self._slots = asyncio.Semaphore(MAX_RUNNING)
         self.session = uuid4().hex
         """
         New on every start. The broker compares it with the session an op
@@ -95,6 +129,7 @@ class Agent:
         async with httpx.AsyncClient(
             base_url=self.config.url.rstrip("/") + "/",
             headers={"Authorization": f"Bearer {self.config.token}"},
+            verify=broker_tls(self.config.ca_bundle),
             timeout=httpx.Timeout(30.0, read=POLL_WAIT_S + 30.0),
         ) as http:
             sender = asyncio.create_task(self._send_results(http, results))
@@ -175,7 +210,15 @@ class Agent:
                         ops = response.json()["ops"]
                         log.debug(f"Poll: {len(ops)} ops after {waited:.1f}s")
                         for raw in ops:
-                            op = Op.model_validate(raw)
+                            try:
+                                op = Op.model_validate(raw)
+                            except pydantic.ValidationError as exc:
+                                # Never held: the broker reports it lost.
+                                log.warning(
+                                    f"Ignoring a malformed op: "
+                                    f"{exc.error_count()} errors"
+                                )
+                                continue
                             self.holding.add(op.op_id)
                             task = asyncio.create_task(
                                 self._run_one(op, results)
@@ -193,11 +236,16 @@ class Agent:
     async def _run_one(self, op: Op, results: asyncio.Queue[OpResult]) -> None:
         log = horus_logger.log
         tag = f"Op {op.op_id[:8]} {op.method}"
+        env = op.args.get("env")
+        secrets = (
+            [str(v) for v in env.values()] if isinstance(env, dict) else []
+        )
         if summary := summarize(op.method, op.args):
             log.info(f"[run {(op.run_id or '-')[:8]}] {summary}")
         log.debug(f"{tag} start (run {op.run_id}): {describe_args(op.args)}")
         started = time.monotonic()
-        result = await self.runner.run(op)
+        async with self._slots:
+            result = await self.runner.run(op)
         took = time.monotonic() - started
         if result.error is not None:
             # Only the method and error: args carry task secrets in env.
@@ -215,7 +263,7 @@ class Agent:
                 log.info(f"launched pid {answer.get('pid')}")
             log.debug(
                 f"{tag} done in {took:.2f}s: "
-                f"{describe_result(op.method, result.result)}"
+                f"{describe_result(op.method, result.result, secrets)}"
             )
         await results.put(result)
 

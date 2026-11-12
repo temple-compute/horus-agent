@@ -32,6 +32,14 @@ class AgentConfig:
     Where tasks run on this machine. Empty in configs written before it
     existed: :func:`default_work_dir` then.
     """
+    run_as: str = ""
+    """Unix user that runs task commands. Empty: the agent's own user."""
+    run_as_via: str = "sudo"
+    """How to switch to :attr:`run_as`: ``sudo`` or ``setpriv``."""
+    ca_bundle: str = ""
+    """CA certificates that verify the broker. Empty: certifi's bundle."""
+    job_env: tuple[str, ...] = ()
+    """Agent environment variables passed to tasks, beyond the defaults."""
 
 
 def default_work_dir() -> Path:
@@ -59,4 +67,6 @@ def save(config: AgentConfig, path: Path) -> None:
 
 def load(path: Path) -> AgentConfig:
     """Read the config written by :func:`save`."""
-    return AgentConfig(**json.loads(path.read_text()))
+    raw = json.loads(path.read_text())
+    raw["job_env"] = tuple(raw.get("job_env", ()))
+    return AgentConfig(**raw)

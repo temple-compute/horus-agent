@@ -9,6 +9,10 @@ OpRunner, the agent-side dispatcher, without a broker.
 """
 
 import asyncio
+import base64
+import os
+import pwd
+import signal
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -110,3 +114,99 @@ async def test_answers_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
             Op(op_id=op_id, method="path_exists", args={"path": "/"})
         )
     assert list(runner._answered) == ["b"]
+
+
+async def test_poll_and_signal_only_own_jobs(tmp_path: Path) -> None:
+    runner = OpRunner()
+    job = str(tmp_path / "job")
+    launched = await run(runner, "launch", cmd="sleep 30", job_dir=job)
+    for pid in (os.getpid(), 0, -1):
+        for method, extra in (("poll", {}), ("signal", {"sig": 9})):
+            with pytest.raises(RuntimeError, match="No job with pid"):
+                await run(runner, method, pid=pid, job_dir=job, **extra)
+    with pytest.raises(RuntimeError, match="No job with pid"):
+        await run(runner, "poll", pid=1, job_dir=str(tmp_path / "other"))
+    await run(runner, "signal", pid=launched["pid"], job_dir=job, sig=9)
+    for _ in range(50):
+        status = await run(runner, "poll", pid=launched["pid"], job_dir=job)
+        if status is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert status not in (None, 0)
+
+
+def test_job_environment_keeps_only_safe_names() -> None:
+    environ = {
+        "PATH": "/bin",
+        "LC_ALL": "C",
+        "HTTPS_PROXY": "http://proxy:3128",
+        "HORUS_AGENT_CONFIG": "/etc/agent.json",
+        "AWS_SECRET_ACCESS_KEY": "s3cr3t",
+        "MODULEPATH": "/opt/modules",
+    }
+    assert ops.job_environment(environ, ("MODULEPATH",)) == {
+        "PATH": "/bin",
+        "LC_ALL": "C",
+        "HTTPS_PROXY": "http://proxy:3128",
+        "MODULEPATH": "/opt/modules",
+    }
+
+
+def test_switch_user_refuses_root_and_unknown_methods() -> None:
+    me = pwd.getpwuid(os.getuid()).pw_name
+    with pytest.raises(ValueError, match="root"):
+        ops.switch_user("root", "sudo")
+    with pytest.raises(ValueError, match="sudo or setpriv"):
+        ops.switch_user(me, "su")
+    with pytest.raises(KeyError):
+        ops.switch_user("no-such-user-horus", "sudo")
+
+
+@pytest.fixture
+def switch_log(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Fake ``sudo`` and ``setpriv`` that log their argv and run the rest."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = tmp_path / "switch.log"
+    for name in ("sudo", "setpriv"):
+        tool = bin_dir / name
+        tool.write_text(
+            "#!/bin/sh\n"
+            f'echo "{name} $*" >> {log}\n'
+            'while [ "$1" != "--" ]; do shift; done\n'
+            'shift\nexec "$@"\n'
+        )
+        tool.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    return log
+
+
+@pytest.mark.parametrize("via", ["sudo", "setpriv"])
+async def test_run_as_switches_user_without_secrets_in_argv(
+    via: str, switch_log: Path, tmp_path: Path
+) -> None:
+    me = pwd.getpwuid(os.getuid())
+    runner = OpRunner(run_as=me.pw_name, run_as_via=via)
+    result = await run(
+        runner,
+        "exec",
+        cmd='echo "$TASK_SECRET $HOME $USER"; umask',
+        env={"TASK_SECRET": "s3cr3t-value"},
+        cwd=str(tmp_path),
+    )
+    out = base64.b64decode(result["stdout"]).decode().split()
+    assert out == ["s3cr3t-value", me.pw_dir, me.pw_name, "0007"]
+    argv = switch_log.read_text()
+    assert argv.startswith(f"{via} ")
+    assert "s3cr3t-value" not in argv
+
+    job = str(tmp_path / "job")
+    launched = await run(runner, "launch", cmd="sleep 30", job_dir=job)
+    assert await run(runner, "cancel_run") == 1
+    for _ in range(50):
+        status = await run(runner, "poll", pid=launched["pid"], job_dir=job)
+        if status is not None:
+            break
+        await asyncio.sleep(0.1)
+    assert status not in (None, 0)
+    assert f"kill -{signal.SIGKILL}" in switch_log.read_text()
