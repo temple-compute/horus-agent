@@ -8,6 +8,7 @@
 Debug logs: everything the agent does, nothing secret.
 """
 
+import base64
 import logging
 from collections.abc import Generator
 from pathlib import Path
@@ -148,3 +149,47 @@ def test_summarize_shortens_long_commands() -> None:
     assert line is not None
     assert len(line) < 220
     assert logs.summarize("poll", {"pid": 1, "job_dir": "/j"}) is None
+
+
+def test_secrets_embedded_in_commands_are_redacted() -> None:
+    args = {
+        "cmd": "curl -H 'Authorization: Bearer eyJabc.def' "
+        "https://user:pa55word@h/x && run --password=hunter22 "
+        "DB_TOKEN=tok123456 'API_KEY: k-9' --key s3cr3t-value",
+        "env": {"S": "s3cr3t-value", "SHORT": "1"},
+    }
+    for line in (
+        logs.summarize("exec", args) or "",
+        logs.describe_args(args),
+    ):
+        for secret in (
+            "eyJabc",
+            "pa55word",
+            "hunter22",
+            "tok123456",
+            "k-9",
+            "s3cr3t-value",
+        ):
+            assert secret not in line, (secret, line)
+        assert "curl" in line
+        assert "https://<redacted>@h/x" in line
+    output = base64.b64encode(b"connected with s3cr3t-value").decode()
+    shown = logs.describe_result("exec", {"stdout": output}, ["s3cr3t-value"])
+    assert "s3cr3t-value" not in shown
+    assert "connected with <redacted>" in shown
+
+
+def test_redaction_runs_before_cutting_and_quoting() -> None:
+    secret = "PEMKEYLINE1\nPEMKEYLINE2\\x"
+    args = {"cmd": "x" * 195 + f"echo '{secret}'", "env": {"K": secret}}
+    line = logs.summarize("exec", args) or ""
+    assert "PEMKEY" not in line
+    assert "PEMKEY" not in logs.describe_args(args)
+    output = base64.b64encode(("y" * 295 + secret).encode()).decode()
+    assert "PEMKEY" not in logs.describe_result(
+        "exec", {"stdout": output}, [secret]
+    )
+    text = logs.redact('{"password": "p w"} run --token tok-123456 ok')
+    assert "p w" not in text
+    assert "tok-123456" not in text
+    assert text.endswith(" ok")

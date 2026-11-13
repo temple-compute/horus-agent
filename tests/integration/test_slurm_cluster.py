@@ -22,6 +22,7 @@ Opt-in. Start the cluster from a horus-slurm checkout, then run::
 
 import json
 import os
+import shutil
 import subprocess
 import time
 import uuid
@@ -42,6 +43,7 @@ ITEST_DIR = Path(
     os.environ.get("ITEST_DIR", f"/tmp/horus-agent-slurm-itest-{os.getuid()}")
 )
 INSTALL = Path(__file__).parents[1] / "slurm_cluster" / "install_agent.sh"
+FORWARD = Path(__file__).parents[1] / "slurm_cluster" / "forward.py"
 AGENT = "hpc"
 
 pytestmark = pytest.mark.skipif(
@@ -70,11 +72,25 @@ def cluster_broker() -> Generator[FakeBroker]:
     ).strip()
     broker.public_url = f"http://{gateway}:{broker.port}"
     subprocess.run([str(INSTALL), LOGIN, str(ITEST_DIR)], check=True)
+    uid = str(os.getuid())
+    # The agent takes plain http only on loopback: forward it to the host.
+    shutil.copy(FORWARD, ITEST_DIR / "forward.py")
+    _docker(
+        "exec",
+        "-d",
+        "-u",
+        uid,
+        LOGIN,
+        f"{ITEST_DIR}/agent-venv/bin/python",
+        f"{ITEST_DIR}/forward.py",
+        str(broker.port),
+        gateway,
+    )
     config = ITEST_DIR / "agent.json"
     config.write_text(
         json.dumps(
             {
-                "url": broker.public_url,
+                "url": f"http://127.0.0.1:{broker.port}",
                 "agent_id": "a1",
                 "name": AGENT,
                 "token": token,
@@ -82,7 +98,6 @@ def cluster_broker() -> Generator[FakeBroker]:
         )
     )
     config.chmod(0o600)
-    uid = str(os.getuid())
     _docker(
         "exec",
         "-d",
@@ -116,7 +131,7 @@ def cluster_broker() -> Generator[FakeBroker]:
                 LOGIN,
                 "pkill",
                 "-f",
-                "horus-agent run",
+                "horus-agent run|forward.py",
             ],
             check=False,
         )
