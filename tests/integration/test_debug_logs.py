@@ -177,3 +177,19 @@ def test_secrets_embedded_in_commands_are_redacted() -> None:
     shown = logs.describe_result("exec", {"stdout": output}, ["s3cr3t-value"])
     assert "s3cr3t-value" not in shown
     assert "connected with <redacted>" in shown
+
+
+def test_redaction_runs_before_cutting_and_quoting() -> None:
+    secret = "PEMKEYLINE1\nPEMKEYLINE2\\x"
+    args = {"cmd": "x" * 195 + f"echo '{secret}'", "env": {"K": secret}}
+    line = logs.summarize("exec", args) or ""
+    assert "PEMKEY" not in line
+    assert "PEMKEY" not in logs.describe_args(args)
+    output = base64.b64encode(("y" * 295 + secret).encode()).decode()
+    assert "PEMKEY" not in logs.describe_result(
+        "exec", {"stdout": output}, [secret]
+    )
+    text = logs.redact('{"password": "p w"} run --token tok-123456 ok')
+    assert "p w" not in text
+    assert "tok-123456" not in text
+    assert text.endswith(" ok")

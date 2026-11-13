@@ -17,9 +17,11 @@ import ssl
 import stat
 from pathlib import Path
 
+import certifi
 import pytest
+from horus_runtime.logging import horus_logger
 
-from horus_agent import config
+from horus_agent import config, logs
 from horus_agent.cli import main
 from horus_agent.config import AgentConfig
 from horus_agent.daemon import (
@@ -28,6 +30,7 @@ from horus_agent.daemon import (
     broker_tls,
     check_broker_url,
 )
+from horus_agent.protocol import Op, OpResult
 from horus_agent.target import AgentTarget
 from tests.fake_broker import REGISTRATION_TOKEN, FakeBroker
 
@@ -203,7 +206,7 @@ def test_run_refuses_a_config_others_can_read(
     assert "chmod 600" in capsys.readouterr().err
 
 
-def test_run_restricts_umask_and_environment(
+def test_run_restricts_umask_and_names_dropped_variables(
     broker: FakeBroker,
     config_file: Path,
     tmp_path: Path,
@@ -222,25 +225,47 @@ def test_run_restricts_umask_and_environment(
         ),
         config_file,
     )
-    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s3cr3t")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "s3cr3t-value")
     monkeypatch.setenv("MODULEPATH", "/opt/modules")
-    assert main(["run"]) == 1
-    assert "AWS_SECRET_ACCESS_KEY" not in os.environ
-    assert config.CONFIG_ENV not in os.environ
-    assert os.environ["MODULEPATH"] == "/opt/modules"
+    lines: list[str] = []
+    monkeypatch.setattr(logs, "setup", lambda _debug=False: False)
+    sink = horus_logger.log.add(lambda m: lines.append(str(m)), level="INFO")
+    try:
+        assert main(["run"]) == 1
+    finally:
+        horus_logger.log.remove(sink)
+    dropped = next(line for line in lines if "do not get" in line)
+    assert "AWS_SECRET_ACCESS_KEY" in dropped
+    assert "s3cr3t-value" not in dropped
+    assert "MODULEPATH" not in dropped
     assert stat.S_IMODE(work.stat().st_mode) == 0o750
     assert os.umask(0o077) == 0o077
+
+
+def test_run_refuses_a_read_only_work_dir(
+    config_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    work = tmp_path / "work"
+    work.mkdir(mode=0o500)
+    config.save(
+        AgentConfig(
+            url="https://b",
+            agent_id="i",
+            name="n",
+            token="t",
+            work_dir=str(work),
+        ),
+        config_file,
+    )
+    assert main(["run"]) == 1
+    assert "ReadWritePaths" in capsys.readouterr().err
 
 
 def test_config_without_new_fields_loads(tmp_path: Path) -> None:
     path = tmp_path / "agent.json"
     path.write_text('{"url": "u", "agent_id": "i", "name": "n", "token": "t"}')
     loaded = config.load(path)
-    assert (loaded.run_as, loaded.run_as_via, loaded.job_env) == (
-        "",
-        "sudo",
-        (),
-    )
+    assert (loaded.ca_bundle, loaded.job_env) == ("", ())
     saved = AgentConfig(
         url="u", agent_id="i", name="n", token="t", job_env=("A", "B")
     )
@@ -248,14 +273,60 @@ def test_config_without_new_fields_loads(tmp_path: Path) -> None:
     assert config.load(path) == saved
 
 
-@pytest.mark.usefixtures("stdin_token")
-def test_register_rejects_unknown_run_as_user(
-    config_file: Path, capsys: pytest.CaptureFixture[str]
+def test_config_parents_are_private(tmp_path: Path) -> None:
+    os.umask(0o007)
+    path = tmp_path / "home" / ".config" / "horus-agent" / "agent.json"
+    config.save(AgentConfig(url="u", agent_id="i", name="n", token="t"), path)
+    for directory in (path.parent, path.parent.parent, tmp_path / "home"):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory
+    assert os.umask(0o007) == 0o007
+
+
+@pytest.fixture
+def policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "etc" / "policy.toml"
+    path.parent.mkdir(mode=0o755)
+    monkeypatch.setattr(config, "POLICY_PATH", path)
+    return path
+
+
+def test_jobs_policy_must_be_root_owned(
+    policy: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    argv = ["register", "--url", "https://b", "--run-as", "no-such-user-x"]
-    assert main(argv) == 1
+    assert config.load_jobs_policy(policy) == config.JobsPolicy()
+    policy.write_text('[jobs]\nrun_as = "horus-job"\nrun_as_via = "setpriv"\n')
+    policy.chmod(0o644)
+    with pytest.raises(ValueError, match="owned by root"):
+        config.load_jobs_policy(policy)
+    monkeypatch.setattr(config, "POLICY_OWNERS", {0, os.getuid()})
+    assert config.load_jobs_policy(policy) == config.JobsPolicy(
+        "horus-job", "setpriv"
+    )
+    policy.parent.chmod(0o775)
+    with pytest.raises(ValueError, match=str(policy.parent)):
+        config.load_jobs_policy(policy)
+
+
+@pytest.mark.usefixtures("stdin_token")
+def test_register_and_run_check_the_jobs_policy(
+    policy: Path,
+    config_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    policy.write_text('[jobs]\nrun_as = "no-such-user-x"\n')
+    assert main(["register", "--url", "https://b"]) == 1
+    assert "owned by root" in capsys.readouterr().err
+    monkeypatch.setattr(config, "POLICY_OWNERS", {0, os.getuid()})
+    assert main(["register", "--url", "https://b"]) == 1
     assert "no-such-user-x" in capsys.readouterr().err
     assert not config_file.exists()
+    config.save(
+        AgentConfig(url="https://b", agent_id="i", name="n", token="t"),
+        config_file,
+    )
+    assert main(["run"]) == 1
+    assert "no-such-user-x" in capsys.readouterr().err
 
 
 async def test_agent_survives_broker_errors(
@@ -303,6 +374,30 @@ def test_broker_url_and_tls(tmp_path: Path) -> None:
     assert broker_tls().verify_mode == ssl.CERT_REQUIRED
     with pytest.raises(OSError):
         broker_tls(str(tmp_path / "missing.pem"))
+
+
+def test_broker_tls_keeps_ssl_cert_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "from-env.pem"))
+    with pytest.raises(OSError):
+        broker_tls()  # the env file is used, and is missing here
+    assert broker_tls(certifi.where()).verify_mode == ssl.CERT_REQUIRED
+
+
+async def test_control_ops_never_wait_for_a_slot(tmp_path: Path) -> None:
+    agent = Agent(
+        AgentConfig(url="https://b", agent_id="a", name="x", token="t")
+    )
+    agent._slots = asyncio.Semaphore(0)  # every slot taken
+    results: asyncio.Queue[OpResult] = asyncio.Queue()
+    control = Op(op_id="a", method="path_exists", args={"path": "/"})
+    await asyncio.wait_for(agent._run_one(control, results), 5)
+    work = Op(op_id="b", method="mkdir", args={"path": str(tmp_path / "d")})
+    waiting = asyncio.create_task(agent._run_one(work, results))
+    await asyncio.sleep(0.2)
+    assert not waiting.done()
+    waiting.cancel()
 
 
 async def test_unauthorized_agent_stops(broker: FakeBroker) -> None:

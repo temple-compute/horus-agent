@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import httpx
+from horus_runtime.logging import horus_logger
 
 from horus_agent import config, logs, ops
 from horus_agent.daemon import (
@@ -66,11 +67,7 @@ def _token(argv_token: str | None) -> str:
 def _register(args: argparse.Namespace) -> int:
     url: str = args.url
     check_broker_url(url)
-    run_as: str = args.run_as or ""
-    if run_as:
-        # Fails early on a missing user or an unknown method.
-        ops.switch_user(run_as, args.run_as_via)
-    os.umask(ops.JOB_UMASK if run_as else 0o077)
+    _umask(config.load_jobs_policy())
     token = _token(args.token)
     if not token:
         sys.stderr.write("No registration token given.\n")
@@ -109,8 +106,6 @@ def _register(args: argparse.Namespace) -> int:
             name=registration.name,
             token=registration.agent_token,
             work_dir=str(directory),
-            run_as=run_as,
-            run_as_via=args.run_as_via,
             ca_bundle=ca_bundle,
             job_env=tuple(args.job_env or ()),
         ),
@@ -122,6 +117,16 @@ def _register(args: argparse.Namespace) -> int:
         "Start it with: horus-agent run\n"
     )
     return 0
+
+
+def _umask(jobs: config.JobsPolicy) -> None:
+    """
+    Keep new files from other users, sharing them with the task user's
+    group under ``run_as``. Checks the ``run_as`` setup first.
+    """
+    if jobs.run_as:
+        ops.switch_user(jobs.run_as, jobs.run_as_via)
+    os.umask(ops.JOB_UMASK if jobs.run_as else 0o077)
 
 
 async def _run(work_dir: str | None) -> int:
@@ -141,16 +146,26 @@ async def _run(work_dir: str | None) -> int:
         return 1
     try:
         check_broker_url(registered.url)
-        os.umask(ops.JOB_UMASK if registered.run_as else 0o077)
-        # Tasks inherit the agent's environment: keep only what they need.
-        keep = ops.job_environment(dict(os.environ), registered.job_env)
-        os.environ.clear()
-        os.environ.update(keep)
+        jobs = config.load_jobs_policy()
+        _umask(jobs)
         directory = _work_dir(work_dir or registered.work_dir or None)
-        agent = Agent(dataclasses.replace(registered, work_dir=str(directory)))
+        if not os.access(directory, os.W_OK):
+            raise ValueError(
+                f"The work dir {directory} is not writable (with the system "
+                "unit it must be under ReadWritePaths)"
+            )
+        agent = Agent(
+            dataclasses.replace(registered, work_dir=str(directory)), jobs
+        )
     except (ValueError, KeyError, OSError) as exc:
         sys.stderr.write(f"{exc}\n")
         return 1
+    kept = ops.job_environment(dict(os.environ), registered.job_env)
+    if dropped := sorted(set(os.environ) - set(kept)):
+        horus_logger.log.info(
+            "Tasks do not get these variables of the agent's environment "
+            f"(job_env in the config passes them on): {', '.join(dropped)}"
+        )
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
 
@@ -187,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument(
         "--allow-root",
         action="store_true",
-        help="Run as root anyway. Tasks would then run as root too.",
+        help="Run as root anyway. Without run_as, tasks then run as root too.",
     )
     commands = parser.add_subparsers(dest="command", required=True)
     register = commands.add_parser(
@@ -211,20 +226,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     register.add_argument("--work-dir", help=work_dir_help)
     register.add_argument(
-        "--run-as",
-        metavar="USER",
-        help="Run task commands as this Unix user, not the agent's.",
-    )
-    register.add_argument(
-        "--run-as-via",
-        choices=("sudo", "setpriv"),
-        default="sudo",
-        help="How to switch to --run-as. Default: sudo.",
-    )
-    register.add_argument(
         "--ca-bundle",
         metavar="PEM",
-        help="Trust only these CA certificates for the broker.",
+        help="Trust only these CA certificates for the broker. Default: "
+        "SSL_CERT_FILE or SSL_CERT_DIR when set, else the certifi bundle.",
     )
     register.add_argument(
         "--job-env",
@@ -243,8 +248,8 @@ def main(argv: list[str] | None = None) -> int:
     logs.setup(args.debug)
     if os.geteuid() == 0 and not args.allow_root:
         sys.stderr.write(
-            "Refusing to run as root: run the agent as its own user "
-            "(--allow-root to override).\n"
+            "Refusing to run as root: run the agent as its own user (see "
+            "Upgrading in the README), or pass --allow-root.\n"
         )
         return 1
     if args.command == "run":

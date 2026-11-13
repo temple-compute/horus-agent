@@ -27,7 +27,7 @@ import httpx
 import pydantic
 from horus_runtime.logging import horus_logger
 
-from horus_agent.config import AgentConfig
+from horus_agent.config import AgentConfig, JobsPolicy
 from horus_agent.logs import describe_args, describe_result, summarize
 from horus_agent.ops import OpRunner
 from horus_agent.protocol import POLL_WAIT_S, Op, OpResult
@@ -37,6 +37,10 @@ MAX_HOLDING = 1000
 """Ops taken but unanswered before the agent stops taking more."""
 MAX_RUNNING = 64
 """Ops run at once; the rest wait their turn."""
+CONTROL_METHODS = frozenset(
+    {"poll", "read_output", "signal", "cancel_run", "path_exists"}
+)
+"""Quick ops that never wait behind :data:`MAX_RUNNING` long ones."""
 MAX_BATCH_BYTES = 8 * 1024 * 1024
 DRAIN_TIMEOUT_S = 30.0
 """How long a stopping agent keeps trying to deliver its last results."""
@@ -76,9 +80,15 @@ def check_broker_url(url: str) -> None:
 def broker_tls(ca_bundle: str = "") -> ssl.SSLContext:
     """
     TLS settings for the broker: verify against *ca_bundle* when set, else
-    certifi's CAs. ``SSL_CERT_FILE`` and ``SSL_CERT_DIR`` are ignored.
+    ``SSL_CERT_FILE`` or ``SSL_CERT_DIR`` as before, else certifi's CAs.
     """
-    return ssl.create_default_context(cafile=ca_bundle or certifi.where())
+    if ca_bundle:
+        return ssl.create_default_context(cafile=ca_bundle)
+    if cafile := os.environ.get("SSL_CERT_FILE"):
+        return ssl.create_default_context(cafile=cafile)
+    if capath := os.environ.get("SSL_CERT_DIR"):
+        return ssl.create_default_context(capath=capath)
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 async def _pause(stop: asyncio.Event, seconds: float) -> None:
@@ -90,10 +100,16 @@ async def _pause(stop: asyncio.Event, seconds: float) -> None:
 class Agent:
     """One running agent process."""
 
-    def __init__(self, config: AgentConfig) -> None:
-        """Serve as the agent registered in *config*."""
+    def __init__(
+        self, config: AgentConfig, jobs: JobsPolicy | None = None
+    ) -> None:
+        """
+        Serve as the agent registered in *config*, running tasks as *jobs*
+        says.
+        """
         self.config = config
-        self.runner = OpRunner(config.run_as, config.run_as_via)
+        jobs = jobs or JobsPolicy()
+        self.runner = OpRunner(jobs.run_as, jobs.run_as_via, config.job_env)
         self._slots = asyncio.Semaphore(MAX_RUNNING)
         self.session = uuid4().hex
         """
@@ -227,6 +243,8 @@ class Agent:
                             task.add_done_callback(running.discard)
                     continue
                 failure = f"HTTP {response.status_code}"
+            if "CERTIFICATE_VERIFY_FAILED" in failure:
+                failure += "; set ca_bundle in the agent's config"
             horus_logger.log.warning(
                 f"Broker poll failed ({failure}); retrying in {delay:.0f}s"
             )
@@ -244,7 +262,12 @@ class Agent:
             log.info(f"[run {(op.run_id or '-')[:8]}] {summary}")
         log.debug(f"{tag} start (run {op.run_id}): {describe_args(op.args)}")
         started = time.monotonic()
-        async with self._slots:
+        slot = (
+            contextlib.nullcontext()
+            if op.method in CONTROL_METHODS
+            else self._slots
+        )
+        async with slot:
             result = await self.runner.run(op)
         took = time.monotonic() - started
         if result.error is not None:

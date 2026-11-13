@@ -10,18 +10,21 @@ Agent side: run each op on this machine through Horus's own LocalTarget.
 
 import asyncio
 import contextlib
+import errno
 import os
 import pwd
 import re
 import shlex
+import shutil
 import signal
+import stat
 import tempfile
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from horus_builtin.target.local import LocalTarget
-from horus_runtime.core.target.channel import JobHandle
+from horus_runtime.core.target.channel import build_detach_command
 from horus_runtime.logging import horus_logger
 
 from horus_agent import blobs
@@ -67,6 +70,14 @@ JOB_ENV = frozenset(
 JOB_UMASK = 0o007
 """Task files are shared with the agent through the work dir's group."""
 
+SWITCH_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+"""Where ``sudo`` and ``setpriv`` are looked up: system dirs only."""
+SPAWN_ENV = {"PATH": "/usr/bin:/bin"}
+"""
+The whole environment of the process that starts a task: the task's own
+is applied after the user switch.
+"""
+
 
 def job_environment(
     environ: dict[str, str], extra: tuple[str, ...] = ()
@@ -76,14 +87,15 @@ def job_environment(
     return {
         name: value
         for name, value in environ.items()
-        if name in keep or name.startswith("LC_")
+        if (name in keep or name.startswith("LC_"))
+        and _ENV_NAME.fullmatch(name)
     }
 
 
-def switch_user(user: str, via: str) -> str:
+def switch_user(user: str, via: str) -> list[str]:
     """
-    Shell prefix that runs ``sh -c <script>`` as *user*, keeping the
-    environment (task env values never go on a command line).
+    Command prefix that runs the rest of the command line as *user*, with
+    ``sudo`` or ``setpriv`` found by absolute path in :data:`SWITCH_PATH`.
 
     ``sudo`` needs a sudoers rule letting the agent run anything as *user*;
     ``setpriv`` needs CAP_SETUID and CAP_SETGID (systemd
@@ -92,30 +104,21 @@ def switch_user(user: str, via: str) -> str:
     entry = pwd.getpwnam(user)
     if entry.pw_uid == 0:
         raise ValueError("Tasks must not run as root")
-    if via == "sudo":
-        argv = ["sudo", "-n", "-E", "-u", user, "--"]
-    elif via == "setpriv":
-        argv = [
-            "setpriv",
-            f"--reuid={entry.pw_uid}",
-            f"--regid={entry.pw_gid}",
-            "--init-groups",
-            "--inh-caps=-all",
-            "--",
-        ]
-    else:
+    if via not in ("sudo", "setpriv"):
         raise ValueError(f"run_as_via must be sudo or setpriv, not {via!r}")
-    return shlex.join(
-        [
-            *argv,
-            "env",
-            f"HOME={entry.pw_dir}",
-            f"USER={user}",
-            f"LOGNAME={user}",
-            "/bin/sh",
-            "-c",
-        ]
-    )
+    tool = shutil.which(via, path=SWITCH_PATH)
+    if tool is None:
+        raise ValueError(f"run_as_via is {via}, but {via} is not installed")
+    if via == "sudo":
+        return [tool, "-n", "-u", user, "--"]
+    return [
+        tool,
+        f"--reuid={entry.pw_uid}",
+        f"--regid={entry.pw_gid}",
+        "--init-groups",
+        "--inh-caps=-all",
+        "--",
+    ]
 
 
 def _path(path: str) -> Path:
@@ -146,66 +149,159 @@ def _output(name: str, data: bytes) -> dict[str, str]:
     return {f"{name}_file": path}
 
 
-def _read_from(path: Path, offset: int, limit: int) -> bytes:
-    """Up to *limit* bytes of *path* from *offset*; empty if missing."""
+def _open_regular(path: Path) -> BinaryIO:
+    """
+    *path* opened for reading. A symlink is refused whatever it points to,
+    and so is anything but a regular file (a FIFO would block the agent).
+    """
     try:
-        with path.open("rb") as fh:
-            fh.seek(offset)
-            return fh.read(limit)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"Refusing to follow a symlink: {path}") from exc
+        raise
+    fh = os.fdopen(fd, "rb")
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        fh.close()
+        raise ValueError(f"Not a regular file: {path}")
+    return fh
+
+
+def _job_file(
+    job_dir: str, name: str, offset: int = 0, limit: int = -1
+) -> bytes:
+    """
+    Up to *limit* bytes from *offset* of file *name* in *job_dir*, empty if
+    missing. Tasks can write in job dirs: neither may be a symlink.
+    """
+    base = _path(job_dir)
+    if base.is_symlink():
+        raise ValueError(f"Refusing to follow a symlink: {base}")
+    try:
+        fh = _open_regular(base / name)
     except FileNotFoundError:
         return b""
+    with fh:
+        fh.seek(offset)
+        return fh.read(limit)
 
 
 class OpRunner:
     """Runs ops on this machine and remembers recent answers."""
 
-    def __init__(self, run_as: str = "", run_as_via: str = "sudo") -> None:
+    def __init__(
+        self,
+        run_as: str = "",
+        run_as_via: str = "sudo",
+        job_env: tuple[str, ...] = (),
+    ) -> None:
         """
         Start with no answered ops and no tracked runs. Task commands run as
-        *run_as* (switching with *run_as_via*), else as the agent's user.
+        *run_as* (switching with *run_as_via*), else as the agent's user,
+        with the agent environment variables :func:`job_environment` keeps.
         """
-        # macOS tar adds an AppleDouble "._<name>" file per file it packs
-        # (extended attributes), which then show up as extra items in folder
-        # artifacts. Every command the agent runs inherits this.
-        os.environ.setdefault("COPYFILE_DISABLE", "1")
         self._local = LocalTarget()
         self._answered: OrderedDict[str, OpResult] = OrderedDict()
         self._running: dict[str, asyncio.Task[OpResult]] = {}
         self._run_jobs: dict[str, dict[str, int]] = {}
         """Per run: job dir -> process group of each job launched here."""
-        self._switch = switch_user(run_as, run_as_via) if run_as else ""
+        self._pids: dict[str, int] = {}
+        """Job dir -> pid of each job launched by this process."""
+        self._switch = switch_user(run_as, run_as_via) if run_as else []
+        self._umask = JOB_UMASK if run_as else 0o077
+        self._env = {
+            **job_environment(dict(os.environ), job_env),
+            # macOS tar adds an AppleDouble "._<name>" file per file it
+            # packs, which then show up as extra items in folder artifacts.
+            "COPYFILE_DISABLE": "1",
+        }
+        if run_as:
+            home = pwd.getpwnam(run_as).pw_dir
+            self._env |= {"HOME": home, "USER": run_as, "LOGNAME": run_as}
 
-    def _as_job(self, cmd: str) -> str:
-        """*cmd* as the task user runs it."""
-        if not self._switch:
-            return cmd
-        return f"{self._switch} {shlex.quote(f'umask {JOB_UMASK:03o}; {cmd}')}"
+    async def _shell(
+        self, script: str, env: dict[str, str] | None, *, capture: bool
+    ) -> tuple[int, bytes, bytes]:
+        """
+        Run ``/bin/sh -c`` *script* as the task user, in a new session.
 
-    async def _kill_as_job(self, pgid: int, sig: int) -> None:
-        """Signal the task user's processes in group *pgid*."""
-        if not self._switch:
-            return
-        proc = await asyncio.create_subprocess_shell(
-            self._as_job(f"kill -{int(sig)} -{int(pgid)}"),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        The process starts with :data:`SPAWN_ENV` as its whole environment.
+        The task's environment (the agent's kept variables, then *env*) is
+        read from stdin once the user is switched, so no task value can
+        steer the switch or appear on a command line. (The inherited pipe
+        is read with ``cat``: ``/dev/stdin`` cannot be reopened as the task
+        user.)
+        """
+        _check_env(env)
+        exports = "".join(
+            f"export {name}={shlex.quote(value)}\n"
+            for name, value in {**self._env, **(env or {})}.items()
         )
-        await proc.wait()
+        out = (
+            asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL
+        )
+        proc = await asyncio.create_subprocess_exec(
+            *self._switch,
+            "/bin/sh",
+            "-c",
+            f'umask {self._umask:03o}; eval "$(cat)"\n{script}',
+            stdin=asyncio.subprocess.PIPE,
+            stdout=out,
+            stderr=out,
+            env=SPAWN_ENV,
+            start_new_session=True,
+        )
+        stdout, stderr = await proc.communicate(exports.encode())
+        return await proc.wait(), stdout or b"", stderr or b""
 
-    @staticmethod
-    def _job_pid(pid: int | None, job_dir: str) -> int | None:
+    async def _signal(self, pgid: int, sig: int) -> bool:
+        """
+        Send *sig* to process group *pgid*, as the task user with ``run_as``
+        (so only task processes can be reached). Whether it was delivered.
+        """
+        if self._switch:
+            code, _, _ = await self._shell(
+                f"kill -{int(sig)} -{int(pgid)}", None, capture=False
+            )
+            return code == 0
+        if pgid == os.getpgrp():
+            raise ValueError("Refusing to signal the agent's process group")
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+
+    def _job_pid(self, pid: int | None, job_dir: str) -> int | None:
         """*pid*, which must be the job this agent launched in *job_dir*."""
         if pid is None:
             return None
-        try:
-            recorded = int((_path(job_dir) / "pid").read_text().strip())
-        except (FileNotFoundError, ValueError):
-            recorded = 0
-        if recorded <= 1 or recorded != pid:
+        known = self._pids.get(job_dir)
+        if known is None:
+            # Launched before a restart: the job dir records it.
+            try:
+                known = int(_job_file(job_dir, "pid").strip() or 0)
+            except ValueError:
+                known = 0
+        if known <= 1 or known != pid:
             raise ValueError(
                 f"No job with pid {pid} was launched in {job_dir}"
             )
-        return recorded
+        return known
+
+    def _poll(self, pid: int | None, job_dir: str) -> int | None:
+        """``None`` while the job runs, then its exit code (-1: lost)."""
+        if code := _job_file(job_dir, "exit_code").strip():
+            return int(code)
+        if pid is None:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return -1
+        except PermissionError:
+            pass
+        return None
 
     async def run(self, op: Op) -> OpResult:
         """
@@ -256,9 +352,7 @@ class OpRunner:
                 return await self._launch(op.run_id, **args)
             case "poll":
                 pid = self._job_pid(args["pid"], args["job_dir"])
-                code = await local.poll(
-                    JobHandle(pid=pid, job_dir=args["job_dir"])
-                )
+                code = self._poll(pid, args["job_dir"])
                 if code is not None:
                     horus_logger.log.info(
                         f"Job pid {args['pid']} in {args['job_dir']} exited "
@@ -273,10 +367,7 @@ class OpRunner:
                 pid = self._job_pid(args["pid"], args["job_dir"])
                 if pid is not None:
                     with contextlib.suppress(ProcessLookupError):
-                        await self._kill_as_job(os.getpgid(pid), args["sig"])
-                await local.send_signal(
-                    JobHandle(pid=pid, job_dir=args["job_dir"]), args["sig"]
-                )
+                        await self._signal(os.getpgid(pid), args["sig"])
                 return None
             case "put_file":
                 await local.put_file(
@@ -329,14 +420,12 @@ class OpRunner:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        _check_env(env)
         shown = redact(cmd, (env or {}).values())
         horus_logger.log.debug(f"exec in {cwd or os.getcwd()}: {shown}")
-        proc = await self._local.run_command_sync(
-            self._as_job(cmd), cwd=cwd, env=env
+        prefix = f"cd {shlex.quote(cwd)} || exit 1\n" if cwd else ""
+        returncode, out, err = await self._shell(
+            prefix + cmd, env, capture=True
         )
-        out, err = await proc.communicate()
-        returncode = await proc.wait()
         horus_logger.log.debug(
             f"exec exited {returncode}: {len(out)} bytes stdout, "
             f"{len(err)} bytes stderr"
@@ -355,22 +444,24 @@ class OpRunner:
         cwd: str | None = None,
         env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        _check_env(env)
-        pid_file = _path(job_dir) / "pid"
         log = horus_logger.log
-        if pid_file.exists():
+        if recorded := _job_file(job_dir, "pid").strip():
             # An earlier delivery of this launch already started the job.
-            pid = int(pid_file.read_text().strip())
+            pid = int(recorded)
             log.debug(f"Job in {job_dir} already started as pid {pid}")
         else:
             log.debug(
                 f"launch in {cwd or os.getcwd()} (job {job_dir}): "
                 f"{redact(cmd, (env or {}).values())}"
             )
-            handle = await self._local.launch(
-                self._as_job(cmd), cwd=cwd, env=env, job_dir=job_dir
+            inner = f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+            await self._shell(
+                build_detach_command(inner, job_dir), env, capture=False
             )
-            pid = int(handle.pid or 0)
+            pid = int(_job_file(job_dir, "pid").strip() or 0)
+            if pid <= 1:
+                raise RuntimeError(f"The job in {job_dir} did not start")
+        self._pids[job_dir] = pid
         if run_id is not None:
             with contextlib.suppress(ProcessLookupError):
                 pgid = os.getpgid(pid)
@@ -384,15 +475,14 @@ class OpRunner:
     def _read_output(
         job_dir: str, stdout_offset: int, stderr_offset: int
     ) -> dict[str, Any]:
-        base = _path(job_dir)
         limit = INLINE_LIMIT // 2
-        out = _read_from(base / "stdout.log", stdout_offset, limit)
-        err = _read_from(base / "stderr.log", stderr_offset, limit)
+        out = _job_file(job_dir, "stdout.log", stdout_offset, limit)
+        err = _job_file(job_dir, "stderr.log", stderr_offset, limit)
         return {
             "stdout": b64e(out),
             "stderr": b64e(err),
             "more": len(out) == limit or len(err) == limit,
-            "exited": (base / "exit_code").exists(),
+            "exited": (_path(job_dir) / "exit_code").exists(),
         }
 
     async def _cancel_run(self, run_id: str | None) -> int:
@@ -408,12 +498,9 @@ class OpRunner:
             if (Path(job_dir) / "exit_code").exists():
                 log.debug(f"Cancel run {run_id}: {job_dir} already finished")
                 continue
-            with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pgid, signal.SIGKILL)
+            if await self._signal(pgid, signal.SIGKILL):
                 killed += 1
                 log.debug(
                     f"Cancel run {run_id}: killed group {pgid} ({job_dir})"
                 )
-            # The group's processes that run as the task user.
-            await self._kill_as_job(pgid, signal.SIGKILL)
         return killed

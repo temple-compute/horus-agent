@@ -32,9 +32,13 @@ _QUERY = re.compile(r"(https?://[^\s\"'?<>]*)\?[^\s\"'<>)]*")
 
 
 _USERINFO = re.compile(r"://[^/\s@:]+:[^/\s@]+@")
+_SECRET_NAME = (
+    r"[\w.-]*(?:token|secret|passw(?:or)?d|api[_-]?key|access[_-]?key)[\w.-]*"
+)
 _CREDENTIAL = re.compile(
-    r"(?i)\b((?:bearer|basic)\s+|[\w.-]*(?:token|secret|passw(?:or)?d|"
-    r"api[_-]?key|access[_-]?key)[\w.-]*\s*[=:]\s*)"
+    # Bearer x, name=x, name: x, "name": "x", --name x
+    rf"(?i)((?:\bbearer|\bbasic)\s+|\b{_SECRET_NAME}[\"']?\s*[=:]\s*"
+    rf"|(?<![\w-])--{_SECRET_NAME}\s+)"
     r"(?:\"[^\"]*\"|'[^']*'|[^\s;&|'\"]+)"
 )
 MIN_SECRET_CHARS = 6
@@ -101,9 +105,12 @@ def _preview(value: str, secrets: Iterable[str]) -> str:
         text = base64.b64decode(value).decode(errors="replace")
     except (binascii.Error, ValueError):
         return f"<{_b64_size(value)} bytes>"
+    # Redact before cutting, or a secret across the cut would show its start.
+    size = len(text)
+    text = redact(text, secrets)
     if len(text) > PREVIEW_CHARS:
-        text = text[:PREVIEW_CHARS] + f"… ({len(text)} chars)"
-    return redact(repr(text), secrets)
+        text = text[:PREVIEW_CHARS] + f"… ({size} chars)"
+    return repr(text)
 
 
 QUIET_METHODS = frozenset({"poll", "read_output"})
@@ -120,10 +127,10 @@ def summarize(method: str, args: dict[str, Any]) -> str | None:
     if method in QUIET_METHODS:
         return None
     if "cmd" in args:
-        cmd = " ".join(str(args["cmd"]).split())
+        cmd = " ".join(redact(args["cmd"], _env_values(args)).split())
         if len(cmd) > SUMMARY_CHARS:
             cmd = cmd[:SUMMARY_CHARS] + "…"
-        detail = redact(cmd, _env_values(args))
+        detail = cmd
     elif "path" in args:
         detail = redact(args["path"])
         if isinstance(args.get("data"), str):
@@ -147,7 +154,12 @@ def describe_args(args: dict[str, Any]) -> str:
             parts.append(f"data=<{_b64_size(value)} bytes>")
         else:
             # Commands can hold presigned URLs (curl transfers).
-            parts.append(f"{key}={redact(repr(value), secrets)}")
+            shown = (
+                repr(redact(value, secrets))
+                if isinstance(value, str)
+                else redact(repr(value), secrets)
+            )
+            parts.append(f"{key}={shown}")
     return " ".join(parts)
 
 
