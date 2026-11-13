@@ -24,6 +24,7 @@ import json
 import os
 import posixpath
 import re
+import unicodedata
 import zipfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
@@ -31,7 +32,7 @@ from typing import Any
 
 import yaml
 
-from horus_agent.template import placeholders
+from horus_agent.template import placeholders, unsafe_placeholders
 
 SCHEMA = 1
 WORKFLOW_MEMBER = "workflow.yaml"
@@ -44,8 +45,14 @@ VALUE_KINDS = frozenset(
 """Artifact kinds whose placeholder renders their value, not a path."""
 
 RESERVED_ENV = re.compile(
-    r"LD_.*|DYLD_.*|PYTHON.*|PATH|BASH_ENV|ENV|HOME|SHELL|IFS|"
-    r"HORUS_SIDE_ARTIFACTS_DIR",
+    r"LD_.*|DYLD_.*|PYTHON.*|PATH|BASH_ENV|ENV|HOME|SHELL|IFS|HORUS_.*|"
+    # Settings that change what the shell, a scheduler or an interpreter
+    # runs, or where its traffic and temporary files go.
+    r"SBATCH_.*|SLURM_.*|PERL5.*|PERLLIB|NODE_OPTIONS|NODE_PATH|"
+    r"JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|RUBYOPT|RUBYLIB|"
+    r"GCONV_PATH|OPENSSL_.*|PS4|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|CDPATH|"
+    r"GLOBIGNORE|BASH_FUNC_.*|R_PROFILE.*|R_ENVIRON.*|R_LIBS.*|GIT_.*|"
+    r"TMPDIR|SSL_CERT_.*|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|.*_PROXY",
     re.IGNORECASE,
 )
 """Environment names a task's secrets may not set on an agent."""
@@ -250,9 +257,37 @@ def build_manifest_from_workflow(
     builder = _Builder(files)
     builder.walk(workflow, prefix="")
     body = {"schema": SCHEMA, "tasks": builder.tasks, "files": builder.used}
+    _check_text(body)
     info = {"name": workflow.get("name")}
     info.update(about or {})
     return Manifest(body=body, about=info, warnings=tuple(builder.warnings))
+
+
+def _check_text(value: Any, where: str = "") -> None:
+    """
+    Refuse control and invisible formatting characters anywhere in the
+    body (tabs and newlines aside), which could hide part of a command from
+    whoever approves it.
+    """
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _check_text(key, where)
+            _check_text(item, f"{where}/{key}")
+    elif isinstance(value, list):
+        for item in value:
+            _check_text(item, where)
+    elif isinstance(value, str):
+        for char in value:
+            if char not in "\t\n" and unicodedata.category(char) in (
+                "Cc",
+                "Cf",
+                "Zl",
+                "Zp",
+            ):
+                raise ManifestError(
+                    f"{where or 'The release'} holds the control character "
+                    f"U+{ord(char):04X}"
+                )
 
 
 def _archive_path(raw: str) -> str:
@@ -358,12 +393,31 @@ class _Builder:
         ids = set(inputs) | set(outputs)
         for template in templates:
             self._check_placeholders(where, template, ids)
-        for name, item in inputs.items():
-            if item.get("role") == "param" and item["kind"] == "string":
-                self.warnings.append(
-                    f"{where}: any value the launcher types for {name!r} is "
-                    "passed, quoted, to its command"
+            unsafe = unsafe_placeholders(
+                template, ids | {"task.id", "task.name"}
+            )
+            for name, why in sorted(unsafe.items()):
+                raise ManifestError(
+                    f"{where}: ${{{name}}} is {why}; write it as a bare word "
+                    "(the agent quotes every value), not inside quotes"
                 )
+        for name, item in sorted(inputs.items()):
+            if item.get("role") == "param":
+                self.warnings.append(
+                    f"{where}: the launcher chooses {name!r} at run time; "
+                    "its command gets it as one quoted word"
+                )
+            elif item.get("role") == "edge" and (
+                item["kind"] in VALUE_KINDS or item["kind"] == "item"
+            ):
+                self.warnings.append(
+                    f"{where}: {name!r} is a value chosen at run time; its "
+                    "command gets it as one quoted word"
+                )
+        for name in sorted(task.get("secrets") or {}):
+            self.warnings.append(
+                f"{where}: the launcher sets environment {name!r} at run time"
+            )
         return {
             "name": str(task.get("name", task_id)),
             "target": self._target(where, chain, shared, task),
@@ -446,9 +500,12 @@ class _Builder:
                 raise ManifestError(
                     f"{where}: script {script!r} is not in the release"
                 )
+        python = str(runtime.get("python", "python"))
+        if "$" in python:
+            raise ManifestError(f"{where}: python must not hold placeholders")
         return {
             "kind": "python_script",
-            "python": str(runtime.get("python", "python")),
+            "python": python,
             "script_sha256": digest,
             "args": str(runtime.get("args", "")),
         }
