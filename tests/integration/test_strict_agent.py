@@ -143,9 +143,7 @@ async def test_task_launch_from_the_running_task(
         name="Say",
         runtime=CommandRuntime(command=COMMAND),
         executor=ShellExecutor(),
-        inputs=[
-            StringArtifact(id="msg", value="hi; id", path=strict_agent / "m")
-        ],
+        inputs=[StringArtifact(id="msg", value="hi", path=strict_agent / "m")],
         outputs=[FileArtifact(id="out", path=out)],
     )
     monkeypatch.setattr(target_mod, "_current_task", lambda: task)
@@ -158,7 +156,7 @@ async def test_task_launch_from_the_running_task(
             task=task,
         )
         assert await proc.wait() == 0
-        assert out.read_text() == "hi; id|s3cret"
+        assert out.read_text() == "hi|s3cret"
         # The secret reached the job through stdin, not a file.
         assert not list(strict_agent.glob(".horus_job/*/env"))
         # Without the task, the command is sent as is, and refused.

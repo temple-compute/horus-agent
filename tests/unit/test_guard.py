@@ -428,7 +428,7 @@ def basic_args(env: Env, **over: Any) -> dict[str, Any]:
             "ref": {"path": str(env.run / "ref.fa")},
             "reads": {"path": str(env.run / "reads")},
             "bam": {"path": str(env.run / "out.bam")},
-            "sample": {"value": "S1; rm -rf ~"},
+            "sample": {"value": "S1"},
             "panel": {"value": "H1N1"},
             "tags": {"value": ["a b", "3", "true"]},
         },
@@ -449,15 +449,18 @@ async def test_task_command_is_rendered_by_the_agent(env: Env) -> None:
         manifest.task("align"),
         {"job_dir": Path(raw["job_dir"]), "cwd": env.run},
     )
-    prepared = launch.prepare(env.guard, RUN1, admitted, slurm=False)
-    ref = env.run / ".horus-const" / digest(env.run / "ref.fa") / "ref.fa"
+    prepared = await launch.prepare(env.guard, RUN1, admitted, slurm=False)
+    ref = env.guard.const_store / digest(env.run / "ref.fa") / "ref.fa"
     assert prepared.command == (
         f"bwa mem -t 8 {ref} "
-        f"{env.run}/reads > {env.run}/out.bam --sample 'S1; rm -rf ~' "
+        f"{env.run}/reads > {env.run}/out.bam --sample S1 "
         "--panel H1N1 --tags 'a b' 3 true --id align $HOME"
     )
     # Secrets reach the job through stdin, never a file or the command.
-    assert prepared.env == {"GISAID_TOKEN": "tok"}
+    assert prepared.env == {
+        "GISAID_TOKEN": "tok",
+        **launch.job_env(Path(raw["job_dir"])),
+    }
     assert not (env.run / ".horus_job" / "j1" / "env").exists()
 
 
@@ -504,7 +507,7 @@ async def test_task_launch_runs_the_agents_copy_of_inputs(env: Env) -> None:
     result = await env.call("task_launch", task="align", **args)
     job = Path(args["job_dir"])
     assert result["pid"] > 1
-    copy = env.run / ".horus-const" / digest(env.run / "ref.fa") / "ref.fa"
+    copy = env.guard.const_store / digest(env.run / "ref.fa") / "ref.fa"
     assert copy.read_bytes() == REF
     assert copy.stat().st_mode & 0o777 == 0o640
     # The cloud's file may change; what runs is the verified copy, which
@@ -563,7 +566,7 @@ async def test_echo_task_end_to_end(env: Env) -> None:
         "job_dir": str(job),
         "cwd": str(env.run),
         "bindings": {
-            "msg": {"value": "hi $(id)"},
+            "msg": {"value": "hi"},
             "out": {"path": str(out)},
         },
         "env": {"TOKEN": "s3cret"},
@@ -575,7 +578,7 @@ async def test_echo_task_end_to_end(env: Env) -> None:
         if (job / "exit_code").exists():
             break
         await asyncio.sleep(0.05)
-    assert out.read_text() == "hi $(id)|s3cret"
+    assert out.read_text() == "hi|s3cret"
     assert "s3cret" not in (job / "stderr.log").read_text()
     code = await env.call("poll", release="echo", job_dir=str(job))
     assert code == 0

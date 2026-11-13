@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import pytest
 
-from horus_agent import cli, policy
+from horus_agent import cli, launch, policy
 from horus_agent.manifest import (
     Manifest,
     ManifestError,
@@ -26,6 +26,7 @@ from horus_agent.manifest import (
 )
 from horus_agent.native import digest
 from horus_agent.ops import OpRunner
+from horus_agent.protocol import PolicyRefusedError
 from tests.unit.test_guard import RUN1, RUN2, Env, env, refused
 
 __all__ = ["env"]  # the fixture
@@ -73,7 +74,7 @@ async def wait_exit(job: Path) -> None:
     ],
 )
 def test_placeholders_outside_bare_words_are_refused(command: str) -> None:
-    with pytest.raises(ManifestError, match=r"bare word|quoting"):
+    with pytest.raises(ManifestError, match=r"plain argument|quoting"):
         manifest(command)
 
 
@@ -498,12 +499,12 @@ async def test_values_from_upstream_tasks_bind_as_values(env: Env) -> None:
         job_dir=str(job),
         cwd=str(env.run),
         bindings={
-            "s": {"value": "a b; id"},
+            "s": {"value": "a.b:1"},
             "out": {"path": str(env.run / "o")},
         },
     )
     await wait_exit(job)
-    assert (env.run / "o").read_text() == "a b; id\n"
+    assert (env.run / "o").read_text() == "a.b:1\n"
 
 
 async def test_squeue_failure_is_an_error(
@@ -573,3 +574,332 @@ async def test_revoke_kills_running_jobs(env: Env) -> None:
     else:
         raise AssertionError("the job of a revoked release kept running")
     assert await env.runner.stop_revoked() == 0  # once per run
+
+
+# --- round 2 ----------------------------------------------------------------
+
+
+def string_manifest(command: str) -> Manifest:
+    """One approved task with a free text parameter ``msg``."""
+    return manifest(command, inputs=[{"id": "msg", "kind": "string"}])
+
+
+async def launch_t(
+    env: Env, approved: Manifest, run_dir: Path, job: str, **bindings: Any
+) -> Any:
+    return await env.call(
+        "task_launch",
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(run_dir / job),
+        cwd=str(run_dir),
+        bindings={"out": {"path": str(run_dir / "o")}, **bindings},
+        env={},
+    )
+
+
+async def test_a_strict_agent_has_no_spill_folder(env: Env) -> None:
+    (env.run / "results").mkdir()
+    (env.run / "results" / "patient.vcf").write_text("PATIENT-123\n")
+    dst = env.work / ".horus-spill" / RUN1 / "x.vcf"
+    await refused(
+        env,
+        "move",
+        "agent's own",
+        src=str(env.run / "results" / "patient.vcf"),
+        dst=str(dst),
+    )
+    await refused(env, "get_file", "agent's own", path=str(dst))
+
+
+async def test_open_agents_hand_back_only_their_own_spill_files(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from horus_agent import ops
+
+    env.with_policy(mode="open")
+    monkeypatch.setattr(ops, "INLINE_LIMIT", 4)
+    result = await env.call("exec", cmd="echo too-long", release=None)
+    got = await env.call("get_file", path=result["stdout_file"], release=None)
+    assert got == {"size": 9}
+    planted = env.work / ".horus-spill" / "planted.vcf"
+    planted.write_text("PATIENT-123\n")
+    await refused(
+        env, "get_file", "stays here", path=str(planted), release=None
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "[[ ${msg} -gt 0 ]]; echo > ${out}",
+        "(( ${msg} )); echo > ${out}",
+        "for ((i=0;i<${msg};i++)); do :; done; echo > ${out}",
+        "let ${msg}; echo > ${out}",
+        "echo $[ ${msg} ] > ${out}",
+        "declare -i v=${msg}; echo > ${out}",
+        "a[${msg}]=1; echo > ${out}",
+        "printf -v v ${msg}; echo > ${out}",
+        "trap ${msg} EXIT; echo > ${out}",
+        "cat > ${out} <<EOF\n\tEOF\n${msg}\nEOF",
+        "cat > ${out} <<-EOF\n\t${msg}\n\tEOF",
+        "echo ${msg} | sh > ${out}",
+        "sh <<< ${msg} > ${out}",
+        ". <(echo ${msg}); echo > ${out}",
+        "env ${msg} true > ${out}",
+        "python3 -c ${msg} > ${out}",
+        "Rscript -e ${msg} > ${out}",
+        "awk ${msg} /dev/null > ${out}",
+        "${msg} > ${out}",
+        "timeout 5 ${msg} > ${out}",
+        "bash ${msg} > ${out}",
+    ],
+)
+def test_code_and_arithmetic_positions_are_refused(command: str) -> None:
+    with pytest.raises(ManifestError, match=r"plain argument|quoting"):
+        string_manifest(command)
+
+
+def test_verified_scripts_may_run_as_code() -> None:
+    manifest(
+        "Rscript ${s} ${inp} > ${out}",
+        inputs=[
+            {"id": "s", "kind": "file", "path": "s.R"},
+            {"id": "inp", "kind": "file"},
+        ],
+        files={"s.R": b"1\n"},
+    )
+    with pytest.raises(ManifestError, match="plain argument"):
+        manifest("Rscript ${inp} > ${out}")  # cloud data run as code
+
+
+@pytest.mark.parametrize(
+    ("kind", "value", "ok"),
+    [
+        ("number", "8", True),
+        ("number", "-1.5", True),
+        ("number", "a[$(id)]", False),
+        ("number", "THREADS", False),
+        ("boolean", "true", True),
+        ("boolean", "yes", False),
+        ("string", "S1.fastq,lane:2", True),
+        ("string", "a b", False),
+        ("string", "--to-command=id", False),
+        ("string", "x;id", False),
+        ("choice", "H1N1", True),
+        ("choice", "H5N1", False),
+    ],
+)
+def test_values_must_fit_their_kind(kind: str, value: str, ok: bool) -> None:
+    spec = {"kind": kind, "options": ["H1N1", "H3N2"]}
+    if ok:
+        launch.check_value("p", spec, value)
+    else:
+        with pytest.raises(PolicyRefusedError, match="not a valid"):
+            launch.check_value("p", spec, value)
+
+
+def test_choice_options_are_approved() -> None:
+    found = manifest(
+        "echo ${c} > ${out}",
+        inputs=[
+            {
+                "id": "c",
+                "kind": "choice",
+                "options": [{"value": "a"}, {"value": 2}],
+            }
+        ],
+    )
+    assert cast(Any, found.task("t"))["inputs"]["c"]["options"] == ["a", "2"]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".Rprofile",
+        ".Renviron",
+        "Makefile",
+        "nextflow.config",
+        "node_modules",
+        "sitecustomize.py",
+        "x.pth",
+        ".npmrc",
+        "package.json",
+        "conftest.py",
+    ],
+)
+async def test_tool_config_names_cannot_be_written(
+    env: Env, name: str
+) -> None:
+    data = base64.b64encode(b"x").decode()
+    await refused(
+        env,
+        "put_file",
+        "settings or code",
+        path=str(env.run / name),
+        data=data,
+    )
+    await refused(
+        env, "mkdir", "settings or code", path=str(env.run / name / "lib")
+    )
+
+
+async def test_packages_with_tool_config_names_are_refused(env: Env) -> None:
+    import tarfile
+
+    src = env.run / "pkgsrc"
+    (src / "node_modules" / "lodash").mkdir(parents=True)
+    (src / "node_modules" / "lodash" / "index.js").write_text("1")
+    pkg = env.run / "p.tgz"
+    with tarfile.open(pkg, "w:gz") as tar:
+        tar.add(src, arcname=".")
+    await refused(
+        env, "unpack", "", pkg=str(pkg), dest=str(env.run / "unpacked")
+    )
+    assert not (env.run / "unpacked").exists()
+
+
+async def test_working_dirs_holding_op_written_config_are_refused(
+    env: Env,
+) -> None:
+    approved = manifest("cat .Rprofile > ${out}", inputs=[])
+    policy.approve(approved, "root")
+    (env.run / ".Rprofile").write_text("system('touch PWNED')\n")
+    await refused(
+        env,
+        "task_launch",
+        "settings or code",
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(env.run / "j"),
+        cwd=str(env.run),
+        bindings={"out": {"path": str(env.run / "o")}},
+        env={},
+    )
+
+
+async def test_jobs_get_a_clean_home_and_no_user_startup_files(
+    env: Env,
+) -> None:
+    approved = manifest("env > ${out}", inputs=[])
+    policy.approve(approved, "root")
+    await launch_t(env, approved, env.run, "j")
+    await wait_exit(env.run / "j")
+    seen = dict(
+        line.split("=", 1)
+        for line in (env.run / "o").read_text().splitlines()
+        if "=" in line
+    )
+    assert seen["HOME"] == str(env.run / "j" / "home")
+    assert (env.run / "j" / "home").is_dir()
+    assert seen["R_PROFILE_USER"] == seen["R_ENVIRON_USER"] == os.devnull
+    assert seen["PYTHONNOUSERSITE"] == "1"
+    assert not {"NODE_PATH", "BASH_ENV", "ENV"} & set(seen)
+
+
+def test_the_state_dir_is_the_agents_alone(tmp_path: Path) -> None:
+    from horus_agent.guard import Guard
+    from horus_agent.policy import Approvals, Policy
+
+    old = os.umask(0o007)  # the umask under run_as
+    try:
+        guard = Guard(
+            Policy(work_dir=str(tmp_path / "w"), allowed_hosts=()),
+            Approvals(),
+        )
+    finally:
+        os.umask(old)
+    assert guard.state.stat().st_mode & 0o777 == 0o711
+    assert (guard.state / "runs").stat().st_mode & 0o777 == 0o700
+    assert guard.const_store.stat().st_mode & 0o777 == 0o750
+    assert guard.policy.audit_path.is_relative_to(guard.state)
+
+
+async def test_cancelled_runs_leave_the_active_set(env: Env) -> None:
+    env.with_policy(max_concurrent_runs=1)
+    approved = manifest("sleep 30 > ${out}", inputs=[])
+    policy.approve(approved, "root")
+    release = approved.release_hash
+    await launch_t(env, approved, env.run, "j")
+    assert await env.call("cancel_run", release=release) == 1
+    await env.call("remove", release=release, path=str(env.run / "j"))
+    other = env.work / "proj" / RUN2
+    await env.call("mkdir", run=RUN2, release=release, path=str(other / "x"))
+
+
+async def test_a_work_dir_reached_through_a_link_works(
+    env: Env, tmp_path: Path
+) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(env.work)
+    env.with_policy(work_dir=str(link))
+    approved = manifest("echo hi > ${out}", inputs=[])
+    policy.approve(approved, "root")
+    run = link / "proj" / RUN1
+    await launch_t(env, approved, run, "j")
+    await wait_exit(env.run / "j")
+    assert (env.run / "o").read_text() == "hi\n"
+
+
+async def test_same_content_under_two_names(env: Env) -> None:
+    approved = manifest(
+        "cat ${a} ${b} > ${out}",
+        inputs=[
+            {"id": "a", "kind": "file", "path": "a.txt"},
+            {"id": "b", "kind": "file", "path": "b.txt"},
+        ],
+        files={"a.txt": b"same\n", "b.txt": b"same\n"},
+    )
+    policy.approve(approved, "root")
+    (env.run / "a.txt").write_text("same\n")
+    (env.run / "b.txt").write_text("same\n")
+    await launch_t(
+        env,
+        approved,
+        env.run,
+        "j",
+        a={"path": str(env.run / "a.txt")},
+        b={"path": str(env.run / "b.txt")},
+    )
+    await wait_exit(env.run / "j")
+    assert (env.run / "o").read_text() == "same\nsame\n"
+    # Reused, not copied again, by a later run.
+    other = env.work / "proj" / RUN2
+    other.mkdir()
+    (other / "a.txt").write_text("same\n")
+    (other / "b.txt").write_text("same\n")
+    stored = env.guard.const_store / digest(env.run / "a.txt") / "a.txt"
+    before = stored.stat().st_ino
+    await env.call(
+        "task_launch",
+        run=RUN2,
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(other / "j"),
+        cwd=str(other),
+        bindings={
+            "out": {"path": str(other / "o")},
+            "a": {"path": str(other / "a.txt")},
+            "b": {"path": str(other / "b.txt")},
+        },
+    )
+    assert stored.stat().st_ino == before
+
+
+async def test_job_dirs_with_percent_are_refused(env: Env) -> None:
+    approved = manifest("echo > ${out}", inputs=[])
+    policy.approve(approved, "root")
+    await refused(
+        env,
+        "task_launch",
+        "characters",
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(env.run / "j%j"),
+        cwd=str(env.run),
+        bindings={"out": {"path": str(env.run / "o")}},
+    )
