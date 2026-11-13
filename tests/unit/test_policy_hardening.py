@@ -903,3 +903,61 @@ async def test_job_dirs_with_percent_are_refused(env: Env) -> None:
         cwd=str(env.run),
         bindings={"out": {"path": str(env.run / "o")}},
     )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "timeout -s KILL 60 ${msg} > ${out}",
+        "timeout --signal=KILL 60 ${msg} > ${out}",
+        "env -u HOME ${msg} > ${out}",
+        "env -S ${msg} > ${out}",
+        "flock -c ${msg} /tmp/l > ${out}",
+        "sudo -s cat ${msg} > ${out}",
+        "nice -n 5 ${msg} > ${out}",
+        "mpirun --unknown-option x prog ${msg} > ${out}",
+    ],
+)
+def test_wrapper_options_do_not_hide_the_program(command: str) -> None:
+    with pytest.raises(ManifestError, match=r"plain argument"):
+        string_manifest(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "timeout -s KILL 60 cat ${msg} > ${out}",
+        "env -u HOME cat ${msg} > ${out}",
+        "srun -n 4 cat ${msg} > ${out}",
+        "nice -10 cat ${msg} > ${out}",
+    ],
+)
+def test_wrapped_programs_take_plain_arguments(command: str) -> None:
+    string_manifest(command)
+
+
+@pytest.mark.parametrize(
+    ("change", "match"),
+    [
+        ({"max_unpack_files": 2}, "max_unpack_files"),
+        ({"max_unpack_bytes": 5}, "max_unpack_bytes"),
+    ],
+)
+async def test_unpack_is_capped(
+    env: Env, change: dict[str, int], match: str
+) -> None:
+    import tarfile
+
+    src = env.run / "src"
+    src.mkdir()
+    for name in ("a", "b", "c"):
+        (src / name).write_text("0123456789")
+    pkg = env.run / "p.tgz"
+    with tarfile.open(pkg, "w:gz") as tar:
+        tar.add(src, arcname=".")
+    env.with_policy(**change)
+    await refused(env, "unpack", match, pkg=str(pkg), dest=str(env.run / "d"))
+    assert not (env.run / "d").exists()
+    env.with_policy(max_unpack_files=10, max_unpack_bytes=100)
+    await env.call("unpack", pkg=str(pkg), dest=str(env.run / "d"))
+    assert (env.run / "d" / "c").read_text() == "0123456789"

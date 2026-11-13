@@ -180,6 +180,8 @@ downloads = true
 resource_usage = true           # CPU and RAM samples for the run's charts
 max_put_bytes = 4194304
 max_fetch_bytes = 53687091200
+max_unpack_bytes = 53687091200   # what one unpack may extract
+max_unpack_files = 1000000
 max_concurrent_runs = 4
 audit_log = "/var/log/horus-agent/ops.jsonl"   # default: <work_dir>/.horus-agent/ops.jsonl
 
