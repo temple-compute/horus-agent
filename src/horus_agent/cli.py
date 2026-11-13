@@ -161,6 +161,8 @@ async def _run(work_dir: str | None) -> int:
                 "No policy file: only approved workflow releases run here. "
                 f"{policy.OPEN_HINT}\n"
             )
+        if problem := policy.same_user_problem(rules):
+            raise ValueError(problem)
         _umask(rules.jobs)
         agent = Agent(
             dataclasses.replace(registered, work_dir=str(directory)), rules
@@ -193,12 +195,36 @@ async def _run(work_dir: str | None) -> int:
     return 0
 
 
+SERVICE_CONFIG = Path("/var/lib/horus-agent/.config/horus-agent/agent.json")
+"""The agent's config under the system unit (README), used by sudo."""
+
+
+def _service_config() -> Path:
+    """The agent's config: ``HORUS_AGENT_CONFIG``, yours, or the unit's."""
+    path = config.config_path()
+    if (
+        config.CONFIG_ENV not in os.environ
+        and not path.exists()
+        and SERVICE_CONFIG.exists()
+    ):
+        return SERVICE_CONFIG
+    return path
+
+
 def _archive(source: str) -> bytes:
     """A release archive: a local file, else downloaded by release id."""
     path = Path(source)
     if path.is_file():
         return path.read_bytes()
-    registered = config.load(config.config_path())
+    where = _service_config()
+    try:
+        registered = config.load(where)
+    except FileNotFoundError:
+        raise ValueError(
+            f"No agent config at {where} to download release {source} "
+            f"with; set {config.CONFIG_ENV} to the agent's agent.json, or "
+            "approve an exported archive file"
+        ) from None
     response = httpx.get(
         f"{registered.url.rstrip('/')}/agents/me/releases/"
         f"{quote(source, safe='')}/archive",
@@ -213,32 +239,45 @@ def _archive(source: str) -> bytes:
     return response.content
 
 
+def _safe(value: object) -> str:
+    """*value* as text with every unprintable character escaped."""
+    return "".join(
+        ch if ch.isprintable() else f"\\u{ord(ch):04x}" for ch in str(value)
+    )
+
+
 def _show(manifest: Manifest) -> str:
-    """What an approver reads before saying yes."""
+    """
+    What an approver reads before saying yes. Every field is printed with
+    unprintable characters escaped, so nothing in it can hide the rest.
+    """
     lines = [
-        f"Release: {manifest.about.get('name')} "
+        f"Release: {_safe(manifest.about.get('name'))} "
         f"(hash {manifest.release_hash})",
     ]
     for task_id, task in sorted(manifest.tasks.items()):
         runtime = task["runtime"]
-        lines.append(
-            f"\nTask {task_id} on {' > '.join(task['target']['chain'])}"
-        )
+        chain = " > ".join(task["target"]["chain"])
+        lines.append(f"\nTask {_safe(task_id)} on {_safe(chain)}")
         if runtime["kind"] == "command":
-            lines.append(f"  command: {runtime['command']}")
+            text = str(runtime["command"])
+            lines.append("  command:")
         else:
-            lines.append(
-                f"  script: {runtime['python']} <sha256 "
-                f"{runtime['script_sha256']}> {runtime['args']}"
+            text = (
+                f"{runtime['python']} -I <sha256 {runtime['script_sha256']}> "
+                f"{runtime['args']}"
             )
+            lines.append("  script:")
+        lines += [f"    | {_safe(line)}" for line in text.split("\n")]
         if "slurm" in task["target"]:
             lines.append(f"  slurm: {json.dumps(task['target']['slurm'])}")
         for name, spec in sorted(task["inputs"].items()):
             detail = spec.get("value") or spec.get("sha256") or ""
-            lines.append(f"  input {name}: {spec['role']} {detail}".rstrip())
+            row = f"  input {_safe(name)}: {spec['role']} {_safe(detail)}"
+            lines.append(row.rstrip())
         for name in sorted(task["env"]):
-            lines.append(f"  env {name}: {task['env'][name]}")
-    lines += [f"\nWarning: {w}" for w in manifest.warnings]
+            lines.append(f"  env {_safe(name)}: {_safe(task['env'][name])}")
+    lines += [f"\nWarning: {_safe(w)}" for w in manifest.warnings]
     return "\n".join(lines) + "\n"
 
 
@@ -300,6 +339,25 @@ def _revoke(release_hash: str) -> int:
         sys.stderr.write(f"No approval {release_hash}.\n")
         return 1
     sys.stdout.write(f"Revoked {release_hash}.\n")
+    return 0
+
+
+def _policy_init(open_mode: bool, run_as: str) -> int:
+    path = policy.policy_path()
+    if os.geteuid() not in config.POLICY_OWNERS:
+        sys.stderr.write(f"Only root can write {path} (use sudo).\n")
+        return 1
+    if path.exists():
+        sys.stderr.write(f"{path} exists; edit it instead.\n")
+        return 1
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(policy.template(open_mode=open_mode, run_as=run_as))
+    sys.stdout.write(
+        f"Wrote {path}. Add the storage host to allowed_hosts, then "
+        "restart the agent.\n"
+    )
     return 0
 
 
@@ -389,7 +447,18 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
     revoke = commands.add_parser("revoke", help="Withdraw an approval (root).")
     revoke.add_argument("hash", help="Release hash.")
     policy_cmd = commands.add_parser("policy", help="Show the policy.")
-    policy_cmd.add_argument("action", choices=("check",))
+    policy_cmd.add_argument("action", choices=("check", "init"))
+    policy_cmd.add_argument(
+        "--open",
+        action="store_true",
+        help="init: accept any workflow (internal machines).",
+    )
+    policy_cmd.add_argument(
+        "--run-as",
+        default="horus-job",
+        metavar="USER",
+        help="init: the Unix user tasks run as. Default: horus-job.",
+    )
     args = parser.parse_args(argv)
     logs.setup(getattr(args, "debug", False))
     match args.command:
@@ -399,6 +468,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
             return _approvals()
         case "revoke":
             return _revoke(args.hash)
+        case "policy" if args.action == "init":
+            return _policy_init(args.open, args.run_as)
         case "policy":
             return _policy_check()
     if os.geteuid() == 0 and not args.allow_root:

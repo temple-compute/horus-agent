@@ -57,6 +57,8 @@ class Policy:
     """``full`` or ``off``: whether task output is sent back."""
     resource_usage: bool = True
     """Whether resource samples are taken and may be read back."""
+    allow_same_user: bool = False
+    """Strict mode without ``[jobs] run_as``: tasks run as the agent."""
     max_put_bytes: int = 4 * 1024 * 1024
     max_fetch_bytes: int = 50 * 1024**3
     max_concurrent_runs: int = 4
@@ -101,7 +103,13 @@ class Policy:
         return out
 
 
-_BOOLS = ("require_release", "downloads", "uploads", "resource_usage")
+_BOOLS = (
+    "require_release",
+    "downloads",
+    "uploads",
+    "resource_usage",
+    "allow_same_user",
+)
 _INTS = ("max_put_bytes", "max_fetch_bytes", "max_concurrent_runs")
 
 
@@ -169,6 +177,33 @@ def load_policy(work_dir: str, api_url: str) -> Policy:
             f"The agent's work dir {own} is not under the policy's {wd}"
         )
     return policy
+
+
+def same_user_problem(policy: Policy) -> str | None:
+    """Why *policy* may not run: strict, with tasks as the agent's user."""
+    if policy.strict and not policy.jobs.run_as and not policy.allow_same_user:
+        return (
+            "Strict mode runs tasks as their own user: set [jobs] run_as in "
+            f"{policy_path()} (or allow_same_user = true, or mode = "
+            '"open"). horus-agent policy init writes a starting file.'
+        )
+    return None
+
+
+def template(*, open_mode: bool, run_as: str) -> str:
+    """A starting ``policy.toml`` for ``horus-agent policy init``."""
+    lines = [
+        "schema = 1",
+        f'mode = "{"open" if open_mode else "strict"}"',
+        "# Hosts transfers may reach: the broker's and the storage bucket's.",
+        '# allowed_hosts = ["api.example.com", '
+        '"bucket.s3.eu-north-1.amazonaws.com"]',
+        "uploads = false",
+        'logs = "off"',
+    ]
+    if run_as:
+        lines += ["", "[jobs]", f'run_as = "{run_as}"', 'run_as_via = "sudo"']
+    return "\n".join(lines) + "\n"
 
 
 def _parse(  # noqa: PLR0912
