@@ -94,12 +94,18 @@ def pack(src: Path, pkg: Path) -> None:
 
 
 def unpack(
-    pkg: Path, dest: Path, refuse: Callable[[str], bool] | None = None
+    pkg: Path,
+    dest: Path,
+    refuse: Callable[[str], bool] | None = None,
+    max_bytes: int | None = None,
+    max_files: int | None = None,
 ) -> None:
     """
     Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
-    ``..``, links leaving it and device files. *dest* is swapped in whole,
-    and left alone when it already holds this package (sha256 marker).
+    ``..``, links leaving it and device files, and a package holding more
+    than *max_files* entries or *max_bytes* bytes. *dest* is swapped in
+    whole, and left alone when it already holds this package (sha256
+    marker).
     """
     marker = dest.parent / f".{dest.name}.horus-sha256"
     sha = _sha256(pkg)
@@ -112,7 +118,21 @@ def unpack(
     tmp.mkdir()
     try:
         with open_file(pkg) as fh, tarfile.open(fileobj=fh, mode="r:*") as tar:
-            tar.extractall(tmp, filter="data")
+            members, total = [], 0
+            for member in tar:  # headers only; nothing is written yet
+                members.append(member)
+                total += member.size
+                if max_files is not None and len(members) > max_files:
+                    raise PolicyRefusedError(
+                        f"The package holds over {max_files} files "
+                        "(max_unpack_files)"
+                    )
+                if max_bytes is not None and total > max_bytes:
+                    raise PolicyRefusedError(
+                        f"The package unpacks to over {max_bytes} bytes "
+                        "(max_unpack_bytes)"
+                    )
+            tar.extractall(tmp, members=members, filter="data")
         for _root, dirs, names in os.walk(tmp):
             if refuse and (bad := [n for n in dirs + names if refuse(n)]):
                 raise PolicyRefusedError(

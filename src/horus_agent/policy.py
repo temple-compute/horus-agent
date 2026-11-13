@@ -62,6 +62,10 @@ class Policy:
     """Strict mode without ``[jobs] run_as``: tasks run as the agent."""
     max_put_bytes: int = 4 * 1024 * 1024
     max_fetch_bytes: int = 50 * 1024**3
+    max_unpack_bytes: int = 50 * 1024**3
+    """Largest total size an ``unpack`` may extract."""
+    max_unpack_files: int = 1_000_000
+    """Most files and folders an ``unpack`` may extract."""
     max_concurrent_runs: int = 4
     audit_log: str = ""
     """One JSON line per op decision. Empty: ``<work_dir>/.horus-agent``."""
@@ -111,7 +115,13 @@ _BOOLS = (
     "resource_usage",
     "allow_same_user",
 )
-_INTS = ("max_put_bytes", "max_fetch_bytes", "max_concurrent_runs")
+_INTS = (
+    "max_put_bytes",
+    "max_fetch_bytes",
+    "max_unpack_bytes",
+    "max_unpack_files",
+    "max_concurrent_runs",
+)
 
 
 def policy_path() -> Path:

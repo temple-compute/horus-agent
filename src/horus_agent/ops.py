@@ -468,6 +468,8 @@ class OpRunner:
                     Path(args["pkg"]),
                     Path(args["dest"]),
                     None if guard is None else guard_mod.bad_name,
+                    None if guard is None else guard.policy.max_unpack_bytes,
+                    None if guard is None else guard.policy.max_unpack_files,
                 )
                 return None
             case "move":
