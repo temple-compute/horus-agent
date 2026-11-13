@@ -81,29 +81,65 @@ _INTERPRETERS = frozenset(
     }
 )
 _PYTHON = re.compile(r"python[0-9.]*|pypy[0-9.]*")
-_WRAPPERS = frozenset(
-    {
-        "exec",
-        "command",
-        "builtin",
-        "nohup",
-        "nice",
-        "timeout",
-        "time",
-        "stdbuf",
-        "taskset",
-        "numactl",
-        "srun",
-        "mpirun",
-        "mpiexec",
-        "env",
-        "sudo",
-        "doas",
-        "chroot",
-        "flock",
-        "setsid",
-    }
+_SLURM_MPI = (
+    "-n -N -c -p -t -J -np -H --np --ntasks --nodes --cpus-per-task "
+    "--partition --time --job-name --host --hostfile -machinefile --map-by "
+    "--bind-to"
 )
+_WRAPPERS: dict[str, tuple[str, str, str, int]] = {
+    # name: (options taking an argument, flags, options running code,
+    #        positional arguments before the command)
+    "exec": ("-a", "-c -l", "", 0),
+    "command": ("", "-p", "", 0),
+    "builtin": ("", "", "", 0),
+    "nohup": ("", "", "", 0),
+    "nice": ("-n --adjustment", "", "", 0),
+    "timeout": (
+        "-s --signal -k --kill-after",
+        "--preserve-status --foreground -v --verbose",
+        "",
+        1,
+    ),
+    "time": (
+        "-o -f --output --format",
+        "-p -v --verbose --portability",
+        "",
+        0,
+    ),
+    "stdbuf": ("-i -o -e", "", "", 0),
+    "taskset": ("", "-c --cpu-list -a --all-tasks", "", 1),
+    "numactl": (
+        "-N -m -C -p -i --cpunodebind --membind --physcpubind --preferred "
+        "--interleave",
+        "-l --localalloc",
+        "",
+        0,
+    ),
+    "srun": (_SLURM_MPI, "-l --label --exclusive", "", 0),
+    "mpirun": (_SLURM_MPI, "--oversubscribe", "", 0),
+    "mpiexec": (_SLURM_MPI, "--oversubscribe", "", 0),
+    "env": (
+        "-u --unset -C --chdir",
+        "-i --ignore-environment -0 --null -",
+        "-S --split-string",
+        0,
+    ),
+    "sudo": (
+        "-u -g -C -D -h -p -r -t -U --user --group",
+        "-n -E -H -P -b",
+        "-s -i --shell --login",
+        0,
+    ),
+    "doas": ("-u -C", "-n", "-s", 0),
+    "chroot": ("--userspec --groups", "", "", 1),
+    "flock": (
+        "-w --timeout -E --conflict-exit-code",
+        "-s -x -n -u -o --shared --exclusive --nonblock --unlock --close",
+        "-c --command",
+        1,
+    ),
+    "setsid": ("", "-f -w -c --fork --wait --ctty", "", 0),
+}
 """Commands that run their arguments as another command."""
 _REPARSE = frozenset(
     {"eval", "ssh", "su", "xargs", "parallel", "watch", "let", "trap"}
@@ -175,6 +211,34 @@ def _base(word: str) -> str:
     return word.rsplit("/", 1)[-1]
 
 
+def _unwrap(words: list[str]) -> list[str] | str:
+    """
+    *words* without the wrappers in front of the program (``timeout -s
+    KILL 60``, ``env -u X``...), or why the program cannot be told: an
+    option the agent does not know, or one that runs code.
+    """
+    rest = list(words)
+    while rest and _base(rest[0]) in _WRAPPERS:
+        takes, flags, code, positional = _WRAPPERS[_base(rest.pop(0))]
+        while rest and rest[0].startswith("-"):
+            option = rest.pop(0)
+            name = option.split("=", 1)[0]
+            if name in code.split():
+                return "in a command that runs it as code"
+            if name in takes.split() and "=" not in option:
+                rest = rest[1:]
+            elif not (
+                name in takes.split()
+                or name in flags.split()
+                or re.fullmatch(r"-\d+", option)  # nice -10
+            ):
+                return (
+                    f"after a wrapper option the agent cannot read: {option}"
+                )
+        rest = rest[positional:]
+    return rest
+
+
 def _code_reason(  # noqa: PLR0911
     words: list[str], word: str
 ) -> str | None:
@@ -196,11 +260,12 @@ def _code_reason(  # noqa: PLR0911
     if "printf" in bases and "-v" in words:
         return "in printf -v"
     # Skip assignments and wrappers to find the program.
-    rest = [w for w in words if not re.fullmatch(r"[A-Za-z_]\w*=.*", w)]
-    while rest and _base(rest[0]) in _WRAPPERS:
-        rest = rest[1:]
-        while rest and (rest[0].startswith("-") or rest[0][:1].isdigit()):
-            rest = rest[1:]
+    unwrapped = _unwrap(
+        [w for w in words if not re.fullmatch(r"[A-Za-z_]\w*=.*", w)]
+    )
+    if isinstance(unwrapped, str):
+        return unwrapped
+    rest = unwrapped
     if not rest:
         return CODE_POSITION if not word else None
     program = _base(rest[0])
