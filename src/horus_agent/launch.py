@@ -20,6 +20,7 @@ import contextlib
 import os
 import re
 import shlex
+import stat
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -40,8 +41,6 @@ JOB_ID = re.compile(r"\d+(_\d+)?")
 
 TASK_ID = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(\[\d+\])?")
 """A task id as the runtime writes it: ``sub/task`` or a map clone ``x[3]``."""
-WORK_SUBDIR = "work"
-"""The fresh, empty directory a job starts in, inside its job dir."""
 
 
 @dataclass
@@ -53,15 +52,10 @@ class Prepared:
     env: dict[str, str]
     """The task's environment; reaches it through stdin, not a file."""
     cwd: Path
-    """The task's working directory, where its monitor files go."""
+    """The task's working directory, where the runtime runs it too."""
     job_dir: Path
     side_dir: Path
     task: dict[str, Any]
-
-    @property
-    def workdir(self) -> Path:
-        """Where the job starts: a fresh folder no op has written to."""
-        return self.job_dir / WORK_SUBDIR
 
 
 def _template(task: dict[str, Any], script: Path | None) -> str:
@@ -82,6 +76,28 @@ def _store(guard: Guard, run_id: str | None, job_dir: Path) -> Path:
         if job_dir.is_relative_to(root):
             return root / CONST_DIR
     raise PolicyRefusedError(f"Job dir is outside its run's dir: {job_dir}")
+
+
+def _working_dir(guard: Guard, run_id: str | None, raw: str) -> Path:
+    """
+    The task's working directory, where the runtime runs a task and puts
+    its relative outputs: confined to the run, reached through no link, and
+    a folder the agent made (created here when missing). Files placed in it
+    cannot replace what runs: scripts and constants run from the agent's
+    copies, and Python with ``-I`` imports nothing from it.
+    """
+    cwd = guard.confine_bound(run_id, raw)
+    if cwd != Path(os.path.normpath(raw)):
+        raise PolicyRefusedError(
+            f"Working directory goes through a link: {raw}"
+        )
+    cwd.mkdir(parents=True, exist_ok=True)
+    info = cwd.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+        raise PolicyRefusedError(
+            f"Working directory is not a folder the agent made: {raw}"
+        )
+    return cwd
 
 
 def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
@@ -119,7 +135,7 @@ def prepare(
         method = "slurm_submit" if chain[0] == "slurm" else "task_launch"
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
     job_dir = guard.confine_bound(run_id, args.job_dir)
-    cwd = guard.confine_bound(run_id, args.cwd)
+    cwd = _working_dir(guard, run_id, args.cwd)
     store = _store(guard, run_id, job_dir)
     script = None
     if task["runtime"]["kind"] == "python_script":
@@ -269,7 +285,7 @@ def sbatch_script(prepared: Prepared) -> str:
     exit_path = shlex.quote(str(prepared.job_dir / "exit_code"))
     lines += [
         "",
-        f"cd {shlex.quote(str(prepared.workdir))} || exit 1",
+        f"cd {shlex.quote(str(prepared.cwd))} || exit 1",
         f"( {prepared.command} ); code=$?; echo $code > {exit_path}; "
         "exit $code",
     ]

@@ -519,8 +519,6 @@ async def test_task_launch_runs_the_agents_copy_of_inputs(env: Env) -> None:
             break
         await asyncio.sleep(0.05)
     assert await env.call("poll", job_dir=str(job)) is not None
-    # The job started in a fresh directory, not the run's.
-    assert (job / launch.WORK_SUBDIR).is_dir()
 
 
 async def test_python_script_hash_is_checked(env: Env) -> None:

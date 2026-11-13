@@ -342,7 +342,9 @@ async def test_planted_job_files_are_never_trusted(env: Env) -> None:
     first = await env.call("task_launch", release="echo", task="say", **args)
     await wait_exit(env.run / "job2")
     (env.run / "job2" / "pid").write_text(f"{os.getpid()}\n")
-    assert env.guard.job(RUN1, env.run / "job2") == {"pid": first["pid"]}
+    assert (
+        cast(Any, env.guard.job(RUN1, env.run / "job2"))["pid"] == first["pid"]
+    )
     await refused(
         env,
         "unpack",
@@ -513,3 +515,61 @@ async def test_squeue_failure_is_an_error(
     monkeypatch.setattr(OpRunner, "_slurm", failing)
     with pytest.raises(RuntimeError, match="squeue failed"):
         await env.runner._slurm_status("42", env.run)
+
+
+async def test_relative_outputs_land_in_the_working_directory(
+    env: Env,
+) -> None:
+    env.with_policy(uploads=True, logs="full")
+    approved = manifest(
+        "echo hi > o",
+        inputs=[],
+        outputs=[{"id": "out", "kind": "file", "path": "o"}],
+    )
+    policy.approve(approved, "root")
+    cwd = env.run / "t"
+    args: dict[str, Any] = {
+        "task_id": "t",
+        "job_dir": str(cwd / ".horus_job" / "j"),
+        "cwd": str(cwd),
+    }
+    release = approved.release_hash
+    await env.call("task_launch", release=release, task="t", **args)
+    await wait_exit(cwd / ".horus_job" / "j")
+    got = await env.call("get_file", release=release, path=str(cwd / "o"))
+    assert base64.b64decode(got["data"]) == b"hi\n"
+    # A working directory reached through a link is refused.
+    (env.run / "link").symlink_to(cwd)
+    args.update(
+        job_dir=str(cwd / ".horus_job" / "k"), cwd=str(env.run / "link")
+    )
+    await refused(
+        env, "task_launch", "link", release=release, task="t", **args
+    )
+
+
+async def test_revoke_kills_running_jobs(env: Env) -> None:
+    approved = manifest("sleep 30 > ${out}", inputs=[])
+    policy.approve(approved, "root")
+    release = approved.release_hash
+    first = await env.call(
+        "task_launch",
+        release=release,
+        task="t",
+        task_id="t",
+        job_dir=str(env.run / "j"),
+        cwd=str(env.run),
+        bindings={"out": {"path": str(env.run / "o")}},
+    )
+    assert await env.runner.stop_revoked() == 0
+    policy.revoke(release)
+    assert await env.runner.stop_revoked() == 1
+    for _ in range(100):
+        try:
+            os.kill(first["pid"], 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the job of a revoked release kept running")
+    assert await env.runner.stop_revoked() == 0  # once per run

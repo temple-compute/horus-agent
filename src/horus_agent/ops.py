@@ -596,15 +596,14 @@ class OpRunner:
             if pid <= 1:
                 raise RuntimeError(f"The job in {job_dir} did not start")
         self._pids[job_dir] = pid
+        pgid = None
+        with contextlib.suppress(ProcessLookupError):
+            pgid = os.getpgid(pid)
         if self.guard is not None:
-            self.guard.add_job(run_id, Path(job_dir), pid=pid)
-        if run_id is not None:
-            with contextlib.suppress(ProcessLookupError):
-                pgid = os.getpgid(pid)
-                self._run_jobs.setdefault(run_id, {})[job_dir] = pgid
-                log.debug(
-                    f"Job pid {pid} (group {pgid}) belongs to run {run_id}"
-                )
+            self.guard.add_job(run_id, Path(job_dir), pid=pid, pgid=pgid)
+        if run_id is not None and pgid is not None:
+            self._run_jobs.setdefault(run_id, {})[job_dir] = pgid
+            log.debug(f"Job pid {pid} (group {pgid}) belongs to run {run_id}")
         return {"pid": pid}
 
     async def _task_launch(self, op: Op, admitted: Admitted) -> dict[str, Any]:
@@ -631,14 +630,13 @@ class OpRunner:
         log = horus_logger.log
         log.info(f"[run {(op.run_id or '-')[:8]}] {op.method} {args.task_id}")
         job_dir.mkdir(parents=True)
-        prepared.workdir.mkdir()
         if slurm:
             return await self._sbatch(op.run_id, prepared)
         result = await self._launch(
             op.run_id,
             prepared.command,
             str(job_dir),
-            cwd=str(prepared.workdir),
+            cwd=str(prepared.cwd),
             env=prepared.env,
         )
         if guard.policy.resource_usage:
@@ -651,6 +649,39 @@ class OpRunner:
                 self._samplers.add(task)
                 task.add_done_callback(self._samplers.discard)
         return result
+
+    async def stop_revoked(self) -> int:
+        """
+        Kill the running jobs of runs whose release is no longer approved
+        (``horus-agent revoke``), once per run. Returns the jobs stopped.
+        """
+        guard = self.guard
+        if guard is None or not (
+            guard.policy.strict and guard.policy.require_release
+        ):
+            return 0
+        approved = guard.approvals.hashes()
+        stopped = 0
+        for run_id, record in guard.records().items():
+            if record.get("release_hash") in approved or record.get("stopped"):
+                continue
+            for job_dir, job in (record.get("jobs") or {}).items():
+                if (Path(job_dir) / "exit_code").exists():
+                    continue
+                pid, pgid = job.get("pid"), job.get("pgid")
+                with contextlib.suppress(ProcessLookupError):
+                    # Only a group the recorded job still leads.
+                    if pid and pgid and os.getpgid(pid) == pgid:
+                        stopped += await self._signal(pgid, signal.SIGKILL)
+                if slurm_id := job.get("slurm_job_id"):
+                    with contextlib.suppress(RuntimeError):
+                        await self._slurm_cancel(slurm_id)
+                        stopped += 1
+            guard.mark_stopped(run_id)
+            horus_logger.log.warning(
+                f"[run {run_id[:8]}] its release was revoked; stopped its jobs"
+            )
+        return stopped
 
     def _slurm_id(self, run_id: str | None, job_dir: str) -> str:
         """The Slurm job the agent submitted from *job_dir* for the run."""

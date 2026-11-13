@@ -44,6 +44,8 @@ CONTROL_METHODS = frozenset(
 )
 """Quick ops that never wait behind :data:`MAX_RUNNING` long ones."""
 MAX_BATCH_BYTES = 8 * 1024 * 1024
+REVOKE_CHECK_S = 10.0
+"""How often running jobs of revoked releases are looked for."""
 DRAIN_TIMEOUT_S = 30.0
 """How long a stopping agent keeps trying to deliver its last results."""
 
@@ -130,6 +132,17 @@ class Agent:
         poll response was lost), so the broker reports it lost.
         """
 
+    async def _stop_revoked(self, stop: asyncio.Event) -> None:
+        """Kill the jobs of revoked releases soon after each revoke."""
+        while not stop.is_set():
+            try:
+                await self.runner.stop_revoked()
+            except Exception as exc:
+                horus_logger.log.warning(
+                    f"Stopping revoked runs failed: {exc}"
+                )
+            await _pause(stop, REVOKE_CHECK_S)
+
     async def serve(self, stop: asyncio.Event) -> None:
         """
         Poll and run ops until *stop* is set, then finish the ops already
@@ -156,9 +169,13 @@ class Agent:
             timeout=httpx.Timeout(30.0, read=POLL_WAIT_S + 30.0),
         ) as http:
             sender = asyncio.create_task(self._send_results(http, results))
+            reaper = asyncio.create_task(self._stop_revoked(stop))
             try:
                 await self._poll_loop(http, stop, results, running)
             finally:
+                reaper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reaper
                 log.debug(
                     f"Stopping: {len(running)} ops still running, "
                     f"{results.qsize()} results to deliver"

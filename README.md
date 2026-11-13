@@ -215,7 +215,7 @@ sudo horus-agent approve <release-id>          # downloaded with the agent's tok
 sudo horus-agent approve ./release.zip         # a release archive exported from the UI
 sudo horus-agent approve <release-id> --expect-hash <hash> --yes
 horus-agent approvals                          # hash, name, version, when, by whom
-sudo horus-agent revoke <hash>                 # refused from the next op, within 10 s
+sudo horus-agent revoke <hash>                 # refused within 10 s; running jobs killed within 30 s
 horus-agent policy check                       # the effective policy, or what is wrong
 ```
 
@@ -225,13 +225,13 @@ horus-agent policy check                       # the effective policy, or what i
 
 - Tasks of approved releases with the `shell` executor and a `command` or `python_script` runtime, on `kind: agent` or `kind: slurm` with `inner: {kind: agent}`.
 - The agent renders each task's command itself from the approved template. The orchestrator only says which approved task runs and binds its placeholders: a path in the run's directory, made of letters, digits and `._+,=@%:/-[]` only, or a value (a run parameter, or a value from an upstream task), which the agent renders as one quoted word.
-- Constant inputs and scripts are copied into the run's `.horus-const` folder as they are hashed against the approval, and the command names those copies, which no op can reach. Constant folders may hold only files and folders. A `python_script` runs with `python -I`, and every job starts in a new, empty folder inside its job dir: reference inputs and outputs through their placeholders.
+- Constant inputs and scripts are copied into the run's `.horus-const` folder as they are hashed against the approval, and the command names those copies, which no op can reach. Constant folders may hold only files and folders. A task runs in its own working directory inside its run's folder, as the runtime runs it, so relative outputs land where the runtime collects them; that directory must be one the agent made and not reached through a link. Files placed there cannot replace what runs: scripts and constants run from the agent's copies, and a `python_script` runs with `python -I`, so nothing in the working directory is imported.
 - Secrets reach the task through its shell's stdin, never a file or its command line, and only under the names the release declares.
 - For Slurm the agent writes the batch script from the approved Slurm options and runs `sbatch`, `squeue`, `sacct` and `scancel` itself.
 - File plumbing (hashing, packing and unpacking folders, moves, sizes) has native ops in the agent (`digest`, `pack`, `unpack`, `move`, `stat`) instead of shell commands; `AgentTarget` implements the runtime's file hooks with them: `path_digest`, `pack_folder`, `unpack_folder`, `move_file` and `file_size`. Archives are unpacked without absolute paths, `..`, links out or device files.
 - Job pids and Slurm job ids come from the agent's own records, never from files in the run's directory, and each job gets a job dir the agent creates.
 - With `uploads = false`, only metadata the agent or the orchestrator wrote (pid and exit code of a job, resource samples, the runtime's `.horus/*.json`) can be read back; no op may write data under those names. With `logs = "off"`, job logs stay on the machine whatever `uploads` says.
-- After `revoke`, a run already bound to the release can still be polled, signalled, cancelled and cleaned up; nothing new starts.
+- After `revoke`, nothing new of the release starts, and within about 30 s the agent kills the running jobs (and cancels the Slurm jobs) of runs bound to it. Those runs can still be polled and cleaned up.
 - No raw commands: `exec` and `launch` are refused, and file reads and writes never follow a symlink in the file's own name. A refused op fails the task with `PolicyRefusedError`, an `OperationRefusedError` of the runtime. Shared Slurm allocations, containers and Python-function executors are not accepted in approved releases.
 - The agent samples each task's CPU and RAM and writes the files the resource monitor reads, so runs keep their charts.
 

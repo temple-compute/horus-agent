@@ -338,7 +338,10 @@ def _revoke(release_hash: str) -> int:
     if not policy.revoke(release_hash):
         sys.stderr.write(f"No approval {release_hash}.\n")
         return 1
-    sys.stdout.write(f"Revoked {release_hash}.\n")
+    sys.stdout.write(
+        f"Revoked {release_hash}. The agent kills its running jobs within "
+        "30 s.\n"
+    )
     return 0
 
 

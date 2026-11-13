@@ -177,7 +177,7 @@ class Guard:
     def _run_file(self, run_id: str) -> Path:
         return self.state / "runs" / f"{run_id}.json"
 
-    def _records(self) -> dict[str, dict[str, Any]]:
+    def records(self) -> dict[str, dict[str, Any]]:
         """Every run binding, by run id."""
         out = {}
         for path in (self.state / "runs").glob("*.json"):
@@ -206,7 +206,7 @@ class Guard:
         if record is None:
             live = [
                 other
-                for other, rec in self._records().items()
+                for other, rec in self.records().items()
                 if self._active(other, rec)
             ]
             if len(live) >= self.policy.max_concurrent_runs:
@@ -292,7 +292,7 @@ class Guard:
             raise PolicyRefusedError(f"Run {run_id} is not bound")
         if str(root) in record["roots"]:
             return
-        for other, rec in self._records().items():
+        for other, rec in self.records().items():
             for theirs in map(Path, rec.get("roots") or ()):
                 if other != run_id and (
                     root.is_relative_to(theirs) or theirs.is_relative_to(root)
@@ -348,6 +348,13 @@ class Guard:
             str(job_dir)
         )
         return job
+
+    def mark_stopped(self, run_id: str) -> None:
+        """Note that the run's jobs were killed after its release's revoke."""
+        record = self.run_record(run_id)
+        if record is not None:
+            record["stopped"] = True
+            self._save(run_id, record)
 
     def add_meta(self, run_id: str | None, path: Path) -> None:
         """Let *path* (run metadata) be read back when uploads are off."""
