@@ -209,15 +209,17 @@ class OpRunner:
         """Job dir -> pid of each job launched by this process."""
         self._switch = switch_user(run_as, run_as_via) if run_as else []
         self._umask = JOB_UMASK if run_as else 0o077
-        self._env = {
-            **job_environment(dict(os.environ), job_env),
-            # macOS tar adds an AppleDouble "._<name>" file per file it
-            # packs, which then show up as extra items in folder artifacts.
-            "COPYFILE_DISABLE": "1",
-        }
+        self._job_env = job_env
+        # macOS tar adds an AppleDouble "._<name>" file per file it packs,
+        # which then show up as extra items in folder artifacts.
+        self._fixed_env = {"COPYFILE_DISABLE": "1"}
         if run_as:
             home = pwd.getpwnam(run_as).pw_dir
-            self._env |= {"HOME": home, "USER": run_as, "LOGNAME": run_as}
+            self._fixed_env |= {
+                "HOME": home,
+                "USER": run_as,
+                "LOGNAME": run_as,
+            }
 
     async def _shell(
         self, script: str, env: dict[str, str] | None, *, capture: bool
@@ -235,7 +237,11 @@ class OpRunner:
         _check_env(env)
         exports = "".join(
             f"export {name}={shlex.quote(value)}\n"
-            for name, value in {**self._env, **(env or {})}.items()
+            for name, value in {
+                **job_environment(dict(os.environ), self._job_env),
+                **self._fixed_env,
+                **(env or {}),
+            }.items()
         )
         out = (
             asyncio.subprocess.PIPE if capture else asyncio.subprocess.DEVNULL

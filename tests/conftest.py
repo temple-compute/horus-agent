@@ -87,6 +87,7 @@ async def agent(broker: FakeBroker, tmp_path: Path) -> AsyncGenerator[Agent]:
             name=AGENT_NAME,
             token=AGENT_TOKEN,
             work_dir=str(tmp_path / "agent-home"),
+            job_env=("FAKE_SLURM_STATE",),  # tests/fake_slurm
         )
     )
     stop = asyncio.Event()
