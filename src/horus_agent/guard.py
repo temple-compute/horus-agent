@@ -13,6 +13,7 @@ path it names must sit inside its own run's directory, every URL on an
 allowed https host. Each decision is appended to the audit log.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -32,14 +33,30 @@ STATE_DIR = ".horus-agent"
 """Agent-only directory under the work dir: run bindings, audit log."""
 SPILL_DIR = ".horus-spill"
 """Large command output an open agent hands back as a file."""
-RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
-LIVE_RUN_S = 3600.0
-"""A run with no op for this long no longer counts as running."""
+CONST_DIR = ".horus-const"
+"""
+Per-run copies of verified constant inputs and scripts, written by the
+agent; no op may name a path inside it.
+"""
+RUN_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|[0-9a-f]{32}"
+)
+"""Run ids are opaque UUIDs, so one can never name another run's folder."""
+SAFE_PATH = re.compile(r"[A-Za-z0-9._+,=@%:/\[\]-]+")
+"""
+Characters a path rendered into a command may hold: none of them means
+anything to a shell, in any quoting context.
+"""
+IDLE_RUN_S = 600.0
+"""A run with no job yet counts as active this long after its last op."""
 RESERVED_NAMES = frozenset({"pid", "exit_code", "slurm_job_id", "env"})
 """Files the agent itself writes in a job dir; ops may not write them."""
 META_NAMES = frozenset(
     {".horus_resource.txt", ".horus_gpu.csv", "resource-usage.csv"}
 )
+"""Names of files the agent writes for the resource monitor."""
+LOG_NAMES = frozenset({"stdout.log", "stderr.log"})
 META_MAX_BYTES = 64 * 1024
 WRITES = {
     "fetch": ("path",),
@@ -53,6 +70,18 @@ Path arguments each method writes to. ``put_file`` and ``unpack`` are
 checked by the caller, which lets an identical rewrite of an input through.
 """
 OPEN_ONLY = frozenset({"exec", "launch"})
+CONTROL_OPS = frozenset(
+    {
+        "poll",
+        "read_output",
+        "signal",
+        "cancel_run",
+        "slurm_status",
+        "slurm_cancel",
+        "remove",
+    }
+)
+"""Ops that still reach a run whose release was revoked: stop and clean."""
 
 
 @dataclass
@@ -110,7 +139,7 @@ class Guard:
         manifest = task = None
         if strict and self.policy.require_release:
             manifest = self.approvals.get(op.release_hash)
-            if manifest is None:
+            if manifest is None and not self._bound_control(op):
                 raise PolicyRefusedError(
                     "This workflow release is not approved on this agent. "
                     "On the machine run: sudo horus-agent approve <release>"
@@ -132,8 +161,40 @@ class Guard:
             self.check_writable(op.run_id, paths[name], op.method)
         return Admitted(args, manifest, task, paths)
 
+    def _bound_control(self, op: Op) -> bool:
+        """
+        Whether *op* stops or cleans up a run bound before its release was
+        revoked: those jobs must stay within reach.
+        """
+        record = self.run_record(op.run_id)
+        return (
+            op.method in CONTROL_OPS
+            and op.release_hash is not None
+            and (record is None or record["release_hash"] == op.release_hash)
+            and (record is not None or op.method == "cancel_run")
+        )
+
     def _run_file(self, run_id: str) -> Path:
         return self.state / "runs" / f"{run_id}.json"
+
+    def _records(self) -> dict[str, dict[str, Any]]:
+        """Every run binding, by run id."""
+        out = {}
+        for path in (self.state / "runs").glob("*.json"):
+            with contextlib.suppress(OSError, ValueError):
+                out[path.stem] = json.loads(path.read_text())
+        return out
+
+    def _active(self, run_id: str, record: dict[str, Any]) -> bool:
+        """Whether a run still has a job running, or is about to start one."""
+        jobs = record.get("jobs") or {}
+        if not jobs:
+            try:
+                idle = time.time() - self._run_file(run_id).stat().st_mtime
+            except FileNotFoundError:
+                return False
+            return idle < IDLE_RUN_S
+        return any(not (Path(j) / "exit_code").exists() for j in jobs)
 
     def _bind(self, op: Op) -> None:
         """Tie the run to its release on its first op (pre-check 3)."""
@@ -144,9 +205,9 @@ class Guard:
         record = self.run_record(run_id)
         if record is None:
             live = [
-                p
-                for p in (self.state / "runs").glob("*.json")
-                if time.time() - p.stat().st_mtime < LIVE_RUN_S
+                other
+                for other, rec in self._records().items()
+                if self._active(other, rec)
             ]
             if len(live) >= self.policy.max_concurrent_runs:
                 raise PolicyRefusedError(
@@ -159,8 +220,9 @@ class Guard:
                 {
                     "release_hash": op.release_hash,
                     "first_seen": time.time(),
-                    "sealed": [],
-                    "jobs": [],
+                    "roots": [],
+                    "jobs": {},
+                    "meta": [],
                 },
             )
         elif record.get("release_hash") != op.release_hash:
@@ -172,7 +234,7 @@ class Guard:
 
     def run_record(self, run_id: str | None) -> dict[str, Any] | None:
         """The binding of *run_id*, or ``None`` before its first op."""
-        if run_id is None:
+        if run_id is None or not RUN_ID.fullmatch(run_id):
             return None
         try:
             record: dict[str, Any] = json.loads(
@@ -190,20 +252,14 @@ class Guard:
             json.dump(record, fh)
         tmp.replace(path)
 
-    def _update(self, run_id: str | None, key: str, item: str) -> None:
-        record = self.run_record(run_id)
-        if run_id is None or record is None:
-            return
-        if item not in record[key]:
-            record[key].append(item)
-            self._save(run_id, record)
-
     # --- paths ------------------------------------------------------------
 
     def confine(self, run_id: str | None, raw: str) -> Path:
         """
         *raw* resolved (symlinks followed) and required to sit in the work
-        dir; under a strict policy also in a directory named after the run.
+        dir; under a strict policy also in its run's own directory: the
+        folder named after the run, which no other run's folder may contain
+        or sit in.
 
         Raises:
             PolicyRefusedError: The path leaves its run's directory.
@@ -214,13 +270,44 @@ class Guard:
         if not path.is_relative_to(self.work_dir) or path == self.work_dir:
             raise PolicyRefusedError(f"Path is outside the work dir: {raw}")
         parts = path.relative_to(self.work_dir).parts
-        if parts[0] == STATE_DIR:
+        if parts[0] == STATE_DIR or CONST_DIR in parts:
             raise PolicyRefusedError(f"Path is the agent's own: {raw}")
         if parts[0] == SPILL_DIR and not self.policy.strict:
             return path
-        if self.policy.strict and (run_id is None or run_id not in parts):
-            raise PolicyRefusedError(f"Path is outside its run's dir: {raw}")
+        if self.policy.strict:
+            if run_id is None or run_id not in parts:
+                raise PolicyRefusedError(
+                    f"Path is outside its run's dir: {raw}"
+                )
+            self._root(
+                run_id,
+                self.work_dir.joinpath(*parts[: parts.index(run_id) + 1]),
+            )
         return path
+
+    def _root(self, run_id: str, root: Path) -> None:
+        """Record *root* as a folder of the run, apart from other runs'."""
+        record = self.run_record(run_id)
+        if record is None:
+            raise PolicyRefusedError(f"Run {run_id} is not bound")
+        if str(root) in record["roots"]:
+            return
+        for other, rec in self._records().items():
+            for theirs in map(Path, rec.get("roots") or ()):
+                if other != run_id and (
+                    root.is_relative_to(theirs) or theirs.is_relative_to(root)
+                ):
+                    raise PolicyRefusedError(
+                        f"Path is outside its run's dir: {root} overlaps "
+                        "another run"
+                    )
+        record["roots"].append(str(root))
+        self._save(run_id, record)
+
+    def roots(self, run_id: str | None) -> list[Path]:
+        """The folders of the run seen so far."""
+        record = self.run_record(run_id) or {}
+        return [Path(r) for r in record.get("roots") or ()]
 
     def confine_param(self, run_id: str | None, raw: str) -> Path:
         """A run parameter path: in the run's dir or a ``read_roots`` dir."""
@@ -230,51 +317,100 @@ class Guard:
                 return path
         return self.confine(run_id, raw)
 
-    def seal(self, run_id: str | None, path: Path) -> None:
-        """Refuse every later write onto *path* (a verified input)."""
-        self._update(run_id, "sealed", str(path))
+    def confine_bound(self, run_id: str | None, raw: str) -> Path:
+        """
+        A path rendered into a command or a job's directory: confined, made
+        of :data:`SAFE_PATH` characters only, and not agent bookkeeping.
+        """
+        if not SAFE_PATH.fullmatch(raw):
+            raise PolicyRefusedError(
+                f"Path has characters a command cannot take safely: {raw!r}"
+            )
+        path = self.confine(run_id, raw)
+        if _meta_name(path):
+            raise PolicyRefusedError(f"Path is run metadata: {raw}")
+        return path
 
-    def add_job(self, run_id: str | None, job_dir: Path) -> None:
-        """Remember a job this agent started for the run."""
-        self._update(run_id, "jobs", str(job_dir))
+    # --- jobs ---------------------------------------------------------------
 
-    def is_job(self, run_id: str | None, job_dir: Path) -> bool:
-        """Whether this agent started a job in *job_dir* for the run."""
+    def add_job(self, run_id: str | None, job_dir: Path, **info: Any) -> None:
+        """Remember a job this agent started for the run (pid, Slurm id)."""
         record = self.run_record(run_id)
-        return record is not None and str(job_dir) in record["jobs"]
+        if run_id is None or record is None:
+            return
+        record["jobs"].setdefault(str(job_dir), {}).update(info)
+        self._save(run_id, record)
+
+    def job(self, run_id: str | None, job_dir: Path) -> dict[str, Any] | None:
+        """What the agent recorded when it started the job in *job_dir*."""
+        record = self.run_record(run_id) or {}
+        job: dict[str, Any] | None = (record.get("jobs") or {}).get(
+            str(job_dir)
+        )
+        return job
+
+    def add_meta(self, run_id: str | None, path: Path) -> None:
+        """Let *path* (run metadata) be read back when uploads are off."""
+        record = self.run_record(run_id)
+        if run_id is None or record is None or str(path) in record["meta"]:
+            return
+        record["meta"].append(str(path))
+        self._save(run_id, record)
 
     def check_writable(self, run_id: str | None, path: Path, how: str) -> None:
         """
-        Refuse writing *path* when it is (or holds) a sealed input or a job
-        file the agent writes itself.
+        Refuse writing *path* when it is run metadata, a job dir of the run
+        (or holds or sits in one) or a file the agent writes itself. A
+        finished job's dir may be removed.
         """
         if path.name in RESERVED_NAMES:
             raise PolicyRefusedError(f"{how} may not write {path.name}")
-        record = self.run_record(run_id) or {"sealed": [], "jobs": []}
-        if how == "remove" and path.name == run_id:
-            raise PolicyRefusedError("remove refused: the run's directory")
-        if how == "remove" and all(
-            (Path(job) / "exit_code").exists() for job in record["jobs"]
-        ):
-            return  # inputs are only held while a job of the run runs
-        for sealed in map(Path, record["sealed"]):
-            if (
-                path == sealed
-                or sealed.is_relative_to(path)
-                or (path.is_relative_to(sealed))
+        if path in self.roots(run_id):
+            raise PolicyRefusedError(f"{how} refused: the run's directory")
+        meta = _meta_name(path)
+        from_runtime = how == "put_file" and runtime_meta(path)
+        if meta and not from_runtime and how not in ("remove", "mkdir"):
+            raise PolicyRefusedError(f"{how} refused: {path} is run metadata")
+        record = self.run_record(run_id) or {}
+        for job in map(Path, record.get("jobs") or {}):
+            if not (
+                path == job
+                or path.is_relative_to(job)
+                or job.is_relative_to(path)
             ):
-                raise PolicyRefusedError(
-                    f"{how} refused: {path} holds a verified input"
-                )
+                continue
+            if how == "remove" and (job / "exit_code").exists():
+                continue
+            raise PolicyRefusedError(f"{how} refused: {path} holds a job")
 
-    def check_readable(self, path: Path) -> None:
-        """With ``uploads = false``, only run metadata may be read back."""
-        spill = self.work_dir / SPILL_DIR
-        if self.policy.uploads or is_meta(path) or path.is_relative_to(spill):
+    def check_readable(self, run_id: str | None, path: Path) -> None:
+        """
+        With ``logs = "off"`` no task output leaves; with ``uploads =
+        false`` only run metadata the agent or the orchestrator wrote does.
+        """
+        record = self.run_record(run_id) or {}
+        jobs = [Path(j) for j in record.get("jobs") or {}]
+        in_job = any(path.parent == job for job in jobs)
+        if self.policy.logs == "off" and (
+            path.name in LOG_NAMES
+            or (in_job and path.name not in ("pid", "exit_code"))
+        ):
+            raise PolicyRefusedError(
+                f"Logs are off on this agent; {path.name} stays here"
+            )
+        if self.policy.uploads:
             return
-        raise PolicyRefusedError(
-            f"Uploads are off on this agent; {path.name} stays here"
+        if path.is_relative_to(self.work_dir / SPILL_DIR):
+            return
+        meta = str(path) in (record.get("meta") or ()) or (
+            in_job and path.name in ("pid", "exit_code")
         )
+        with contextlib.suppress(FileNotFoundError):
+            meta = meta and path.lstat().st_size <= META_MAX_BYTES
+        if not meta:
+            raise PolicyRefusedError(
+                f"Uploads are off on this agent; {path.name} stays here"
+            )
 
     def check_url(self, url: str, downloads: bool) -> None:
         """Require https and an allowed host; ``downloads``/``uploads`` on."""
@@ -286,8 +422,8 @@ class Guard:
             parts.hostname not in self.policy.allowed_hosts
         ):
             raise PolicyRefusedError(
-                f"URL host {parts.hostname!r} is not allowed (https and "
-                "allowed_hosts only)"
+                f"URL host {parts.hostname!r} is not allowed (https only; "
+                "add it to allowed_hosts in the policy)"
             )
 
     # --- audit ------------------------------------------------------------
@@ -319,19 +455,16 @@ class Guard:
             fh.write(line + "\n")
 
 
-def is_meta(path: Path) -> bool:
-    """
-    A runtime metadata file small enough to leave the machine when uploads
-    are off: ``.horus/*.json``, a job's ``pid``/``exit_code``, and the
-    resource usage files.
-    """
+def runtime_meta(path: Path) -> bool:
+    """A runtime state file the orchestrator writes: ``.horus/<x>.json``."""
+    return path.parent.name == ".horus" and path.suffix == ".json"
+
+
+def _meta_name(path: Path) -> bool:
+    """A path named like run metadata, which data may not take."""
     pure = PurePosixPath(path)
-    meta = (
-        (pure.parent.name == ".horus" and pure.suffix == ".json")
+    return (
+        ".horus" in pure.parts
         or pure.name in META_NAMES
-        or (pure.name in ("pid", "exit_code"))
+        or pure.name in RESERVED_NAMES
     )
-    try:
-        return meta and path.stat().st_size <= META_MAX_BYTES
-    except FileNotFoundError:
-        return meta

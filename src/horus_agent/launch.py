@@ -28,14 +28,20 @@ from typing import Any
 
 from horus_agent import native
 from horus_agent.blobs import open_file
-from horus_agent.guard import Admitted, Guard
-from horus_agent.manifest import RESERVED_ENV
+from horus_agent.guard import CONST_DIR, SAFE_PATH, Admitted, Guard
+from horus_agent.manifest import RESERVED_ENV, VALUE_KINDS
 from horus_agent.protocol import PolicyRefusedError, TaskLaunchArgs
 from horus_agent.template import placeholders, render
 
 SIDE_ENV = "HORUS_SIDE_ARTIFACTS_DIR"
 _SBATCH_BAD = re.compile(r"[\s#'\"\\\x00]")
 JOB_ID = re.compile(r"\d+(_\d+)?")
+
+
+TASK_ID = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(\[\d+\])?")
+"""A task id as the runtime writes it: ``sub/task`` or a map clone ``x[3]``."""
+WORK_SUBDIR = "work"
+"""The fresh, empty directory a job starts in, inside its job dir."""
 
 
 @dataclass
@@ -47,9 +53,15 @@ class Prepared:
     env: dict[str, str]
     """The task's environment; reaches it through stdin, not a file."""
     cwd: Path
+    """The task's working directory, where its monitor files go."""
     job_dir: Path
     side_dir: Path
     task: dict[str, Any]
+
+    @property
+    def workdir(self) -> Path:
+        """Where the job starts: a fresh folder no op has written to."""
+        return self.job_dir / WORK_SUBDIR
 
 
 def _template(task: dict[str, Any], script: Path | None) -> str:
@@ -58,9 +70,30 @@ def _template(task: dict[str, Any], script: Path | None) -> str:
         return str(runtime["command"])
     if script is None:
         raise PolicyRefusedError("A python_script task needs its script")
-    # The runtime does not quote the interpreter, only the script path.
-    head = f"{runtime['python']} {shlex.quote(str(script))}"
+    # The runtime does not quote the interpreter, only the script path. -I
+    # keeps the script's folder, the job's cwd and PYTHON* out of sys.path.
+    head = f"{runtime['python']} -I {shlex.quote(str(script))}"
     return f"{head} {runtime['args']}".rstrip()
+
+
+def _store(guard: Guard, run_id: str | None, job_dir: Path) -> Path:
+    """The run's folder for verified copies of constant inputs."""
+    for root in guard.roots(run_id):
+        if job_dir.is_relative_to(root):
+            return root / CONST_DIR
+    raise PolicyRefusedError(f"Job dir is outside its run's dir: {job_dir}")
+
+
+def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
+    """The agent's own copy of *src*, which must be the approved one."""
+    try:
+        return native.materialise(src, store, expected)
+    except FileNotFoundError:
+        raise PolicyRefusedError(f"{name!r} is missing") from None
+    except ValueError as exc:
+        raise PolicyRefusedError(
+            f"{name!r} is not the approved file or folder: {exc}"
+        ) from exc
 
 
 def prepare(
@@ -68,27 +101,36 @@ def prepare(
 ) -> Prepared:
     """
     Check an admitted ``task_launch`` / ``slurm_submit`` against its manifest
-    task and render the command.
+    task and render the command. Constant inputs and the script are copied
+    into the agent's own folder as they are verified, and the command names
+    those copies, so nothing an op can still change runs.
 
     Raises:
         PolicyRefusedError: Anything does not match the approved release.
     """
-    args, task, paths = admitted.args, admitted.task, admitted.paths
+    args, task = admitted.args, admitted.task
     if not isinstance(args, TaskLaunchArgs) or task is None:
         raise PolicyRefusedError("Not a task launch of an approved release")
     task_id = args.task_id
+    if not TASK_ID.fullmatch(task_id):
+        raise PolicyRefusedError(f"Invalid task id {task_id!r}")
     chain = task["target"]["chain"]
     if (chain[0] == "slurm") != slurm:
         method = "slurm_submit" if chain[0] == "slurm" else "task_launch"
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
+    job_dir = guard.confine_bound(run_id, args.job_dir)
+    cwd = guard.confine_bound(run_id, args.cwd)
+    store = _store(guard, run_id, job_dir)
     script = None
     if task["runtime"]["kind"] == "python_script":
         if args.script is None:
             raise PolicyRefusedError("A python_script task needs its script")
-        script = guard.confine(run_id, args.script)
-        if native.digest(script) != task["runtime"]["script_sha256"]:
-            raise PolicyRefusedError("The script is not the approved one")
-        guard.seal(run_id, script)
+        script = _verified(
+            guard.confine_bound(run_id, args.script),
+            store,
+            task["runtime"]["script_sha256"],
+            "script",
+        )
     template = _template(task, script)
     ids = set(task["inputs"]) | set(task["outputs"])
     wanted = {n for n in placeholders(template) if n in ids}
@@ -102,45 +144,46 @@ def prepare(
         "task.name": task.get("name", task_id),
     }
     for name, binding in args.bindings.items():
-        values[name] = _bind(guard, run_id, name, task, binding)
+        values[name] = _bind(guard, run_id, name, task, binding, store)
     _check_env(task, args.env)
-    side = Path(args.env.get(SIDE_ENV) or paths["cwd"] / "side-artifacts")
+    side = cwd / "side-artifacts"
     if SIDE_ENV in args.env:
-        side = guard.confine(run_id, args.env[SIDE_ENV])
-    job_dir = paths["job_dir"]
-    job_dir.mkdir(parents=True, exist_ok=True)
+        side = guard.confine_bound(run_id, args.env[SIDE_ENV])
     command = render(template, values)
-    return Prepared(command, dict(args.env), paths["cwd"], job_dir, side, task)
+    return Prepared(command, dict(args.env), cwd, job_dir, side, task)
 
 
-def _bind(
+def _bind(  # noqa: PLR0913, PLR0917
     guard: Guard,
     run_id: str | None,
     name: str,
     task: dict[str, Any],
     binding: Any,
+    store: Path,
 ) -> str | list[str]:
     spec = task["inputs"].get(name)
     role = "output" if spec is None else spec["role"]
     if binding.path is not None:
         if role == "param":
+            if not SAFE_PATH.fullmatch(binding.path):
+                raise PolicyRefusedError(
+                    f"{name!r}: path has characters a command cannot take "
+                    "safely"
+                )
             return str(guard.confine_param(run_id, binding.path))
-        path = guard.confine(run_id, binding.path)
+        path = guard.confine_bound(run_id, binding.path)
         if role == "constant":
             expected = spec.get("sha256") if spec else None
             if expected is None:
                 raise PolicyRefusedError(f"{name!r} must be a value")
-            try:
-                actual = native.digest(path)
-            except FileNotFoundError:
-                actual = ""
-            if actual != expected:
-                raise PolicyRefusedError(
-                    f"{name!r} is not the approved file or folder"
-                )
-            guard.seal(run_id, path)
+            return str(_verified(path, store, expected, name))
         return str(path)
-    if role == "param":
+    if role == "param" or (
+        role == "edge"
+        and spec is not None
+        and (spec["kind"] in VALUE_KINDS or spec["kind"] == "item")
+    ):
+        # A value chosen at run time; rendered as one quoted shell word.
         value: str | list[str] = binding.value
         return value
     if role == "constant" and spec is not None:
@@ -226,7 +269,7 @@ def sbatch_script(prepared: Prepared) -> str:
     exit_path = shlex.quote(str(prepared.job_dir / "exit_code"))
     lines += [
         "",
-        f"cd {shlex.quote(str(prepared.cwd))} || exit 1",
+        f"cd {shlex.quote(str(prepared.workdir))} || exit 1",
         f"( {prepared.command} ); code=$?; echo $code > {exit_path}; "
         "exit $code",
     ]

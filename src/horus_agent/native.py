@@ -18,6 +18,7 @@ import os
 import shutil
 import stat as stat_mod
 import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -147,3 +148,80 @@ def stat(path: Path) -> dict[str, Any] | None:
         else "other"
     )
     return {"type": kind, "size": info.st_size, "mtime": int(info.st_mtime)}
+
+
+def materialise(src: Path, store: Path, expected: str) -> Path:
+    """
+    Copy the file or folder *src* into ``store/<hash>/<name>``, hashing the
+    bytes as they are copied, and return the copy. Only regular files and
+    folders are copied: a link, device or FIFO anywhere is refused. The copy
+    is the agent's: tasks may read it but not change it.
+
+    Raises:
+        ValueError: *src* is not what *expected* (its digest) names, or
+            holds something other than files and folders.
+    """
+    final = store / expected.rpartition(":")[2] / src.name
+    if final.parent.is_dir():
+        return final
+    store.mkdir(mode=0o750, parents=True, exist_ok=True)
+    store.chmod(0o750)
+    tmp = Path(tempfile.mkdtemp(prefix=".tmp-", dir=store))
+    try:
+        copy = tmp / src.name
+        info = src.lstat()
+        if stat_mod.S_ISREG(info.st_mode):
+            got = _copy_file(src, copy, info)
+        elif stat_mod.S_ISDIR(info.st_mode):
+            got = tree_digest(_copy_tree(src, copy), "deep:")
+        else:
+            raise ValueError(f"Not a file or folder: {src}")
+        if got != expected:
+            raise ValueError(f"{src.name} is not the approved file or folder")
+        tmp.chmod(0o750)
+        tmp.rename(final.parent)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return final
+
+
+def _copy_file(src: Path, dst: Path, info: os.stat_result) -> str:
+    """Copy one regular file, returning the sha256 of what was copied."""
+    h = hashlib.sha256()
+    mode = 0o750 if info.st_mode & 0o111 else 0o640
+    with (
+        open_file(src) as fin,
+        os.fdopen(
+            os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "wb"
+        ) as fout,
+    ):
+        while chunk := fin.read(_CHUNK):
+            h.update(chunk)
+            fout.write(chunk)
+    dst.chmod(mode)
+    return h.hexdigest()
+
+
+def _copy_tree(src: Path, dst: Path) -> dict[str, str]:
+    """Copy a folder of files and folders; relative path -> file digest."""
+    leaves: dict[str, str] = {}
+    dst.mkdir(mode=0o750)
+    for root, dirs, names in os.walk(src):
+        rel = Path(root).relative_to(src)
+        for name in [*dirs, *names]:
+            info = (Path(root) / name).lstat()
+            target = dst / rel / name
+            if stat_mod.S_ISDIR(info.st_mode):
+                target.mkdir(mode=0o750)
+                target.chmod(0o750)
+            elif stat_mod.S_ISREG(info.st_mode):
+                leaves[(rel / name).as_posix()] = _copy_file(
+                    Path(root) / name, target, info
+                )
+            else:
+                raise ValueError(
+                    f"{src.name} holds {rel / name}, which is not a file "
+                    "or folder"
+                )
+    dst.chmod(0o750)
+    return leaves

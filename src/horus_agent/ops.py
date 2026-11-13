@@ -26,6 +26,7 @@ from horus_runtime.core.target.channel import build_detach_command
 from horus_runtime.logging import horus_logger
 
 from horus_agent import blobs, launch, native
+from horus_agent import guard as guard_mod
 from horus_agent.guard import SPILL_DIR, Admitted, Guard
 from horus_agent.logs import redact
 from horus_agent.protocol import (
@@ -366,7 +367,9 @@ class OpRunner:
         guard.audit(op, "allowed")
         return admitted
 
-    async def _check(self, guard: Guard, op: Op, admitted: Admitted) -> None:
+    async def _check(  # noqa: PLR0912
+        self, guard: Guard, op: Op, admitted: Admitted
+    ) -> None:
         """The per-method policy checks (beyond the envelope)."""
         policy = guard.policy
         args, paths = op.args, admitted.paths
@@ -375,17 +378,23 @@ class OpRunner:
                 guard.check_url(args["url"], downloads=True)
             case "upload":
                 guard.check_url(args["url"], downloads=False)
-                guard.check_readable(paths["path"])
+                guard.check_readable(op.run_id, paths["path"])
             case "get_file" | "read_range":
-                guard.check_readable(paths["path"])
+                guard.check_readable(op.run_id, paths["path"])
             case "put_file":
                 data = b64d(args["data"])
                 if len(data) > policy.max_put_bytes:
                     raise PolicyRefusedError("put_file is over max_put_bytes")
                 path = paths["path"]
-                same = path.is_file() and _read(path) == data
+                same = (
+                    path.is_file()
+                    and path.stat().st_size == len(data)
+                    and _read(path) == data
+                )
                 if not same:
                     guard.check_writable(op.run_id, path, "put_file")
+                if guard_mod.runtime_meta(path):
+                    guard.add_meta(op.run_id, path)
             case "unpack":
                 dest = paths["dest"]
                 marker = dest.parent / f".{dest.name}.horus-sha256"
@@ -399,7 +408,7 @@ class OpRunner:
                 if not same:
                     guard.check_writable(op.run_id, dest, "unpack")
             case "poll" | "signal" | "slurm_status" | "slurm_cancel":
-                if policy.strict and not guard.is_job(
+                if policy.strict and not guard.job(
                     op.run_id, paths["job_dir"]
                 ):
                     raise PolicyRefusedError(
@@ -419,14 +428,21 @@ class OpRunner:
         guard = self.guard
         if guard is not None and op.method in ("poll", "signal"):
             # The pid the agent recorded, never the one in the op.
-            args = {**args, "pid": _recorded_pid(args["job_dir"])}
+            recorded = guard.job(op.run_id, Path(args["job_dir"])) or {}
+            args = {**args, "pid": recorded.get("pid")}
+            self._pids.setdefault(args["job_dir"], args["pid"] or 0)
         match op.method:
             case "task_launch" | "slurm_submit" if admitted is not None:
                 return await self._task_launch(op, admitted)
             case "slurm_status":
-                return await self._slurm_status(Path(args["job_dir"]))
+                return await self._slurm_status(
+                    self._slurm_id(op.run_id, args["job_dir"]),
+                    Path(args["job_dir"]),
+                )
             case "slurm_cancel":
-                return await self._slurm_cancel(Path(args["job_dir"]))
+                return await self._slurm_cancel(
+                    self._slurm_id(op.run_id, args["job_dir"])
+                )
             case "read_output" if (
                 guard is not None and guard.policy.logs == "off"
             ):
@@ -581,7 +597,7 @@ class OpRunner:
                 raise RuntimeError(f"The job in {job_dir} did not start")
         self._pids[job_dir] = pid
         if self.guard is not None:
-            self.guard.add_job(run_id, Path(job_dir))
+            self.guard.add_job(run_id, Path(job_dir), pid=pid)
         if run_id is not None:
             with contextlib.suppress(ProcessLookupError):
                 pgid = os.getpgid(pid)
@@ -592,25 +608,42 @@ class OpRunner:
         return {"pid": pid}
 
     async def _task_launch(self, op: Op, admitted: Admitted) -> dict[str, Any]:
-        """Start an approved task's command, rendered here (or submit it)."""
-        assert self.guard is not None and admitted.task is not None
+        """
+        Start an approved task's command, rendered here (or submit it), in a
+        job dir the agent creates. A launch delivered again gets the job it
+        already started.
+        """
+        guard = self.guard
+        assert guard is not None and admitted.task is not None
         args = admitted.args
         assert isinstance(args, TaskLaunchArgs)
         slurm = op.method == "slurm_submit"
-        prepared = launch.prepare(self.guard, op.run_id, admitted, slurm=slurm)
+        job_dir = admitted.paths["job_dir"]
+        known = guard.job(op.run_id, job_dir) or {}
+        key = "slurm_job_id" if slurm else "pid"
+        if known.get(key):
+            return {"job_id" if slurm else "pid": known[key]}
+        if known or job_dir.exists() or job_dir.is_symlink():
+            raise PolicyRefusedError(
+                f"{job_dir} already exists; each job starts in a new job dir"
+            )
+        prepared = launch.prepare(guard, op.run_id, admitted, slurm=slurm)
         log = horus_logger.log
         log.info(f"[run {(op.run_id or '-')[:8]}] {op.method} {args.task_id}")
+        job_dir.mkdir(parents=True)
+        prepared.workdir.mkdir()
         if slurm:
             return await self._sbatch(op.run_id, prepared)
-        started = (prepared.job_dir / "pid").exists()
         result = await self._launch(
             op.run_id,
             prepared.command,
-            str(prepared.job_dir),
-            cwd=str(prepared.cwd),
+            str(job_dir),
+            cwd=str(prepared.workdir),
             env=prepared.env,
         )
-        if not started and self.guard.policy.resource_usage:
+        if guard.policy.resource_usage:
+            guard.add_meta(op.run_id, prepared.side_dir / launch.SAMPLES_FILE)
+            guard.add_meta(op.run_id, prepared.cwd / launch.RUSAGE_FILE)
             with contextlib.suppress(ProcessLookupError):
                 task = launch.start_sampler(
                     os.getpgid(result["pid"]), prepared
@@ -618,6 +651,18 @@ class OpRunner:
                 self._samplers.add(task)
                 task.add_done_callback(self._samplers.discard)
         return result
+
+    def _slurm_id(self, run_id: str | None, job_dir: str) -> str:
+        """The Slurm job the agent submitted from *job_dir* for the run."""
+        job = (
+            None
+            if self.guard is None
+            else self.guard.job(run_id, Path(job_dir))
+        )
+        job_id = str((job or {}).get("slurm_job_id") or "")
+        if not launch.JOB_ID.fullmatch(job_id):
+            raise ValueError(f"No Slurm job was submitted in {job_dir}")
+        return job_id
 
     async def _slurm(
         self, *argv: str, env: dict[str, str] | None = None
@@ -632,9 +677,6 @@ class OpRunner:
         self, run_id: str | None, prepared: launch.Prepared
     ) -> dict[str, Any]:
         """Submit an approved task as a batch job, once."""
-        id_file = prepared.job_dir / "slurm_job_id"
-        if job_id := _job_file(str(prepared.job_dir), "slurm_job_id").strip():
-            return {"job_id": job_id.decode()}
         script = prepared.job_dir / "job.sh"
         with blobs.open_file(script, "w") as fh:
             fh.write(launch.sbatch_script(prepared))
@@ -647,15 +689,14 @@ class OpRunner:
                 f"sbatch submission failed: {err.decode(errors='replace')}"
             )
         new_id = launch.parse_job_id(out)
-        with blobs.open_file(id_file, "w") as fh:
-            fh.write(new_id)
         if self.guard is not None:
-            self.guard.add_job(run_id, prepared.job_dir)
+            self.guard.add_job(run_id, prepared.job_dir, slurm_job_id=new_id)
         return {"job_id": new_id}
 
-    async def _slurm_status(self, job_dir: Path) -> dict[str, Any]:
-        """The queue state of the job submitted in *job_dir*."""
-        job_id = _slurm_job_id(job_dir)
+    async def _slurm_status(
+        self, job_id: str, job_dir: Path
+    ) -> dict[str, Any]:
+        """The queue state of Slurm job *job_id*, submitted from *job_dir*."""
         exit_code = _job_file(str(job_dir), "exit_code").strip()
         status: dict[str, Any] = {
             "job_id": job_id,
@@ -665,9 +706,14 @@ class OpRunner:
             "exit_code": int(exit_code) if exit_code else None,
             "final": None,
         }
-        _code, out, _err = await self._slurm(
+        code, out, err = await self._slurm(
             "squeue", "-h", "-j", job_id, "-o", "%T|%r|%N"
         )
+        # Slurm answers "Invalid job id" once the job has left the queue.
+        if code != 0 and b"nvalid job id" not in err:
+            raise RuntimeError(
+                f"squeue failed ({code}): {err.decode(errors='replace')}"
+            )
         line = out.decode(errors="replace").strip().splitlines()
         if line:
             state, reason, nodes = [*line[0].split("|"), "", ""][:3]
@@ -685,17 +731,17 @@ class OpRunner:
         )
         rows = out.decode(errors="replace").strip().splitlines()
         if rows:
-            state, code, reason = [*rows[0].split("|"), "", ""][:3]
+            state, final_code, reason = [*rows[0].split("|"), "", ""][:3]
             status["final"] = {
                 "state": state.split()[0] if state else "",
-                "exit_code": code,
+                "exit_code": final_code,
                 "reason": reason or None,
             }
         return status
 
-    async def _slurm_cancel(self, job_dir: Path) -> None:
-        """Cancel the job submitted in *job_dir*."""
-        code, _out, err = await self._slurm("scancel", _slurm_job_id(job_dir))
+    async def _slurm_cancel(self, job_id: str) -> None:
+        """Cancel Slurm job *job_id*."""
+        code, _out, err = await self._slurm("scancel", job_id)
         if code != 0:
             raise RuntimeError(
                 f"scancel failed: {err.decode(errors='replace')}"
@@ -742,22 +788,3 @@ def _read(path: Path, offset: int = 0, length: int = -1) -> bytes:
         fh.seek(offset)
         data: bytes = fh.read(length)
     return data
-
-
-def _recorded_pid(job_dir: str) -> int | None:
-    """The pid the agent recorded when it started the job in *job_dir*."""
-    try:
-        pid = int(_job_file(job_dir, "pid").strip())
-    except ValueError:
-        return None
-    return pid if pid > 1 else None
-
-
-def _slurm_job_id(job_dir: Path) -> str:
-    """The Slurm job the agent submitted from *job_dir*."""
-    job_id = _job_file(str(job_dir), "slurm_job_id").strip().decode()
-    if not job_id:
-        raise ValueError(f"No Slurm job was submitted in {job_dir}")
-    if not launch.JOB_ID.fullmatch(job_id):
-        raise ValueError(f"Invalid Slurm job id in {job_dir}")
-    return job_id
