@@ -25,7 +25,7 @@ import pytest
 
 from horus_agent import guard as guard_mod
 from horus_agent import launch, policy
-from horus_agent.guard import Guard, is_meta
+from horus_agent.guard import Guard
 from horus_agent.manifest import (
     Manifest,
     build_manifest,
@@ -40,6 +40,8 @@ DATA = Path(__file__).parent.parent / "data" / "manifest"
 FAKE_SLURM = Path(__file__).parent.parent / "fake_slurm"
 HOST = "files.example.org"
 REF = b">chr1\nACGT\n"
+RUN1 = "11111111-1111-4111-8111-111111111111"
+RUN2 = "22222222-2222-4222-8222-222222222222"
 
 
 def echo_manifest() -> Manifest:
@@ -79,7 +81,7 @@ class Env:
         self,
         method: str,
         *,
-        run: str = "run1",
+        run: str = RUN1,
         release: str | None = "basic",
         task: str | None = None,
         v: int = 2,
@@ -112,7 +114,7 @@ class Env:
 def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     monkeypatch.setattr(policy, "APPROVALS_TTL_S", -1.0)
     work = tmp_path / "work"
-    run = work / "proj" / "run1"
+    run = work / "proj" / RUN1
     run.mkdir(parents=True)
     hashes = []
     for manifest in (
@@ -178,8 +180,8 @@ async def test_revoked_release_is_refused(env: Env) -> None:
 async def test_too_many_runs(env: Env) -> None:
     env.with_policy(max_concurrent_runs=1)
     await env.call("mkdir", path=str(env.run / "a"))
-    other = env.work / "proj" / "run2"
-    await refused(env, "mkdir", "runs already", path=str(other), run="run2")
+    other = env.work / "proj" / RUN2
+    await refused(env, "mkdir", "runs already", path=str(other), run=RUN2)
 
 
 async def test_decisions_are_audited(env: Env) -> None:
@@ -207,8 +209,8 @@ async def test_decisions_are_audited(env: Env) -> None:
         "{work}/../etc",
         "{work}",
         "{work}/proj",
-        "{work}/proj/run2/x",
-        "{work}/.horus-agent/runs/run1.json",
+        f"{{work}}/proj/{RUN2}/x",
+        f"{{work}}/.horus-agent/runs/{RUN1}.json",
         "relative/path",
         "{run}/link/passwd",
     ],
@@ -267,7 +269,7 @@ async def test_every_op_is_confined(
 async def test_open_mode_confines_to_the_work_dir_only(env: Env) -> None:
     env.with_policy(mode="open")
     other = env.work / "elsewhere"
-    await env.call("mkdir", path=str(other), release=None, run="r")
+    await env.call("mkdir", path=str(other), release=None, run=RUN2)
     assert other.is_dir()
     await refused(env, "mkdir", "outside", path="/tmp/x", release=None)
     result = await env.call("exec", cmd="id -u", release=None)
@@ -305,8 +307,10 @@ async def test_transfer_refusals(env: Env) -> None:
 
 async def test_uploads_off_keeps_data_but_not_metadata(env: Env) -> None:
     (env.run / "out.bam").write_bytes(b"secret")
-    (env.run / ".horus").mkdir()
-    (env.run / ".horus" / "state.json").write_text("{}")
+    state = str(env.run / ".horus" / "state.json")
+    await env.call(
+        "put_file", path=state, data=base64.b64encode(b"{}").decode()
+    )
     await refused(env, "get_file", "stays here", path=str(env.run / "out.bam"))
     await refused(
         env,
@@ -409,16 +413,6 @@ async def test_unpack_refuses_unsafe_members(env: Env, member: str) -> None:
     assert not (env.run / "out").exists()
 
 
-def test_is_meta(tmp_path: Path) -> None:
-    assert is_meta(tmp_path / ".horus" / "x.json")
-    assert is_meta(tmp_path / "job" / "exit_code")
-    assert is_meta(tmp_path / "side-artifacts" / "resource-usage.csv")
-    assert not is_meta(tmp_path / "data.json")
-    big = tmp_path / ".horus_resource.txt"
-    big.write_bytes(b"x" * (guard_mod.META_MAX_BYTES + 1))
-    assert not is_meta(big)
-
-
 # --- task_launch -----------------------------------------------------------
 
 
@@ -444,7 +438,8 @@ def basic_args(env: Env, **over: Any) -> dict[str, Any]:
     return args
 
 
-def test_task_command_is_rendered_by_the_agent(env: Env) -> None:
+async def test_task_command_is_rendered_by_the_agent(env: Env) -> None:
+    await env.call("mkdir", path=str(env.run / "x"))  # binds the run
     raw = basic_args(env)
     manifest = env.guard.approvals.get(env.basic)
     assert manifest is not None
@@ -454,9 +449,10 @@ def test_task_command_is_rendered_by_the_agent(env: Env) -> None:
         manifest.task("align"),
         {"job_dir": Path(raw["job_dir"]), "cwd": env.run},
     )
-    prepared = launch.prepare(env.guard, "run1", admitted, slurm=False)
+    prepared = launch.prepare(env.guard, RUN1, admitted, slurm=False)
+    ref = env.run / ".horus-const" / digest(env.run / "ref.fa") / "ref.fa"
     assert prepared.command == (
-        f"bwa mem -t 8 {env.run}/ref.fa "
+        f"bwa mem -t 8 {ref} "
         f"{env.run}/reads > {env.run}/out.bam --sample 'S1; rm -rf ~' "
         "--panel H1N1 --tags 'a b' 3 true --id align $HOME"
     )
@@ -502,37 +498,29 @@ async def test_task_launch_refusals(
     await refused(env, "task_launch", match, task=args["task_id"], **args)
 
 
-async def test_task_launch_runs_and_seals_inputs(env: Env) -> None:
+async def test_task_launch_runs_the_agents_copy_of_inputs(env: Env) -> None:
     (env.run / "ref.fa").write_bytes(REF)
     args = basic_args(env)
-    args["bindings"]["ref"] = {"path": str(env.run / "ref.fa")}
     result = await env.call("task_launch", task="align", **args)
     job = Path(args["job_dir"])
     assert result["pid"] > 1
+    copy = env.run / ".horus-const" / digest(env.run / "ref.fa") / "ref.fa"
+    assert copy.read_bytes() == REF
+    assert copy.stat().st_mode & 0o777 == 0o640
+    # The cloud's file may change; what runs is the verified copy, which
+    # no op can reach.
     data = base64.b64encode(b"x").decode()
-    await refused(
-        env,
-        "put_file",
-        "verified input",
-        path=str(env.run / "ref.fa"),
-        data=data,
-    )
-    await refused(
-        env,
-        "fetch",
-        "verified input",
-        path=str(env.run / "ref.fa"),
-        url=f"https://{HOST}/x",
-    )
-    # The same bytes again are fine (a second consumer of the input).
-    same = base64.b64encode(REF).decode()
-    await env.call("put_file", path=str(env.run / "ref.fa"), data=same)
+    await env.call("put_file", path=str(env.run / "ref.fa"), data=data)
+    assert copy.read_bytes() == REF
+    await refused(env, "put_file", "agent's own", path=str(copy), data=data)
+    await refused(env, "remove", "agent's own", path=str(copy.parent))
     for _ in range(100):
         if (job / "exit_code").exists():
             break
         await asyncio.sleep(0.05)
     assert await env.call("poll", job_dir=str(job)) is not None
-    await env.call("remove", path=str(env.run / "ref.fa"))
+    # The job started in a fresh directory, not the run's.
+    assert (job / launch.WORK_SUBDIR).is_dir()
 
 
 async def test_python_script_hash_is_checked(env: Env) -> None:
@@ -553,7 +541,7 @@ async def test_python_script_hash_is_checked(env: Env) -> None:
     await refused(
         env,
         "task_launch",
-        "not the approved one",
+        "not the approved",
         task="make",
         release=manifest.release_hash,
         **args,
@@ -594,6 +582,7 @@ async def test_echo_task_end_to_end(env: Env) -> None:
     code = await env.call("poll", release="echo", job_dir=str(job))
     assert code == 0
     await env.call("signal", release="echo", job_dir=str(job), sig=15)
+    args["job_dir"] = str(env.run / "job2")
     await refused(
         env,
         "slurm_submit",

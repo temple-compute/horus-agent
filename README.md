@@ -160,19 +160,20 @@ Environment variables appear by name only, and their values are hidden wherever 
 - Tasks no longer get the agent's whole environment. The first `run` logs the names they lose; add the ones they need (for example `MODULEPATH`, `LD_LIBRARY_PATH`, `CONDA_EXE`, `XDG_RUNTIME_DIR`) to `job_env`.
 - `agent.json` must be mode 0600 (`chmod 600 ~/.config/horus-agent/agent.json`).
 - Under the hardened system unit, the work dir must be under `ReadWritePaths`.
+- A strict agent (the default) needs `[jobs] run_as` in its policy, so tasks cannot change the agent's own files. `sudo horus-agent policy init` writes a starting policy; `sudo horus-agent policy init --open` writes one for a machine that accepts any workflow.
 
 ## Policy and approved releases
 
 The machine's administrator decides what the agent may do, in a root-owned policy file. The cloud cannot change it.
 
-With no policy file the agent is **strict**: it runs only workflow releases approved on this machine, and nothing else. On a machine where any workflow may run, write `mode = "open"`.
+With no policy file the agent is **strict**: it runs only workflow releases approved on this machine, and nothing else. On a machine where any workflow may run, write `mode = "open"`. In strict mode tasks must run as their own user (`[jobs] run_as`); `allow_same_user = true` overrides that. `sudo horus-agent policy init [--open] [--run-as USER]` writes a starting file. The agent reads the policy when it starts: restart it after a change.
 
 ```toml
 # /etc/horus-agent/policy.toml (owned by root, mode 0644)
 schema = 1
 mode = "strict"                 # strict | open
 work_dir = "/srv/horus-agent"   # the agent's --work-dir must be this or under it
-allowed_hosts = ["api.example.com", "bucket.s3.eu-north-1.amazonaws.com"]
+allowed_hosts = ["api.example.com", "bucket.s3.eu-north-1.amazonaws.com"]   # broker and storage bucket
 uploads = false                 # only run metadata leaves the machine
 logs = "off"                    # task output stays on the machine
 downloads = true
@@ -203,7 +204,7 @@ The agent refuses to start if the policy file, `/etc/horus-agent/approved/` or a
 
 In both modes:
 
-- every path an op names must sit in the work dir; in strict mode also in its own run's directory, with symlinks resolved;
+- every path an op names must sit in the work dir; in strict mode also in its own run's directory (the folder named after its run id, which must be a UUID), with symlinks resolved; the folders of two runs never overlap;
 - downloads and uploads go over https to `allowed_hosts` only, with size caps and timeouts;
 - every op decision is appended to the audit log (method, run, paths, allowed or refused; never data or environment values).
 
@@ -218,16 +219,20 @@ sudo horus-agent revoke <hash>                 # refused from the next op, withi
 horus-agent policy check                       # the effective policy, or what is wrong
 ```
 
-`approve` reads the release on this machine and prints what it can run before asking for `yes`: each agent task's command, script hash, Slurm options, inputs (constant values and file hashes, run parameters) and secret names. The approval is stored under its content hash, so publishing the same content again needs no new approval, and any change to a command, script, constant file, Slurm option or secret name needs one. When `approve` reads the release through the agent's config, run it with `HORUS_AGENT_CONFIG` pointing at the agent's `agent.json`.
+`approve` reads the release on this machine and prints what it can run before asking for `yes`: each agent task's command, script hash, Slurm options, inputs (constant values and file hashes, run parameters) and secret names. The approval is stored under its content hash, so publishing the same content again needs no new approval, and any change to a command, script, constant file, Slurm option or secret name needs one. `approve` refuses a release whose commands use a placeholder anywhere but as a bare word (inside quotes, a heredoc, `${...}`, arithmetic, or the arguments of `eval`, `sh -c`, `ssh` and similar), or that holds control or invisible formatting characters, and every field it prints is escaped. Write `${x}`, never `"${x}"`: the agent quotes every value. `approve <release-id>` reads the agent's config from `HORUS_AGENT_CONFIG`, your own, or `/var/lib/horus-agent/.config/horus-agent/agent.json`.
 
 ### What a strict agent runs
 
 - Tasks of approved releases with the `shell` executor and a `command` or `python_script` runtime, on `kind: agent` or `kind: slurm` with `inner: {kind: agent}`.
-- The agent renders each task's command itself from the approved template. The orchestrator only says which approved task runs and binds its placeholders: a path in the run's directory, or a run parameter's value, which the agent shell-quotes. Constant inputs are hashed against the approval before the task starts and cannot be overwritten while the run lasts.
+- The agent renders each task's command itself from the approved template. The orchestrator only says which approved task runs and binds its placeholders: a path in the run's directory, made of letters, digits and `._+,=@%:/-[]` only, or a value (a run parameter, or a value from an upstream task), which the agent renders as one quoted word.
+- Constant inputs and scripts are copied into the run's `.horus-const` folder as they are hashed against the approval, and the command names those copies, which no op can reach. Constant folders may hold only files and folders. A `python_script` runs with `python -I`, and every job starts in a new, empty folder inside its job dir: reference inputs and outputs through their placeholders.
 - Secrets reach the task through its shell's stdin, never a file or its command line, and only under the names the release declares.
 - For Slurm the agent writes the batch script from the approved Slurm options and runs `sbatch`, `squeue`, `sacct` and `scancel` itself.
 - File plumbing (hashing, packing and unpacking folders, moves, sizes) has native ops in the agent (`digest`, `pack`, `unpack`, `move`, `stat`) instead of shell commands; `AgentTarget` implements the runtime's file hooks with them: `path_digest`, `pack_folder`, `unpack_folder`, `move_file` and `file_size`. Archives are unpacked without absolute paths, `..`, links out or device files.
-- No raw commands: `exec` and `launch` are refused, and so are file reads and writes through a symlink. A refused op fails the task with `PolicyRefusedError`, an `OperationRefusedError` of the runtime. Shared Slurm allocations, containers and Python-function executors are not accepted in approved releases.
+- Job pids and Slurm job ids come from the agent's own records, never from files in the run's directory, and each job gets a job dir the agent creates.
+- With `uploads = false`, only metadata the agent or the orchestrator wrote (pid and exit code of a job, resource samples, the runtime's `.horus/*.json`) can be read back; no op may write data under those names. With `logs = "off"`, job logs stay on the machine whatever `uploads` says.
+- After `revoke`, a run already bound to the release can still be polled, signalled, cancelled and cleaned up; nothing new starts.
+- No raw commands: `exec` and `launch` are refused, and file reads and writes never follow a symlink in the file's own name. A refused op fails the task with `PolicyRefusedError`, an `OperationRefusedError` of the runtime. Shared Slurm allocations, containers and Python-function executors are not accepted in approved releases.
 - The agent samples each task's CPU and RAM and writes the files the resource monitor reads, so runs keep their charts.
 
 The orchestrator needs horus-agent 0.2 or newer to talk to a strict agent, and a horus-runtime that calls the target's native file hooks instead of shell commands for staging and hashing.

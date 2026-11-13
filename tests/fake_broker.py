@@ -20,7 +20,7 @@ from uuid import uuid4
 
 RUN_TOKEN = "run-token"
 REGISTRATION_TOKEN = "register-me"
-RUN_ID = "run-1"
+RUN_ID = "0b6f2c9e-4d1a-4c3e-9f2b-7a8d5e6c1f00"
 
 
 class _Server(ThreadingHTTPServer):
