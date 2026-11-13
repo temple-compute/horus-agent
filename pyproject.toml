@@ -29,7 +29,7 @@ agent = "horus_agent.target"
 [dependency-groups]
 dev = [
   "licenseheaders~=0.8",
-  "mypy~=1.19",
+  "mypy>=1.19,<3.0",
   "pre_commit~=4.0",
   "pytest~=9.0",
   "pytest-asyncio~=1.3.0",
