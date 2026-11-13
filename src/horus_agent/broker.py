@@ -29,6 +29,7 @@ from horus_agent.protocol import (
     AgentInfo,
     Op,
     OpStatus,
+    PolicyRefusedError,
     StagingUrls,
 )
 
@@ -39,24 +40,35 @@ _CLIENTS: weakref.WeakKeyDictionary[
 ] = weakref.WeakKeyDictionary()
 
 
-_WORK_DIRS: dict[tuple[str, str], str] = {}
+_INFOS: dict[tuple[str, str], AgentInfo] = {}
 
 
 def agent_work_dir(url: str, token: str, agent: str) -> str:
+    """The working directory *agent* reported (see :func:`agent_info`)."""
+    info = agent_info(url, token, agent)
+    if not info.work_dir:
+        raise TaskExecutionError(
+            f"Agent {agent!r} has not reported its working directory yet; "
+            "start it with horus-agent run"
+        )
+    return info.work_dir
+
+
+def agent_info(url: str, token: str, agent: str) -> AgentInfo:
     """
-    The working directory *agent* reported, asked once per process.
+    What the broker knows of *agent* (work dir, protocol, policy), asked once
+    per process once it has reported its work dir.
 
     Blocking: target paths are computed synchronously, before any op runs.
     shortcut: a sync request inside the event loop, once per agent per run;
     move it into an async setup hook if the runtime grows one.
 
     Raises:
-        TaskExecutionError: The broker does not know the agent, or the agent
-            has not reported its working directory yet.
+        TaskExecutionError: The broker does not know the agent.
     """
     key = (url, agent)
-    if key in _WORK_DIRS:
-        return _WORK_DIRS[key]
+    if key in _INFOS:
+        return _INFOS[key]
     try:
         response = httpx.get(
             f"{url.rstrip('/')}/agents/info/{agent}",
@@ -71,14 +83,13 @@ def agent_work_dir(url: str, token: str, agent: str) -> str:
             f"{response.text}"
         )
     info = AgentInfo.model_validate(response.json())
-    if not info.work_dir:
-        raise TaskExecutionError(
-            f"Agent {agent!r} has not reported its working directory yet; "
-            "start it with horus-agent run"
+    if info.work_dir:
+        horus_logger.log.debug(
+            f"Agent {agent!r} runs tasks in {info.work_dir} (protocol "
+            f"{info.protocol})"
         )
-    horus_logger.log.debug(f"Agent {agent!r} runs tasks in {info.work_dir}")
-    _WORK_DIRS[key] = info.work_dir
-    return info.work_dir
+        _INFOS[key] = info
+    return info
 
 
 def broker_client(url: str, token: str) -> "BrokerClient":
@@ -105,16 +116,19 @@ class BrokerClient:
             timeout=httpx.Timeout(30.0, read=POLL_WAIT_S + 30.0),
         )
 
-    async def call(
+    async def call(  # noqa: PLR0913
         self,
         agent: str,
         method: str,
         args: dict[str, Any],
         *,
         offline_timeout: float,
+        v: int = 1,
+        task_id: str | None = None,
     ) -> Any:
         """
-        Run *method* on *agent* and return its result.
+        Run *method* on *agent* and return its result. *v* and *task_id*
+        go in the op's envelope (protocol 2).
 
         Raises:
             TargetLostError: The agent has not polled for *offline_timeout*
@@ -125,14 +139,27 @@ class BrokerClient:
         log = horus_logger.log
         started = time.monotonic()
         while True:
-            op = Op(op_id=uuid4().hex, method=method, args=args)
+            op = Op(
+                op_id=uuid4().hex,
+                method=method,
+                args=args,
+                v=v,
+                task_id=task_id,
+            )
             tag = f"Op {op.op_id[:8]} {method} on agent {agent!r}"
             log.debug(f"{tag}: submit {describe_args(args)}")
             status = await self._request(
                 "POST",
                 "agents/ops/",
                 offline_timeout,
-                json={"agent": agent, "op": op.model_dump(exclude={"run_id"})},
+                json={
+                    "agent": agent,
+                    # The broker stamps both from the run.
+                    "op": op.model_dump(
+                        exclude={"run_id", "release_hash"}
+                        | (set() if v > 1 else {"v", "task_id"})
+                    ),
+                },
             )
             while not status.done and not status.lost:
                 seen = status.agent_seen_ago
@@ -162,7 +189,12 @@ class BrokerClient:
             f"{time.monotonic() - started:.2f}s"
         )
         if status.error is not None:
-            raise TaskExecutionError(
+            error = (
+                PolicyRefusedError
+                if status.error.type == PolicyRefusedError.__name__
+                else TaskExecutionError
+            )
+            raise error(
                 f"{method} on agent {agent!r} failed: "
                 f"{status.error.type}: {status.error.message}"
             )

@@ -44,6 +44,12 @@ def config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
+@pytest.fixture
+def same_user() -> None:
+    """A policy letting tasks run as the agent's own user (tests only)."""
+    config.POLICY_PATH.write_text("allow_same_user = true\n")
+
+
 def test_config_is_owner_only(tmp_path: Path) -> None:
     path = tmp_path / "dir" / "agent.json"
     path.parent.mkdir()
@@ -130,6 +136,7 @@ def test_run_without_registration(
     assert "horus-agent register" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("same_user")
 def test_run_with_revoked_token(
     broker: FakeBroker,
     config_file: Path,
@@ -177,6 +184,7 @@ def test_run_refuses_plain_http(
     assert "https://" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("same_user")
 def test_refuses_root_unless_allowed(
     broker: FakeBroker,
     config_file: Path,
@@ -206,6 +214,7 @@ def test_run_refuses_a_config_others_can_read(
     assert "chmod 600" in capsys.readouterr().err
 
 
+@pytest.mark.usefixtures("same_user")
 def test_run_restricts_umask_and_names_dropped_variables(
     broker: FakeBroker,
     config_file: Path,
@@ -287,6 +296,7 @@ def policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "etc" / "policy.toml"
     path.parent.mkdir(mode=0o755)
     monkeypatch.setattr(config, "POLICY_PATH", path)
+    monkeypatch.setattr(config, "POLICY_OWNERS", frozenset({0}))
     return path
 
 
@@ -418,3 +428,36 @@ async def test_upload_refuses_files_over_the_single_put_limit(
     source.write_bytes(b"1234")
     with pytest.raises(ValueError, match="over 5 GiB"):
         await blobs.upload("http://unused", source)
+
+
+def test_strict_run_needs_a_task_user(
+    config_file: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config.save(
+        AgentConfig(url="https://b", agent_id="i", name="n", token="t"),
+        config_file,
+    )
+    assert main(["run"]) == 1
+    assert "run_as" in capsys.readouterr().err
+
+
+def test_policy_init(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["policy", "init", "--run-as", "nobody"]) == 0
+    text = config.POLICY_PATH.read_text()
+    assert 'mode = "strict"' in text and 'run_as = "nobody"' in text
+    assert config.POLICY_PATH.stat().st_mode & 0o777 == 0o644
+    assert main(["policy", "init", "--open"]) == 1
+    assert "exists" in capsys.readouterr().err
+    config.POLICY_PATH.unlink()
+    assert main(["policy", "init", "--open", "--run-as", ""]) == 0
+    assert 'mode = "open"' in config.POLICY_PATH.read_text()
+
+
+def test_approve_by_id_names_the_missing_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setenv(config.CONFIG_ENV, str(tmp_path / "none.json"))
+    assert main(["approve", "some-release"]) == 1
+    assert config.CONFIG_ENV in capsys.readouterr().err

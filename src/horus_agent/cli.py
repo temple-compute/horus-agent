@@ -12,17 +12,19 @@ import argparse
 import asyncio
 import dataclasses
 import getpass
+import json
 import os
 import platform
 import signal
 import socket
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from horus_runtime.logging import horus_logger
 
-from horus_agent import config, logs, ops
+from horus_agent import config, logs, ops, policy
 from horus_agent.daemon import (
     Agent,
     AgentUnauthorizedError,
@@ -30,6 +32,7 @@ from horus_agent.daemon import (
     broker_tls,
     check_broker_url,
 )
+from horus_agent.manifest import Manifest, ManifestError, build_manifest
 from horus_agent.protocol import Registration
 
 TOKEN_ENV = "HORUS_AGENT_TOKEN"
@@ -146,18 +149,25 @@ async def _run(work_dir: str | None) -> int:
         return 1
     try:
         check_broker_url(registered.url)
-        jobs = config.load_jobs_policy()
-        _umask(jobs)
         directory = _work_dir(work_dir or registered.work_dir or None)
         if not os.access(directory, os.W_OK):
             raise ValueError(
                 f"The work dir {directory} is not writable (with the system "
                 "unit it must be under ReadWritePaths)"
             )
+        rules = policy.load_policy(str(directory), registered.url)
+        if rules.source == "defaults":
+            sys.stderr.write(
+                "No policy file: only approved workflow releases run here. "
+                f"{policy.OPEN_HINT}\n"
+            )
+        if problem := policy.same_user_problem(rules):
+            raise ValueError(problem)
+        _umask(rules.jobs)
         agent = Agent(
-            dataclasses.replace(registered, work_dir=str(directory)), jobs
+            dataclasses.replace(registered, work_dir=str(directory)), rules
         )
-    except (ValueError, KeyError, OSError) as exc:
+    except (ValueError, KeyError, OSError, policy.PolicyError) as exc:
         sys.stderr.write(f"{exc}\n")
         return 1
     kept = ops.job_environment(dict(os.environ), registered.job_env)
@@ -185,7 +195,191 @@ async def _run(work_dir: str | None) -> int:
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+SERVICE_CONFIG = Path("/var/lib/horus-agent/.config/horus-agent/agent.json")
+"""The agent's config under the system unit (README), used by sudo."""
+
+
+def _service_config() -> Path:
+    """The agent's config: ``HORUS_AGENT_CONFIG``, yours, or the unit's."""
+    path = config.config_path()
+    if (
+        config.CONFIG_ENV not in os.environ
+        and not path.exists()
+        and SERVICE_CONFIG.exists()
+    ):
+        return SERVICE_CONFIG
+    return path
+
+
+def _archive(source: str) -> bytes:
+    """A release archive: a local file, else downloaded by release id."""
+    path = Path(source)
+    if path.is_file():
+        return path.read_bytes()
+    where = _service_config()
+    try:
+        registered = config.load(where)
+    except FileNotFoundError:
+        raise ValueError(
+            f"No agent config at {where} to download release {source} "
+            f"with; set {config.CONFIG_ENV} to the agent's agent.json, or "
+            "approve an exported archive file"
+        ) from None
+    response = httpx.get(
+        f"{registered.url.rstrip('/')}/agents/me/releases/"
+        f"{quote(source, safe='')}/archive",
+        headers={"Authorization": f"Bearer {registered.token}"},
+        timeout=120.0,
+        verify=broker_tls(registered.ca_bundle),
+    )
+    if response.status_code >= 400:
+        raise ValueError(
+            f"Cannot download release {source}: HTTP {response.status_code}"
+        )
+    return response.content
+
+
+def _safe(value: object) -> str:
+    """*value* as text with every unprintable character escaped."""
+    return "".join(
+        ch if ch.isprintable() else f"\\u{ord(ch):04x}" for ch in str(value)
+    )
+
+
+def _show(manifest: Manifest) -> str:
+    """
+    What an approver reads before saying yes. Every field is printed with
+    unprintable characters escaped, so nothing in it can hide the rest.
+    """
+    lines = [
+        f"Release: {_safe(manifest.about.get('name'))} "
+        f"(hash {manifest.release_hash})",
+    ]
+    for task_id, task in sorted(manifest.tasks.items()):
+        runtime = task["runtime"]
+        chain = " > ".join(task["target"]["chain"])
+        lines.append(f"\nTask {_safe(task_id)} on {_safe(chain)}")
+        if runtime["kind"] == "command":
+            text = str(runtime["command"])
+            lines.append("  command:")
+        else:
+            text = (
+                f"{runtime['python']} -I <sha256 {runtime['script_sha256']}> "
+                f"{runtime['args']}"
+            )
+            lines.append("  script:")
+        lines += [f"    | {_safe(line)}" for line in text.split("\n")]
+        if "slurm" in task["target"]:
+            lines.append(f"  slurm: {json.dumps(task['target']['slurm'])}")
+        for name, spec in sorted(task["inputs"].items()):
+            detail = spec.get("value") or spec.get("sha256") or ""
+            row = f"  input {_safe(name)}: {spec['role']} {_safe(detail)}"
+            lines.append(row.rstrip())
+        for name in sorted(task["env"]):
+            lines.append(f"  env {_safe(name)}: {_safe(task['env'][name])}")
+    lines += [f"\nWarning: {_safe(w)}" for w in manifest.warnings]
+    return "\n".join(lines) + "\n"
+
+
+def _approve(args: argparse.Namespace) -> int:
+    if os.geteuid() not in config.POLICY_OWNERS:
+        sys.stderr.write("Only root can approve releases (use sudo).\n")
+        return 1
+    try:
+        manifest = build_manifest(_archive(args.release))
+    except (ManifestError, ValueError, OSError, httpx.HTTPError) as exc:
+        sys.stderr.write(f"Cannot approve: {exc}\n")
+        return 1
+    if not manifest.tasks:
+        sys.stderr.write("This release runs nothing on agents.\n")
+        return 1
+    if args.expect_hash and args.expect_hash != manifest.release_hash:
+        sys.stderr.write(
+            f"Hash {manifest.release_hash} is not the expected "
+            f"{args.expect_hash}.\n"
+        )
+        return 1
+    sys.stdout.write(_show(manifest))
+    if not args.yes:
+        sys.stdout.write("Type yes to approve: ")
+        sys.stdout.flush()
+        if sys.stdin.readline().strip() != "yes":
+            sys.stderr.write("Not approved.\n")
+            return 1
+    by = os.environ.get("SUDO_USER") or getpass.getuser()
+    path = policy.approve(manifest, by)
+    sys.stdout.write(f"Approved: {path}\n")
+    return 0
+
+
+def _approvals() -> int:
+    directory = policy.approved_dir()
+    rows = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            manifest = Manifest.from_json(path.read_text())
+        except (OSError, ValueError, KeyError, ManifestError):
+            rows.append(f"{path.stem}  (unreadable)")
+            continue
+        about = manifest.about
+        rows.append(
+            f"{manifest.release_hash}  {about.get('name')}  "
+            f"v{about.get('version', '-')}  {about.get('approved_at')}  "
+            f"{about.get('approved_by')}"
+        )
+    sys.stdout.write("\n".join(rows or ["No approved releases."]) + "\n")
+    return 0
+
+
+def _revoke(release_hash: str) -> int:
+    if os.geteuid() not in config.POLICY_OWNERS:
+        sys.stderr.write("Only root can revoke releases (use sudo).\n")
+        return 1
+    if not policy.revoke(release_hash):
+        sys.stderr.write(f"No approval {release_hash}.\n")
+        return 1
+    sys.stdout.write(
+        f"Revoked {release_hash}. The agent kills its running jobs within "
+        "about 20 s.\n"
+    )
+    return 0
+
+
+def _policy_init(open_mode: bool, run_as: str) -> int:
+    path = policy.policy_path()
+    if os.geteuid() not in config.POLICY_OWNERS:
+        sys.stderr.write(f"Only root can write {path} (use sudo).\n")
+        return 1
+    if path.exists():
+        sys.stderr.write(f"{path} exists; edit it instead.\n")
+        return 1
+    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(policy.template(open_mode=open_mode, run_as=run_as))
+    sys.stdout.write(
+        f"Wrote {path}. Add the storage host to allowed_hosts, then "
+        "restart the agent.\n"
+    )
+    return 0
+
+
+def _policy_check() -> int:
+    try:
+        registered = config.load(config.config_path())
+        work_dir, url = registered.work_dir, registered.url
+    except (FileNotFoundError, PermissionError):
+        work_dir, url = str(config.default_work_dir()), ""
+    try:
+        rules = policy.load_policy(work_dir, url)
+    except (policy.PolicyError, OSError) as exc:
+        sys.stderr.write(f"Policy problem: {exc}\n")
+        return 1
+    sys.stdout.write(json.dumps(rules.describe(), indent=2) + "\n")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
     """Entry point of the ``horus-agent`` command."""
     parser = argparse.ArgumentParser(
         prog="horus-agent",
@@ -244,8 +438,43 @@ def main(argv: list[str] | None = None) -> int:
         "--work-dir",
         help="Use this directory instead of the one given at registration.",
     )
+    approve = commands.add_parser(
+        "approve", help="Approve a workflow release on this machine (root)."
+    )
+    approve.add_argument("release", help="Release id or archive file.")
+    approve.add_argument("--expect-hash", help="Refuse any other hash.")
+    approve.add_argument(
+        "--yes", action="store_true", help="Do not ask for confirmation."
+    )
+    commands.add_parser("approvals", help="List approved releases.")
+    revoke = commands.add_parser("revoke", help="Withdraw an approval (root).")
+    revoke.add_argument("hash", help="Release hash.")
+    policy_cmd = commands.add_parser("policy", help="Show the policy.")
+    policy_cmd.add_argument("action", choices=("check", "init"))
+    policy_cmd.add_argument(
+        "--open",
+        action="store_true",
+        help="init: accept any workflow (internal machines).",
+    )
+    policy_cmd.add_argument(
+        "--run-as",
+        default="horus-job",
+        metavar="USER",
+        help="init: the Unix user tasks run as. Default: horus-job.",
+    )
     args = parser.parse_args(argv)
-    logs.setup(args.debug)
+    logs.setup(getattr(args, "debug", False))
+    match args.command:
+        case "approve":
+            return _approve(args)
+        case "approvals":
+            return _approvals()
+        case "revoke":
+            return _revoke(args.hash)
+        case "policy" if args.action == "init":
+            return _policy_init(args.open, args.run_as)
+        case "policy":
+            return _policy_check()
     if os.geteuid() == 0 and not args.allow_root:
         sys.stderr.write(
             "Refusing to run as root: run the agent as its own user (see "

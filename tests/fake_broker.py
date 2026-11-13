@@ -20,7 +20,7 @@ from uuid import uuid4
 
 RUN_TOKEN = "run-token"
 REGISTRATION_TOKEN = "register-me"
-RUN_ID = "run-1"
+RUN_ID = "0b6f2c9e-4d1a-4c3e-9f2b-7a8d5e6c1f00"
 
 
 class _Server(ThreadingHTTPServer):
@@ -46,6 +46,10 @@ class FakeBroker:
         self.seen: dict[str, float] = {}
         self.work_dirs: dict[str, str | None] = {}
         self.blobs: dict[str, bytes] = {}
+        self.release_hash: str | None = None
+        """Stamped on every op, as the broker does from the run."""
+        self.reported: dict[str, dict[str, Any]] = {}
+        """What each agent's last poll said of its protocol and policy."""
         self.ops_seen: list[dict[str, Any]] = []
         self.fail_results = 0
         self.fail_polls = 0
@@ -87,7 +91,9 @@ class FakeBroker:
         with self.cond:
             self.ops_seen.append(op)
             self.op_agent[op["op_id"]] = agent
-            self.queues.setdefault(agent, []).append({**op, "run_id": RUN_ID})
+            self.queues.setdefault(agent, []).append(
+                {**op, "run_id": RUN_ID, "release_hash": self.release_hash}
+            )
             self.cond.notify_all()
 
     def status(self, op_id: str) -> dict[str, Any]:
@@ -170,6 +176,7 @@ def _handler(broker: FakeBroker) -> type[BaseHTTPRequestHandler]:
                         "name": name,
                         "work_dir": broker.work_dirs.get(name),
                         "online": name in broker.seen,
+                        **broker.reported.get(name, {}),
                     },
                 )
                 return
@@ -242,6 +249,11 @@ def _handler(broker: FakeBroker) -> type[BaseHTTPRequestHandler]:
                 broker.seen[agent] = time.time()
                 if body.get("work_dir"):
                     broker.work_dirs[agent] = body["work_dir"]
+                if "protocol" in body:
+                    broker.reported[agent] = {
+                        "protocol": body["protocol"],
+                        "policy": body["policy"],
+                    }
                 deadline = time.time() + broker.max_wait
                 queue = broker.queues[agent]
                 while not queue and time.time() < deadline:

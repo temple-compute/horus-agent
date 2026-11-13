@@ -12,6 +12,7 @@ dependencies = [
   "horus-runtime>=0.8.4,<0.10",
   "httpx>=0.28,<0.29",
   "pydantic>=2.0,<3",
+  "pyyaml>=6,<7",
 ]
 dynamic = ["version"]
 
@@ -36,6 +37,7 @@ dev = [
   "pytest-cov~=7.0",
   "ruff~=0.15",
   "horus-slurm==0.6.2",
+  "types-pyyaml~=6.0",
 ]
 
 [build-system]
@@ -127,3 +129,8 @@ indent-style = "space"
 
 [tool.uv-dynamic-versioning]
 fallback-version = "0.0.1"
+
+[tool.uv.sources]
+# shortcut: the target file hooks are not released yet; pin the release once
+# horus-runtime publishes them.
+horus-runtime = { git = "https://github.com/temple-compute/horus-runtime", rev = "8d97da16ca7af17b5e4317ae8309635b56634184" }
