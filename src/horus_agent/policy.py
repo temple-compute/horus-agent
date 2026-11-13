@@ -14,6 +14,7 @@ the strict defaults apply: only approved releases run.
 """
 
 import os
+import pwd
 import stat
 import time
 import tomllib
@@ -181,6 +182,14 @@ def load_policy(work_dir: str, api_url: str) -> Policy:
 
 def same_user_problem(policy: Policy) -> str | None:
     """Why *policy* may not run: strict, with tasks as the agent's user."""
+    if policy.jobs.run_as:
+        try:
+            pwd.getpwnam(policy.jobs.run_as)
+        except KeyError:
+            return (
+                f"[jobs] run_as names {policy.jobs.run_as!r}, which is not a "
+                "user on this machine"
+            )
     if policy.strict and not policy.jobs.run_as and not policy.allow_same_user:
         return (
             "Strict mode runs tasks as their own user: set [jobs] run_as in "

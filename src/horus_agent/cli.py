@@ -340,7 +340,7 @@ def _revoke(release_hash: str) -> int:
         return 1
     sys.stdout.write(
         f"Revoked {release_hash}. The agent kills its running jobs within "
-        "30 s.\n"
+        "about 20 s.\n"
     )
     return 0
 
