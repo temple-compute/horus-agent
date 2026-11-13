@@ -29,7 +29,7 @@ from typing import Any
 
 from horus_agent import native
 from horus_agent.blobs import open_file
-from horus_agent.guard import CONST_DIR, SAFE_PATH, Admitted, Guard
+from horus_agent.guard import SAFE_PATH, Admitted, Guard, bad_name
 from horus_agent.manifest import RESERVED_ENV, VALUE_KINDS
 from horus_agent.protocol import PolicyRefusedError, TaskLaunchArgs
 from horus_agent.template import placeholders, render
@@ -39,6 +39,14 @@ _SBATCH_BAD = re.compile(r"[\s#'\"\\\x00]")
 JOB_ID = re.compile(r"\d+(_\d+)?")
 
 
+SAFE_VALUE = re.compile(r"[A-Za-z0-9._,:=+@/-]*")
+"""Characters a free text value chosen at run time may hold."""
+NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?")
+LIST_KINDS = frozenset({"list", "multichoice"})
+HOME_SUBDIR = "home"
+"""Each approved job's own fresh home, inside its job dir."""
+UNSET_ENV = ("NODE_PATH", "BASH_ENV", "ENV")
+"""Variables an approved job never sees."""
 TASK_ID = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(\[\d+\])?")
 """A task id as the runtime writes it: ``sub/task`` or a map clone ``x[3]``."""
 
@@ -57,6 +65,11 @@ class Prepared:
     side_dir: Path
     task: dict[str, Any]
 
+    @property
+    def shell(self) -> str:
+        """The command as the job's shell runs it."""
+        return f"unset {' '.join(UNSET_ENV)}; {self.command}"
+
 
 def _template(task: dict[str, Any], script: Path | None) -> str:
     runtime = task["runtime"]
@@ -70,40 +83,50 @@ def _template(task: dict[str, Any], script: Path | None) -> str:
     return f"{head} {runtime['args']}".rstrip()
 
 
-def _store(guard: Guard, run_id: str | None, job_dir: Path) -> Path:
-    """The run's folder for verified copies of constant inputs."""
-    for root in guard.roots(run_id):
-        if job_dir.is_relative_to(root):
-            return root / CONST_DIR
-    raise PolicyRefusedError(f"Job dir is outside its run's dir: {job_dir}")
-
-
 def _working_dir(guard: Guard, run_id: str | None, raw: str) -> Path:
     """
     The task's working directory, where the runtime runs a task and puts
-    its relative outputs: confined to the run, reached through no link, and
-    a folder the agent made (created here when missing). Files placed in it
-    cannot replace what runs: scripts and constants run from the agent's
-    copies, and Python with ``-I`` imports nothing from it.
+    its relative outputs: confined to the run, reached through no link
+    below the work dir, and a folder of the agent or of the task user
+    (created here when missing). Neither it nor any folder up to the run's
+    may hold a tool config name an op wrote. Scripts and constants run from
+    the agent's copies, and Python with ``-I`` imports nothing from it.
     """
     cwd = guard.confine_bound(run_id, raw)
-    if cwd != Path(os.path.normpath(raw)):
+    if cwd != guard.unlinked(raw):
         raise PolicyRefusedError(
             f"Working directory goes through a link: {raw}"
         )
     cwd.mkdir(parents=True, exist_ok=True)
     info = cwd.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in guard.owners:
         raise PolicyRefusedError(
-            f"Working directory is not a folder the agent made: {raw}"
+            f"Working directory is not a folder the agent or its tasks "
+            f"made: {raw}"
         )
-    return cwd
+    root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
+    folder = cwd
+    while True:
+        with os.scandir(folder) as entries:
+            for entry in entries:
+                if bad_name(entry.name) and (
+                    entry.stat(follow_symlinks=False).st_uid == os.geteuid()
+                ):
+                    raise PolicyRefusedError(
+                        f"{entry.path} holds settings or code a tool would "
+                        "read; it was not made by an approved task"
+                    )
+        if folder == root:
+            return cwd
+        folder = folder.parent
 
 
-def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
+async def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
     """The agent's own copy of *src*, which must be the approved one."""
     try:
-        return native.materialise(src, store, expected)
+        return await asyncio.to_thread(
+            native.materialise, src, store, expected
+        )
     except FileNotFoundError:
         raise PolicyRefusedError(f"{name!r} is missing") from None
     except ValueError as exc:
@@ -112,14 +135,28 @@ def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
         ) from exc
 
 
-def prepare(
+def job_env(job_dir: Path) -> dict[str, str]:
+    """
+    What every approved job's environment pins: a fresh home of its own,
+    and no user startup files for R or Python.
+    """
+    return {
+        "HOME": str(job_dir / HOME_SUBDIR),
+        "R_PROFILE_USER": os.devnull,
+        "R_ENVIRON_USER": os.devnull,
+        "PYTHONNOUSERSITE": "1",
+    }
+
+
+async def prepare(
     guard: Guard, run_id: str | None, admitted: Admitted, *, slurm: bool
 ) -> Prepared:
     """
     Check an admitted ``task_launch`` / ``slurm_submit`` against its manifest
     task and render the command. Constant inputs and the script are copied
-    into the agent's own folder as they are verified, and the command names
-    those copies, so nothing an op can still change runs.
+    into the agent's own folder as they are verified (off the event loop),
+    and the command names those copies, so nothing an op can still change
+    runs.
 
     Raises:
         PolicyRefusedError: Anything does not match the approved release.
@@ -136,12 +173,12 @@ def prepare(
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
     job_dir = guard.confine_bound(run_id, args.job_dir)
     cwd = _working_dir(guard, run_id, args.cwd)
-    store = _store(guard, run_id, job_dir)
+    store = guard.const_store
     script = None
     if task["runtime"]["kind"] == "python_script":
         if args.script is None:
             raise PolicyRefusedError("A python_script task needs its script")
-        script = _verified(
+        script = await _verified(
             guard.confine_bound(run_id, args.script),
             store,
             task["runtime"]["script_sha256"],
@@ -160,16 +197,17 @@ def prepare(
         "task.name": task.get("name", task_id),
     }
     for name, binding in args.bindings.items():
-        values[name] = _bind(guard, run_id, name, task, binding, store)
+        values[name] = await _bind(guard, run_id, name, task, binding, store)
     _check_env(task, args.env)
     side = cwd / "side-artifacts"
     if SIDE_ENV in args.env:
         side = guard.confine_bound(run_id, args.env[SIDE_ENV])
     command = render(template, values)
-    return Prepared(command, dict(args.env), cwd, job_dir, side, task)
+    env = {**args.env, **job_env(job_dir)}
+    return Prepared(command, env, cwd, job_dir, side, task)
 
 
-def _bind(  # noqa: PLR0913, PLR0917
+async def _bind(  # noqa: PLR0913, PLR0917
     guard: Guard,
     run_id: str | None,
     name: str,
@@ -192,7 +230,7 @@ def _bind(  # noqa: PLR0913, PLR0917
             expected = spec.get("sha256") if spec else None
             if expected is None:
                 raise PolicyRefusedError(f"{name!r} must be a value")
-            return str(_verified(path, store, expected, name))
+            return str(await _verified(path, store, expected, name))
         return str(path)
     if role == "param" or (
         role == "edge"
@@ -201,6 +239,7 @@ def _bind(  # noqa: PLR0913, PLR0917
     ):
         # A value chosen at run time; rendered as one quoted shell word.
         value: str | list[str] = binding.value
+        check_value(name, spec or {}, value)
         return value
     if role == "constant" and spec is not None:
         if binding.value != spec.get("value"):
@@ -208,6 +247,36 @@ def _bind(  # noqa: PLR0913, PLR0917
         approved: str | list[str] = spec["value"]
         return approved
     raise PolicyRefusedError(f"{name!r} must be a path")
+
+
+def check_value(
+    name: str, spec: dict[str, Any], value: str | list[str]
+) -> None:
+    """
+    A value chosen at run time must fit its input's kind: a number, a
+    boolean, one of the approved options, or text of :data:`SAFE_VALUE`
+    characters that does not start with ``-``.
+
+    Raises:
+        PolicyRefusedError: It does not.
+    """
+    kind = str(spec.get("kind", "string"))
+    if isinstance(value, list) != (kind in LIST_KINDS):
+        shape = "a list" if kind in LIST_KINDS else "one value"
+        raise PolicyRefusedError(f"{name!r} must be {shape}")
+    for item in value if isinstance(value, list) else [value]:
+        if kind == "number":
+            ok = bool(NUMBER.fullmatch(item))
+        elif kind == "boolean":
+            ok = item in ("true", "false")
+        elif kind in ("choice", "multichoice"):
+            ok = item in (spec.get("options") or ())
+        else:
+            ok = bool(SAFE_VALUE.fullmatch(item)) and not item.startswith("-")
+        if not ok:
+            raise PolicyRefusedError(
+                f"{name!r} is not a valid {kind} value: {item!r}"
+            )
 
 
 def _check_env(task: dict[str, Any], env: Mapping[str, str]) -> None:
@@ -286,8 +355,7 @@ def sbatch_script(prepared: Prepared) -> str:
     lines += [
         "",
         f"cd {shlex.quote(str(prepared.cwd))} || exit 1",
-        f"( {prepared.command} ); code=$?; echo $code > {exit_path}; "
-        "exit $code",
+        f"( {prepared.shell} ); code=$?; echo $code > {exit_path}; exit $code",
     ]
     return "\n".join(lines) + "\n"
 
@@ -356,10 +424,11 @@ async def sample(
     peak, cpu = 0, 0.0
     while not (prepared.job_dir / "exit_code").exists():
         rss, used = group_usage(pgid, proc)
-        if rss or used:
-            peak, cpu = max(peak, rss), max(cpu, used)
-            with open_file(samples, "a") as fh:
-                fh.write(f"{time.time():.3f},{rss},{used:.2f},,,,,exact\n")
+        if not rss:
+            break  # the group is gone (killed, so no exit code comes)
+        peak, cpu = max(peak, rss), max(cpu, used)
+        with open_file(samples, "a") as fh:
+            fh.write(f"{time.time():.3f},{rss},{used:.2f},,,,,exact\n")
         await asyncio.sleep(interval)
     wall = max(time.time() - started, 1e-6)
     minutes, seconds = divmod(wall, 60)

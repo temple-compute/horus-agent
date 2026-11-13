@@ -464,7 +464,10 @@ class OpRunner:
                 return None
             case "unpack":
                 await asyncio.to_thread(
-                    native.unpack, Path(args["pkg"]), Path(args["dest"])
+                    native.unpack,
+                    Path(args["pkg"]),
+                    Path(args["dest"]),
+                    None if guard is None else guard_mod.bad_name,
                 )
                 return None
             case "move":
@@ -479,6 +482,8 @@ class OpRunner:
             case "poll":
                 pid = self._job_pid(args["pid"], args["job_dir"])
                 code = self._poll(pid, args["job_dir"])
+                if code == -1 and guard is not None:
+                    guard.end_job(op.run_id, Path(args["job_dir"]))
                 if code is not None:
                     horus_logger.log.info(
                         f"Job pid {args['pid']} in {args['job_dir']} exited "
@@ -564,11 +569,17 @@ class OpRunner:
             f"exec exited {returncode}: {len(out)} bytes stdout, "
             f"{len(err)} bytes stderr"
         )
-        return {
+        result: dict[str, Any] = {
             "returncode": returncode,
             **_output("stdout", out, self._spill),
             **_output("stderr", err, self._spill),
         }
+        if self.guard is not None:
+            # Only these spill files may be read back with uploads off.
+            self.guard.spilled.update(
+                str(v) for k, v in result.items() if k.endswith("_file")
+            )
+        return result
 
     async def _launch(
         self,
@@ -626,15 +637,18 @@ class OpRunner:
             raise PolicyRefusedError(
                 f"{job_dir} already exists; each job starts in a new job dir"
             )
-        prepared = launch.prepare(guard, op.run_id, admitted, slurm=slurm)
+        prepared = await launch.prepare(
+            guard, op.run_id, admitted, slurm=slurm
+        )
         log = horus_logger.log
         log.info(f"[run {(op.run_id or '-')[:8]}] {op.method} {args.task_id}")
         job_dir.mkdir(parents=True)
+        (job_dir / launch.HOME_SUBDIR).mkdir()
         if slurm:
             return await self._sbatch(op.run_id, prepared)
         result = await self._launch(
             op.run_id,
-            prepared.command,
+            prepared.shell,
             str(job_dir),
             cwd=str(prepared.cwd),
             env=prepared.env,
@@ -678,6 +692,7 @@ class OpRunner:
                     with contextlib.suppress(RuntimeError):
                         await self._slurm_cancel(slurm_id)
                         stopped += 1
+                guard.end_job(run_id, Path(job_dir))
             guard.mark_stopped(run_id)
             horus_logger.log.warning(
                 f"[run {run_id[:8]}] its release was revoked; stopped its jobs"
@@ -802,7 +817,14 @@ class OpRunner:
         """
         log = horus_logger.log
         killed = 0
-        for job_dir, pgid in self._run_jobs.pop(run_id or "", {}).items():
+        jobs = self._run_jobs.pop(run_id or "", {})
+        guard = self.guard
+        record = None if guard is None else guard.run_record(run_id)
+        for job_dir, info in ((record or {}).get("jobs") or {}).items():
+            # Also the jobs launched before this agent restarted.
+            if info.get("pgid") and guard_mod.job_running(Path(job_dir), info):
+                jobs.setdefault(job_dir, info["pgid"])
+        for job_dir, pgid in jobs.items():
             if (Path(job_dir) / "exit_code").exists():
                 log.debug(f"Cancel run {run_id}: {job_dir} already finished")
                 continue
@@ -811,6 +833,8 @@ class OpRunner:
                 log.debug(
                     f"Cancel run {run_id}: killed group {pgid} ({job_dir})"
                 )
+            if guard is not None:
+                guard.end_job(run_id, Path(job_dir))
         return killed
 
 

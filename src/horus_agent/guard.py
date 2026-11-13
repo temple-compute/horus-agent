@@ -16,7 +16,9 @@ allowed https host. Each decision is appended to the audit log.
 import contextlib
 import json
 import os
+import pwd
 import re
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -43,10 +45,35 @@ RUN_ID = re.compile(
     r"|[0-9a-f]{32}"
 )
 """Run ids are opaque UUIDs, so one can never name another run's folder."""
-SAFE_PATH = re.compile(r"[A-Za-z0-9._+,=@%:/\[\]-]+")
+SAFE_PATH = re.compile(r"[A-Za-z0-9._+,=@:/\[\]-]+")
 """
 Characters a path rendered into a command may hold: none of them means
 anything to a shell, in any quoting context.
+"""
+TOOL_CONFIG = frozenset(
+    {
+        "Makefile",
+        "makefile",
+        "GNUmakefile",
+        "nextflow.config",
+        "node_modules",
+        "package.json",
+        "sitecustomize.py",
+        "usercustomize.py",
+        "conftest.py",
+        "pyvenv.cfg",
+        "setup.cfg",
+        "pyproject.toml",
+        "tox.ini",
+        "pytest.ini",
+        "snakefile",
+        "Snakefile",
+    }
+)
+"""
+Names tools read code or settings from in their working directory or a
+folder above a script. Together with every name starting with ``.`` (but
+the runtime's own ``.horus*``), no op may write them into a run.
 """
 IDLE_RUN_S = 600.0
 """A run with no job yet counts as active this long after its last op."""
@@ -104,7 +131,53 @@ class Guard:
         self.approvals = approvals
         self.work_dir = Path(policy.work_dir).resolve()
         self.state = self.work_dir / STATE_DIR
-        (self.state / "runs").mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Jobs share the work dir's group: they may pass through the state
+        # dir to the verified copies, never list or change it.
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        for folder, mode in (
+            (self.state, 0o711),
+            (self.state / "runs", 0o700),
+            (self.const_store, 0o750),
+        ):
+            folder.mkdir(mode=mode, exist_ok=True)
+            info = folder.lstat()
+            mine = info.st_uid in (os.geteuid(), os.getuid())
+            if not stat.S_ISDIR(info.st_mode) or not mine:
+                raise PolicyRefusedError(
+                    f"{folder} must be the agent's folder"
+                )
+            folder.chmod(mode)
+        self.spilled: set[str] = set()
+        """Spill files this agent wrote, the only ones it hands back."""
+
+    @property
+    def owners(self) -> frozenset[int]:
+        """Uids whose folders a task may run in: the agent's, the task's."""
+        uids = {os.geteuid()}
+        with contextlib.suppress(KeyError):
+            if self.policy.jobs.run_as:
+                uids.add(pwd.getpwnam(self.policy.jobs.run_as).pw_uid)
+        return frozenset(uids)
+
+    def unlinked(self, raw: str) -> Path:
+        """
+        *raw* as the real path it names when no link sits below the work
+        dir: the configured work dir (maybe itself reached through a link)
+        swapped for the real one.
+        """
+        norm = Path(os.path.normpath(raw))
+        for base in (
+            Path(os.path.normpath(self.policy.work_dir)),
+            self.work_dir,
+        ):
+            if norm.is_relative_to(base):
+                return self.work_dir / norm.relative_to(base)
+        return norm
+
+    @property
+    def const_store(self) -> Path:
+        """Verified copies of constant inputs, by digest; agent-only."""
+        return self.state / "const"
 
     # --- envelope ---------------------------------------------------------
 
@@ -194,7 +267,7 @@ class Guard:
             except FileNotFoundError:
                 return False
             return idle < IDLE_RUN_S
-        return any(not (Path(j) / "exit_code").exists() for j in jobs)
+        return any(job_running(Path(d), j) for d, j in jobs.items())
 
     def _bind(self, op: Op) -> None:
         """Tie the run to its release on its first op (pre-check 3)."""
@@ -272,7 +345,9 @@ class Guard:
         parts = path.relative_to(self.work_dir).parts
         if parts[0] == STATE_DIR or CONST_DIR in parts:
             raise PolicyRefusedError(f"Path is the agent's own: {raw}")
-        if parts[0] == SPILL_DIR and not self.policy.strict:
+        if parts[0] == SPILL_DIR:
+            if self.policy.strict:  # a strict agent never spills
+                raise PolicyRefusedError(f"Path is the agent's own: {raw}")
             return path
         if self.policy.strict:
             if run_id is None or run_id not in parts:
@@ -329,7 +404,20 @@ class Guard:
         path = self.confine(run_id, raw)
         if _meta_name(path):
             raise PolicyRefusedError(f"Path is run metadata: {raw}")
+        self.check_name(path)
         return path
+
+    def check_name(self, path: Path) -> None:
+        """
+        Refuse a path in the work dir naming a tool's config file or folder,
+        or any hidden name but the runtime's own.
+        """
+        for part in path.relative_to(self.work_dir).parts:
+            if bad_name(part):
+                raise PolicyRefusedError(
+                    f"{part!r} is a name tools read settings or code from; "
+                    "it cannot be written into a run"
+                )
 
     # --- jobs ---------------------------------------------------------------
 
@@ -348,6 +436,11 @@ class Guard:
             str(job_dir)
         )
         return job
+
+    def end_job(self, run_id: str | None, job_dir: Path) -> None:
+        """Note that a job was killed or lost: it holds no run open."""
+        if self.job(run_id, job_dir) is not None:
+            self.add_job(run_id, job_dir, ended=time.time())
 
     def mark_stopped(self, run_id: str) -> None:
         """Note that the run's jobs were killed after its release's revoke."""
@@ -372,6 +465,8 @@ class Guard:
         """
         if path.name in RESERVED_NAMES:
             raise PolicyRefusedError(f"{how} may not write {path.name}")
+        if how != "remove":
+            self.check_name(path)
         if path in self.roots(run_id):
             raise PolicyRefusedError(f"{how} refused: the run's directory")
         meta = _meta_name(path)
@@ -386,7 +481,8 @@ class Guard:
                 or job.is_relative_to(path)
             ):
                 continue
-            if how == "remove" and (job / "exit_code").exists():
+            info = record["jobs"][str(job)]
+            if how == "remove" and not job_running(job, info):
                 continue
             raise PolicyRefusedError(f"{how} refused: {path} holds a job")
 
@@ -407,7 +503,7 @@ class Guard:
             )
         if self.policy.uploads:
             return
-        if path.is_relative_to(self.work_dir / SPILL_DIR):
+        if str(path) in self.spilled:
             return
         meta = str(path) in (record.get("meta") or ()) or (
             in_job and path.name in ("pid", "exit_code")
@@ -460,6 +556,29 @@ class Guard:
         fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as fh:
             fh.write(line + "\n")
+
+
+def job_running(job_dir: Path, info: dict[str, Any]) -> bool:
+    """Whether a job may still run: no exit code, not ended, group alive."""
+    if (job_dir / "exit_code").exists() or info.get("ended"):
+        return False
+    pgid = info.get("pgid")
+    if not pgid:
+        return "slurm_job_id" in info
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # alive, as the task user
+    return True
+
+
+def bad_name(name: str) -> bool:
+    """A tool config name, or hidden and not the runtime's (``.horus*``)."""
+    if name.startswith(".horus") or name.endswith(".horus-sha256"):
+        return False
+    return name in TOOL_CONFIG or name.startswith(".") or name.endswith(".pth")
 
 
 def runtime_meta(path: Path) -> bool:

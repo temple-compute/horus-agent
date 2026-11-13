@@ -13,17 +13,20 @@ Results match the runtime's commands: :func:`digest` equals
 and :func:`unpack` leaves what ``FolderArtifact.unpack_command`` leaves.
 """
 
+import contextlib
 import hashlib
 import os
 import shutil
 import stat as stat_mod
 import tarfile
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from horus_agent.blobs import open_file
 from horus_agent.manifest import tree_digest
+from horus_agent.protocol import PolicyRefusedError
 
 SMALL_FILE = 1 << 20
 """``fast`` digests hash files below this size by content."""
@@ -90,7 +93,9 @@ def pack(src: Path, pkg: Path) -> None:
         tar.add(src, arcname=".", filter=_no_links)
 
 
-def unpack(pkg: Path, dest: Path) -> None:
+def unpack(
+    pkg: Path, dest: Path, refuse: Callable[[str], bool] | None = None
+) -> None:
     """
     Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
     ``..``, links leaving it and device files. *dest* is swapped in whole,
@@ -108,6 +113,12 @@ def unpack(pkg: Path, dest: Path) -> None:
     try:
         with open_file(pkg) as fh, tarfile.open(fileobj=fh, mode="r:*") as tar:
             tar.extractall(tmp, filter="data")
+        for _root, dirs, names in os.walk(tmp):
+            if refuse and (bad := [n for n in dirs + names if refuse(n)]):
+                raise PolicyRefusedError(
+                    f"The package holds {bad[0]!r}, a name tools read "
+                    "settings or code from"
+                )
         if dest.exists() or dest.is_symlink():
             dest.rename(old)
         tmp.rename(dest)
@@ -155,33 +166,46 @@ def materialise(src: Path, store: Path, expected: str) -> Path:
     Copy the file or folder *src* into ``store/<hash>/<name>``, hashing the
     bytes as they are copied, and return the copy. Only regular files and
     folders are copied: a link, device or FIFO anywhere is refused. The copy
-    is the agent's: tasks may read it but not change it.
+    is the agent's: tasks may read it but not change it. Content verified
+    once is reused, also under another name.
 
     Raises:
         ValueError: *src* is not what *expected* (its digest) names, or
             holds something other than files and folders.
     """
-    final = store / expected.rpartition(":")[2] / src.name
-    if final.parent.is_dir():
+    folder = store / expected.rpartition(":")[2]
+    final = folder / src.name
+    if final.exists():
         return final
-    store.mkdir(mode=0o750, parents=True, exist_ok=True)
-    store.chmod(0o750)
-    tmp = Path(tempfile.mkdtemp(prefix=".tmp-", dir=store))
-    try:
-        copy = tmp / src.name
-        info = src.lstat()
-        if stat_mod.S_ISREG(info.st_mode):
-            got = _copy_file(src, copy, info)
-        elif stat_mod.S_ISDIR(info.st_mode):
-            got = tree_digest(_copy_tree(src, copy), "deep:")
+    if not folder.is_dir():
+        tmp = Path(tempfile.mkdtemp(prefix=".tmp-", dir=store))
+        try:
+            copy = tmp / src.name
+            info = src.lstat()
+            if stat_mod.S_ISREG(info.st_mode):
+                got = _copy_file(src, copy, info)
+            elif stat_mod.S_ISDIR(info.st_mode):
+                got = tree_digest(_copy_tree(src, copy), "deep:")
+            else:
+                raise ValueError(f"Not a file or folder: {src}")
+            if got != expected:
+                raise ValueError(
+                    f"{src.name} is not the approved file or folder"
+                )
+            tmp.chmod(0o750)
+            with contextlib.suppress(OSError):  # another launch won the race
+                tmp.rename(folder)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if final.exists():
+            return final
+    # The same content under another name: link to the verified copy.
+    existing = next(p for p in folder.iterdir() if not p.name.startswith("."))
+    with contextlib.suppress(FileExistsError):
+        if existing.is_dir():
+            shutil.copytree(existing, final, copy_function=os.link)
         else:
-            raise ValueError(f"Not a file or folder: {src}")
-        if got != expected:
-            raise ValueError(f"{src.name} is not the approved file or folder")
-        tmp.chmod(0o750)
-        tmp.rename(final.parent)
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+            os.link(existing, final)
     return final
 
 
