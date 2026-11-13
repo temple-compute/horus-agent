@@ -69,3 +69,28 @@ jobs:
           name: coverage-html-report
           path: htmlcov/
           retention-days: 5
+
+  wheel:
+    # The published package must import with the released horus-runtime,
+    # whatever [tool.uv.sources] pins for development.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+
+      - name: Build the wheel without dev sources
+        run: uv build --wheel --no-sources -o dist
+
+      - name: Import it with the oldest and newest released runtime
+        run: |
+          for runtime in "horus-runtime==0.8.4" "horus-runtime<0.10"; do
+            rm -rf /tmp/venv
+            uv venv -q -p 3.13 /tmp/venv
+            VIRTUAL_ENV=/tmp/venv uv pip install --no-sources dist/*.whl "$runtime"
+            /tmp/venv/bin/horus-agent --help > /dev/null
+            /tmp/venv/bin/python -c "import horus_agent.target, horus_agent.ops"
+          done

@@ -15,18 +15,15 @@ own filesystem and posts the result back. Everything above the primitives
 for any other remote target, such as SSH.
 """
 
+import contextlib
 import json
 import os
 import tempfile
 from collections.abc import AsyncGenerator, AsyncIterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar
 
-from horus_runtime.context import (
-    HorusContext,
-    current_op_task_id,
-    current_task_id,
-)
+from horus_runtime.context import HorusContext, current_task_id
 from horus_runtime.core.artifact.base import BaseArtifact
 from horus_runtime.core.target.base import BaseTarget
 from horus_runtime.core.target.channel import (
@@ -37,7 +34,6 @@ from horus_runtime.core.target.channel import (
     StreamName,
     new_job_dir,
 )
-from horus_runtime.core.target.exceptions import OperationRefusedError
 from horus_runtime.core.task.exceptions import TaskExecutionError
 from horus_runtime.middleware.target_command import (
     TargetCommandMiddlewareContext,
@@ -55,11 +51,17 @@ from horus_agent.protocol import (
     INLINE_LIMIT,
     PROTOCOL,
     AgentInfo,
+    PolicyRefusedError,
     StagingUrls,
     b64d,
     b64e,
 )
 from horus_agent.template import placeholders
+
+try:
+    from horus_runtime.context import current_op_task_id
+except ImportError:  # horus-runtime without the target file hooks
+    current_op_task_id = current_task_id
 
 if TYPE_CHECKING:
     from horus_runtime.core.artifact.store import CacheMode
@@ -258,6 +260,18 @@ class AgentTarget(BaseTarget):
             strict = self.strict
         except TaskExecutionError:
             strict = False  # no broker yet: the agent still checks each op
+        own = self.working_directory
+        base = None
+        if strict and own and own.startswith("/"):
+            with contextlib.suppress(TaskExecutionError):  # no broker yet
+                base = agent_work_dir(*self._broker_config(), self.agent)
+        if base is not None and not PurePosixPath(str(own)).is_relative_to(
+            base
+        ):
+            raise TaskExecutionError(
+                f"working_directory {own} is outside agent {self.agent!r}'s "
+                f"work dir {base}"
+            )
         if strict and task.executor.kind != "shell":
             raise TaskExecutionError(
                 f"Agent {self.agent!r} runs approved shell tasks only, not "
@@ -417,13 +431,14 @@ class AgentTarget(BaseTarget):
         agent renders the approved command itself, so ``ctx.command`` (maybe
         rewritten by middleware) is not sent. Anything else runs as given.
         """
-        if ctx.task is None or not self.strict:
+        task = getattr(ctx, "task", None)  # newer horus-runtime only
+        if task is None or not self.strict:
             return await super()._run_command(ctx)
         job_dir = new_job_dir(ctx.cwd or self.resolved_working_directory)
         result = await self._call(
             "task_launch",
             **self._launch_args(
-                ctx.task, cwd=ctx.cwd, job_dir=job_dir, env=ctx.env
+                task, cwd=ctx.cwd, job_dir=job_dir, env=ctx.env
             ),
         )
         return PollingChannelProcess(
@@ -570,9 +585,11 @@ class AgentTarget(BaseTarget):
         self, path: str, mode: "CacheMode" = "deep"
     ) -> str | None:
         """The runtime digest of *path*, taken by the agent."""
+        if self.protocol < 2:
+            return await super().path_digest(path, mode)
         try:
             result: str = await self._call("digest", path=path, mode=mode)
-        except OperationRefusedError:
+        except PolicyRefusedError:
             raise
         except TaskExecutionError:
             return None
@@ -580,18 +597,26 @@ class AgentTarget(BaseTarget):
 
     async def pack_folder(self, src: str, pkg: str) -> None:
         """The contents of folder *src* into the gzip tarball *pkg*."""
+        if self.protocol < 2:
+            return await super().pack_folder(src, pkg)
         await self._call("pack", src=src, pkg=pkg)
 
     async def unpack_folder(self, pkg: str, dest: str) -> None:
         """The tarball *pkg* into folder *dest*."""
+        if self.protocol < 2:
+            return await super().unpack_folder(pkg, dest)
         await self._call("unpack", pkg=pkg, dest=dest)
 
     async def move_file(self, src: str, dst: str) -> None:
         """Move *src* onto *dst*, creating parents."""
+        if self.protocol < 2:
+            return await super().move_file(src, dst)
         await self._call("move", src=src, dst=dst)
 
     async def file_size(self, path: str) -> int:
         """Size of the file at *path*."""
+        if self.protocol < 2:
+            return await super().file_size(path)
         result = await self._call("stat", path=path)
         if result is None:
             raise FileNotFoundError(path)

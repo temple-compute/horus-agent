@@ -39,7 +39,7 @@ Route                                     Caller          Answer
 import base64
 from typing import Any, ClassVar, Literal
 
-from horus_runtime.core.target.exceptions import OperationRefusedError
+from horus_runtime.core.task.exceptions import TaskExecutionError
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 INLINE_LIMIT = 4 * 1024 * 1024
@@ -56,6 +56,14 @@ PROTOCOL = 2
 Op schema this agent speaks. Version 2 ops carry the run's ``release_hash``
 and the ``task_id`` they serve, and every method's args are checked.
 """
+
+
+try:
+    from horus_runtime.core.target.exceptions import OperationRefusedError
+except ImportError:  # horus-runtime without the target file hooks
+
+    class OperationRefusedError(TaskExecutionError):  # type: ignore[no-redef]
+        """A target refused an operation by its own policy."""
 
 
 class PolicyRefusedError(OperationRefusedError):
