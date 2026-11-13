@@ -642,12 +642,13 @@ class OpRunner:
         if guard.policy.resource_usage:
             guard.add_meta(op.run_id, prepared.side_dir / launch.SAMPLES_FILE)
             guard.add_meta(op.run_id, prepared.cwd / launch.RUSAGE_FILE)
-            with contextlib.suppress(ProcessLookupError):
-                task = launch.start_sampler(
-                    os.getpgid(result["pid"]), prepared
-                )
-                self._samplers.add(task)
-                task.add_done_callback(self._samplers.discard)
+            # A job that already exited still gets its monitor files.
+            job = guard.job(op.run_id, job_dir) or {}
+            task = launch.start_sampler(
+                job.get("pgid") or result["pid"], prepared
+            )
+            self._samplers.add(task)
+            task.add_done_callback(self._samplers.discard)
         return result
 
     async def stop_revoked(self) -> int:
