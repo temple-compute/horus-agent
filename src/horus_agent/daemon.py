@@ -28,9 +28,11 @@ import pydantic
 from horus_runtime.logging import horus_logger
 
 from horus_agent.config import AgentConfig, JobsPolicy
+from horus_agent.guard import Guard
 from horus_agent.logs import describe_args, describe_result, summarize
 from horus_agent.ops import OpRunner
-from horus_agent.protocol import POLL_WAIT_S, Op, OpResult
+from horus_agent.policy import Approvals, Policy
+from horus_agent.protocol import POLL_WAIT_S, PROTOCOL, Op, OpResult
 
 BACKOFF_MAX_S = 60.0
 MAX_HOLDING = 1000
@@ -101,15 +103,20 @@ class Agent:
     """One running agent process."""
 
     def __init__(
-        self, config: AgentConfig, jobs: JobsPolicy | None = None
+        self, config: AgentConfig, policy: Policy | None = None
     ) -> None:
         """
-        Serve as the agent registered in *config*, running tasks as *jobs*
-        says.
+        Serve as the agent registered in *config*, checking every op against
+        *policy* (none: ops are not checked, for embedding and tests).
         """
         self.config = config
-        jobs = jobs or JobsPolicy()
-        self.runner = OpRunner(jobs.run_as, jobs.run_as_via, config.job_env)
+        self.policy = policy
+        self.approvals = Approvals()
+        guard = None if policy is None else Guard(policy, self.approvals)
+        jobs = policy.jobs if policy else JobsPolicy()
+        self.runner = OpRunner(
+            jobs.run_as, jobs.run_as_via, config.job_env, guard
+        )
         self._slots = asyncio.Semaphore(MAX_RUNNING)
         self.session = uuid4().hex
         """
@@ -165,7 +172,7 @@ class Agent:
                 with contextlib.suppress(asyncio.CancelledError):
                     await sender
 
-    async def _poll_loop(
+    async def _poll_loop(  # noqa: PLR0912, PLR0915
         self,
         http: httpx.AsyncClient,
         stop: asyncio.Event,
@@ -190,6 +197,10 @@ class Agent:
                 await _pause(stop, 0.5)
                 continue
             body["holding"] = sorted(self.holding)
+            if self.policy is not None:
+                body["protocol"] = PROTOCOL
+                body["policy"] = self.policy.summary()
+                body["approved"] = sorted(self.approvals.hashes())
             log.debug(
                 f"Poll: waiting up to {POLL_WAIT_S}s for ops, holding "
                 f"{len(self.holding)}"

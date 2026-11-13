@@ -287,6 +287,7 @@ def policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     path = tmp_path / "etc" / "policy.toml"
     path.parent.mkdir(mode=0o755)
     monkeypatch.setattr(config, "POLICY_PATH", path)
+    monkeypatch.setattr(config, "POLICY_OWNERS", frozenset({0}))
     return path
 
 

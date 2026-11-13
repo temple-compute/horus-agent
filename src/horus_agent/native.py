@@ -1,0 +1,149 @@
+#
+# horus_agent
+# Copyright (c) 2026 Temple Compute
+#
+# MIT License
+#
+"""
+File plumbing the runtime otherwise runs as shell commands on a target
+(``sha256sum``, ``tar``, ``mv``, ``wc -c``), done in Python by the agent.
+
+Results match the runtime's commands: :func:`digest` equals
+``ArtifactStore.digest``, :func:`pack` writes what ``tar -C src .`` writes
+and :func:`unpack` leaves what ``FolderArtifact.unpack_command`` leaves.
+"""
+
+import hashlib
+import os
+import shutil
+import stat as stat_mod
+import tarfile
+from pathlib import Path
+from typing import Any
+
+from horus_agent.blobs import open_file
+from horus_agent.manifest import tree_digest
+
+SMALL_FILE = 1 << 20
+"""``fast`` digests hash files below this size by content."""
+_CHUNK = 1024 * 1024
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open_file(path) as fh:
+        while chunk := fh.read(_CHUNK):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _leaf(path: Path, info: os.stat_result, mode: str) -> str:
+    """A file's digest in *mode*, as the runtime's ``_leaf``."""
+    if mode == "deep":
+        return _sha256(path)
+    if info.st_size < SMALL_FILE:
+        return "fast:" + _sha256(path)
+    tag = b"horus-stat\n%d:%d" % (info.st_size, int(info.st_mtime))
+    return "fast:" + hashlib.sha256(tag).hexdigest()
+
+
+def digest(path: Path, mode: str = "deep") -> str:
+    """
+    The runtime digest of the file or folder at *path*: a file's sha256 (or
+    ``fast:``...), a folder's ``deep:``/``fast:`` Merkle hash over its regular
+    files. Symlinks inside a folder are skipped, as ``find -type f`` does.
+
+    Raises:
+        FileNotFoundError: *path* is neither a file nor a folder.
+    """
+    info = path.stat()
+    if stat_mod.S_ISREG(info.st_mode):
+        return _leaf(path, info, mode)
+    if not stat_mod.S_ISDIR(info.st_mode):
+        raise FileNotFoundError(f"Nothing to digest at {path}")
+    leaves: dict[str, str] = {}
+    for root, _dirs, names in os.walk(path):
+        for name in names:
+            full = Path(root) / name
+            entry = full.lstat()
+            if stat_mod.S_ISREG(entry.st_mode):
+                rel = full.relative_to(path).as_posix()
+                leaves[rel] = _leaf(full, entry, mode)
+    return tree_digest(leaves, f"{mode}:")
+
+
+def _no_links(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    """Pack regular files and folders only."""
+    return info if info.isfile() or info.isdir() else None
+
+
+def pack(src: Path, pkg: Path) -> None:
+    """The contents of folder *src*, rooted at ``.``, as a gzip tarball."""
+    if not src.is_dir():
+        raise NotADirectoryError(f"Not a folder: {src}")
+    pkg.parent.mkdir(parents=True, exist_ok=True)
+    with (
+        open_file(pkg, "wb") as fh,
+        tarfile.open(fileobj=fh, mode="w:gz", compresslevel=1) as tar,
+    ):
+        tar.add(src, arcname=".", filter=_no_links)
+
+
+def unpack(pkg: Path, dest: Path) -> None:
+    """
+    Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
+    ``..``, links leaving it and device files. *dest* is swapped in whole,
+    and left alone when it already holds this package (sha256 marker).
+    """
+    marker = dest.parent / f".{dest.name}.horus-sha256"
+    sha = _sha256(pkg)
+    if dest.is_dir() and marker.is_file() and read_text(marker) == sha:
+        return
+    tmp = dest.with_name(f"{dest.name}.horus-tmp{os.getpid()}")
+    old = dest.with_name(f"{dest.name}.horus-old{os.getpid()}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir()
+    try:
+        with open_file(pkg) as fh, tarfile.open(fileobj=fh, mode="r:*") as tar:
+            tar.extractall(tmp, filter="data")
+        if dest.exists() or dest.is_symlink():
+            dest.rename(old)
+        tmp.rename(dest)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(old, ignore_errors=True)
+    with open_file(marker, "w") as out:
+        out.write(f"{sha}\n")
+
+
+def read_text(path: Path) -> str:
+    """A small marker file's text, never read through a symlink."""
+    with open_file(path, "r") as fh:
+        return str(fh.read()).strip()
+
+
+def move(src: Path, dst: Path) -> None:
+    """Move *src* onto *dst*, creating parents (``mkdir -p && mv -f``)."""
+    if src == dst:
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.is_dir() and not dst.is_symlink() and src.is_dir():
+        shutil.rmtree(dst)
+    os.replace(src, dst)
+
+
+def stat(path: Path) -> dict[str, Any] | None:
+    """``{type, size, mtime}`` of *path*, ``None`` when missing."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    kind = (
+        "dir"
+        if stat_mod.S_ISDIR(info.st_mode)
+        else "file"
+        if stat_mod.S_ISREG(info.st_mode)
+        else "other"
+    )
+    return {"type": kind, "size": info.st_size, "mtime": int(info.st_mtime)}

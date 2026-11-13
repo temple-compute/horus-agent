@@ -79,6 +79,8 @@ printf '[jobs]\nrun_as = "horus-job"\nrun_as_via = "sudo"\n' > /etc/horus-agent/
 chmod 644 /etc/horus-agent/policy.toml
 ```
 
+The same file holds the rest of the machine's policy; see [Policy and approved releases](#policy-and-approved-releases).
+
 With `run_as` set, files are shared with that group (umask 007), never with other users. The token stays in `/var/lib/horus-agent`, which the task user cannot open. Tasks get the task user's `HOME` (here `/srv/horus-agent`, so caches such as `~/.cache` and `~/.conda` land in the work dir).
 
 The agent switches user with `/usr/bin/sudo` or `/usr/bin/setpriv`, by absolute path and with a fixed environment, and the task's environment is applied only after the switch:
@@ -159,6 +161,77 @@ Environment variables appear by name only, and their values are hidden wherever 
 - `agent.json` must be mode 0600 (`chmod 600 ~/.config/horus-agent/agent.json`).
 - Under the hardened system unit, the work dir must be under `ReadWritePaths`.
 
+## Policy and approved releases
+
+The machine's administrator decides what the agent may do, in a root-owned policy file. The cloud cannot change it.
+
+With no policy file the agent is **strict**: it runs only workflow releases approved on this machine, and nothing else. On a machine where any workflow may run, write `mode = "open"`.
+
+```toml
+# /etc/horus-agent/policy.toml (owned by root, mode 0644)
+schema = 1
+mode = "strict"                 # strict | open
+work_dir = "/srv/horus-agent"   # the agent's --work-dir must be this or under it
+allowed_hosts = ["api.example.com", "bucket.s3.eu-north-1.amazonaws.com"]
+uploads = false                 # only run metadata leaves the machine
+logs = "off"                    # task output stays on the machine
+downloads = true
+resource_usage = true           # CPU and RAM samples for the run's charts
+max_put_bytes = 4194304
+max_fetch_bytes = 53687091200
+max_concurrent_runs = 4
+audit_log = "/var/log/horus-agent/ops.jsonl"   # default: <work_dir>/.horus-agent/ops.jsonl
+
+[jobs]
+run_as = "horus-job"            # see Run tasks as another user
+run_as_via = "sudo"
+
+[data]
+read_roots = ["/data/sequencing"]   # extra dirs a path parameter may name
+```
+
+| Key | Default |
+|---|---|
+| `mode` | `strict` |
+| `require_release` | `true` |
+| `work_dir` | the registered work dir |
+| `allowed_hosts` | the broker URL's host |
+| `uploads` / `logs` | `false` / `off` |
+| `downloads` / `resource_usage` | `true` / `true` |
+
+The agent refuses to start if the policy file, `/etc/horus-agent/approved/` or a parent directory is not owned by root or can be written by group or others.
+
+In both modes:
+
+- every path an op names must sit in the work dir; in strict mode also in its own run's directory, with symlinks resolved;
+- downloads and uploads go over https to `allowed_hosts` only, with size caps and timeouts;
+- every op decision is appended to the audit log (method, run, paths, allowed or refused; never data or environment values).
+
+### Approve a release
+
+```sh
+sudo horus-agent approve <release-id>          # downloaded with the agent's token
+sudo horus-agent approve ./release.zip         # a release archive exported from the UI
+sudo horus-agent approve <release-id> --expect-hash <hash> --yes
+horus-agent approvals                          # hash, name, version, when, by whom
+sudo horus-agent revoke <hash>                 # refused from the next op, within 10 s
+horus-agent policy check                       # the effective policy, or what is wrong
+```
+
+`approve` reads the release on this machine and prints what it can run before asking for `yes`: each agent task's command, script hash, Slurm options, inputs (constant values and file hashes, run parameters) and secret names. The approval is stored under its content hash, so publishing the same content again needs no new approval, and any change to a command, script, constant file, Slurm option or secret name needs one. When `approve` reads the release through the agent's config, run it with `HORUS_AGENT_CONFIG` pointing at the agent's `agent.json`.
+
+### What a strict agent runs
+
+- Tasks of approved releases with the `shell` executor and a `command` or `python_script` runtime, on `kind: agent` or `kind: slurm` with `inner: {kind: agent}`.
+- The agent renders each task's command itself from the approved template. The orchestrator only says which approved task runs and binds its placeholders: a path in the run's directory, or a run parameter's value, which the agent shell-quotes. Constant inputs are hashed against the approval before the task starts and cannot be overwritten while the run lasts.
+- Secrets reach the task through its shell's stdin, never a file or its command line, and only under the names the release declares.
+- For Slurm the agent writes the batch script from the approved Slurm options and runs `sbatch`, `squeue`, `sacct` and `scancel` itself.
+- File plumbing (hashing, packing and unpacking folders, moves, sizes) has native ops in the agent (`digest`, `pack`, `unpack`, `move`, `stat`) instead of shell commands; `AgentTarget` implements the runtime's file hooks with them: `path_digest`, `pack_folder`, `unpack_folder`, `move_file` and `file_size`. Archives are unpacked without absolute paths, `..`, links out or device files.
+- No raw commands: `exec` and `launch` are refused, and so are file reads and writes through a symlink. A refused op fails the task with `PolicyRefusedError`, an `OperationRefusedError` of the runtime. Shared Slurm allocations, containers and Python-function executors are not accepted in approved releases.
+- The agent samples each task's CPU and RAM and writes the files the resource monitor reads, so runs keep their charts.
+
+The orchestrator needs horus-agent 0.2 or newer to talk to a strict agent, and a horus-runtime that calls the target's native file hooks instead of shell commands for staging and hashing.
+
 ## Use it in a workflow
 
 ```yaml
@@ -200,6 +273,7 @@ The broker HTTP API is described in `src/horus_agent/protocol.py`. Temple Comput
 - Files over 4 MiB, in either direction, go through presigned object-storage URLs that the broker issues.
 - Output from `run_command(detach=False)` is buffered and capped at 4 MiB. Long-running commands go through `launch`, the default for this target.
 - The `python_function_external` executor is refused: it would load bytes written on the agent's machine as code in the orchestrator.
+- A strict agent runs only approved releases (see above).
 - Without `run_as`, task commands run as the agent's Unix user and can read its config file. Set `run_as` on any machine others use.
 
 ## Development

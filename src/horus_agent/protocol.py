@@ -37,9 +37,10 @@ Route                                     Caller          Answer
 """
 
 import base64
-from typing import Any
+from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel
+from horus_runtime.core.target.exceptions import OperationRefusedError
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 INLINE_LIMIT = 4 * 1024 * 1024
 """
@@ -49,6 +50,17 @@ A whole number of MiB, so ``read_range`` chunks stay MiB-aligned.
 
 POLL_WAIT_S = 20
 """Seconds a broker long-poll may hold the request open."""
+
+PROTOCOL = 2
+"""
+Op schema this agent speaks. Version 2 ops carry the run's ``release_hash``
+and the ``task_id`` they serve, and every method's args are checked.
+"""
+
+
+class PolicyRefusedError(OperationRefusedError):
+    """The agent's policy does not allow the op."""
+
 
 IDEMPOTENT_METHODS = frozenset(
     {
@@ -65,6 +77,14 @@ IDEMPOTENT_METHODS = frozenset(
         "list_dir",
         "path_exists",
         "remove",
+        "task_launch",
+        "slurm_submit",
+        "slurm_status",
+        "slurm_cancel",
+        "digest",
+        "pack",
+        "unpack",
+        "stat",
     }
 )
 """
@@ -83,6 +103,12 @@ class Op(BaseModel):
     args: dict[str, Any] = {}
     run_id: str | None = None
     """Set by the broker, so the agent can stop a run's jobs."""
+    release_hash: str | None = None
+    """Set by the broker: the release the run was launched from, if any."""
+    task_id: str | None = None
+    """The runtime task the op serves; ``None`` for run-level ops."""
+    v: int = 1
+    """Op schema version, :data:`PROTOCOL` for checked ops."""
 
 
 class OpError(BaseModel):
@@ -144,6 +170,179 @@ class AgentInfo(BaseModel):
     work_dir: str | None = None
     """The agent's working directory, as it last reported it."""
     online: bool = False
+    protocol: int = 1
+    """Op schema the agent speaks; 1 for agents that do not say."""
+    policy: dict[str, Any] | None = None
+    """The agent's reported policy summary (informational)."""
+
+
+class Args(BaseModel):
+    """Arguments of one op method; unknown fields are refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: ClassVar[tuple[str, ...]] = ()
+    """Fields holding a path, confined to the run's directory."""
+
+
+class PathArgs(Args):
+    """An op on one path."""
+
+    paths: ClassVar[tuple[str, ...]] = ("path",)
+    path: str
+
+
+class JobArgs(Args):
+    """An op on a job the agent launched in ``job_dir``."""
+
+    paths: ClassVar[tuple[str, ...]] = ("job_dir",)
+    job_dir: str
+    pid: int | None = None
+    """Ignored when checked: the agent reads the pid it recorded."""
+
+
+class SignalArgs(JobArgs):
+    """``signal``."""
+
+    sig: Literal[2, 9, 15]
+
+
+class ReadOutputArgs(Args):
+    """``read_output``."""
+
+    paths: ClassVar[tuple[str, ...]] = ("job_dir",)
+    job_dir: str
+    stdout_offset: int = Field(ge=0)
+    stderr_offset: int = Field(ge=0)
+
+
+class PutFileArgs(PathArgs):
+    """``put_file``."""
+
+    data: str
+
+
+class FetchArgs(PathArgs):
+    """``fetch``."""
+
+    url: str
+
+
+class UploadArgs(PathArgs):
+    """``upload``: the whole file, or ``length`` bytes from ``offset``."""
+
+    url: str
+    offset: int | None = Field(default=None, ge=0)
+    length: int | None = Field(default=None, ge=0)
+
+
+class ReadRangeArgs(PathArgs):
+    """``read_range``."""
+
+    offset: int = Field(ge=0)
+    length: int = Field(ge=0, le=INLINE_LIMIT)
+
+
+class DigestArgs(PathArgs):
+    """``digest``."""
+
+    mode: Literal["deep", "fast"] = "deep"
+
+
+class PackArgs(Args):
+    """``pack``: the contents of folder ``src`` into the tarball ``pkg``."""
+
+    paths: ClassVar[tuple[str, ...]] = ("src", "pkg")
+    src: str
+    pkg: str
+
+
+class UnpackArgs(Args):
+    """``unpack``: the tarball ``pkg`` into the folder ``dest``."""
+
+    paths: ClassVar[tuple[str, ...]] = ("pkg", "dest")
+    pkg: str
+    dest: str
+
+
+class MoveArgs(Args):
+    """``move``."""
+
+    paths: ClassVar[tuple[str, ...]] = ("src", "dst")
+    src: str
+    dst: str
+
+
+class Binding(Args):
+    """What one placeholder of a task's command stands for."""
+
+    path: str | None = None
+    value: str | list[str] | None = None
+
+    @model_validator(mode="after")
+    def _one(self) -> "Binding":
+        if (self.path is None) == (self.value is None):
+            raise ValueError("A binding has exactly one of path and value")
+        return self
+
+
+class TaskLaunchArgs(Args):
+    """
+    ``task_launch`` / ``slurm_submit``: run an approved task's command, which
+    the agent renders from the manifest and *bindings*.
+    """
+
+    paths: ClassVar[tuple[str, ...]] = ("job_dir", "cwd")
+    task_id: str
+    job_dir: str
+    cwd: str
+    bindings: dict[str, Binding] = {}
+    env: dict[str, str] = {}
+    script: str | None = None
+    """Where a ``python_script`` task's script was placed."""
+
+
+class ExecArgs(Args):
+    """Raw ``exec``; only an open agent accepts it."""
+
+    cmd: str
+    cwd: str | None = None
+    env: dict[str, str] | None = None
+
+
+class LaunchArgs(ExecArgs):
+    """Raw ``launch``; only an open agent accepts it."""
+
+    job_dir: str
+
+
+ARGS: dict[str, type[Args]] = {
+    "exec": ExecArgs,
+    "launch": LaunchArgs,
+    "task_launch": TaskLaunchArgs,
+    "slurm_submit": TaskLaunchArgs,
+    "slurm_status": JobArgs,
+    "slurm_cancel": JobArgs,
+    "poll": JobArgs,
+    "read_output": ReadOutputArgs,
+    "signal": SignalArgs,
+    "put_file": PutFileArgs,
+    "fetch": FetchArgs,
+    "get_file": PathArgs,
+    "upload": UploadArgs,
+    "read_range": ReadRangeArgs,
+    "mkdir": PathArgs,
+    "list_dir": PathArgs,
+    "path_exists": PathArgs,
+    "remove": PathArgs,
+    "digest": DigestArgs,
+    "pack": PackArgs,
+    "unpack": UnpackArgs,
+    "move": MoveArgs,
+    "stat": PathArgs,
+    "cancel_run": Args,
+}
+"""Every method a protocol-2 agent knows, with its arguments."""
 
 
 def b64e(data: bytes) -> str:
