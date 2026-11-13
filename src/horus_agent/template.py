@@ -54,22 +54,91 @@ def render(text: str, values: Mapping[str, str | list[str]]) -> str:
 
 
 _SENTINEL = "\0"
-_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "ash", "busybox"})
-_REPARSE = frozenset({"eval", "ssh", "su", "xargs", "parallel", "watch"})
+_SHELLS = frozenset(
+    {"sh", "bash", "dash", "zsh", "ksh", "ash", "busybox", "source", "."}
+)
+_INTERPRETERS = frozenset(
+    {
+        "perl",
+        "ruby",
+        "node",
+        "nodejs",
+        "Rscript",
+        "R",
+        "php",
+        "lua",
+        "julia",
+        "tclsh",
+        "awk",
+        "gawk",
+        "mawk",
+        "nawk",
+        "sed",
+        "jq",
+        "nextflow",
+        "snakemake",
+        "make",
+    }
+)
+_PYTHON = re.compile(r"python[0-9.]*|pypy[0-9.]*")
+_WRAPPERS = frozenset(
+    {
+        "exec",
+        "command",
+        "builtin",
+        "nohup",
+        "nice",
+        "timeout",
+        "time",
+        "stdbuf",
+        "taskset",
+        "numactl",
+        "srun",
+        "mpirun",
+        "mpiexec",
+        "env",
+        "sudo",
+        "doas",
+        "chroot",
+        "flock",
+        "setsid",
+    }
+)
+"""Commands that run their arguments as another command."""
+_REPARSE = frozenset(
+    {"eval", "ssh", "su", "xargs", "parallel", "watch", "let", "trap"}
+)
 """Commands that parse their arguments as shell code again."""
-_HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z0-9_]+)\1")
+_ARITH_DECL = frozenset({"declare", "typeset", "local", "readonly", "export"})
+_SUBSCRIPT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\[[^\]]*$")
+_HEREDOC = re.compile(r"<<(-?)[ \t]*(['\"]?)([A-Za-z0-9_]+)\2")
+_PIPE_TO_CODE = re.compile(
+    r"\|\s*(?:\S*/)?(?:sh|bash|dash|zsh|ksh|ash|busybox|source|\.|"
+    r"python[0-9.]*|perl|ruby|node|Rscript|R|php|lua)(?:\s+-\S*)*\s*"
+    r"(?:$|[;&|)\n<>])"
+)
+CODE_POSITION = "where the command runs it as code"
+"""The reason given for a placeholder naming the program or script to run."""
 
 
 def unsafe_placeholders(text: str, names: set[str]) -> dict[str, str]:
     """
-    The placeholders among *names* that *text* uses somewhere a quoted
-    value is not one inert shell word: inside quotes, a heredoc, a
-    ``${...}`` expansion or arithmetic, or the arguments of a command that
-    parses them as code again (``eval``, ``sh -c``, ``ssh``...). Name ->
-    why. A template whose quoting cannot be followed marks every name.
+    Find the placeholders in *text* where a value is not one inert word.
 
-    Bare words (``${x}``, ``--in=${x}``, ``$(cmd ${x})``) are safe: the
-    agent renders each value as one quoted word.
+    The placeholders among *names* that *text* uses so, name -> why:
+
+    - inside quotes, a heredoc, a ``${...}`` expansion or arithmetic
+      (``$((``, ``((``, ``$[``, ``[[``, ``let``, ``declare -i``, an array
+      subscript);
+    - in arguments a command parses as code again (``eval``, ``ssh``,
+      ``xargs``...), a here-string, or a pipeline into a shell or an
+      interpreter;
+    - :data:`CODE_POSITION`: as the program to run or the script or code
+      handed to a shell or an interpreter.
+
+    A template whose quoting cannot be followed, or with a ``<<-`` heredoc,
+    marks every name. Bare words (``${x}``, ``--in=${x}``, ``$(cmd ${x})``)
+    are safe: the agent renders each value as one quoted word.
     """
     found: list[str] = []
     skeleton = ""
@@ -86,14 +155,74 @@ def unsafe_placeholders(text: str, names: set[str]) -> dict[str, str]:
         else:
             skeleton += match.group(0)
     skeleton += text[last:]
+    if not found:
+        return {}
+    if "<<-" in skeleton:
+        return dict.fromkeys(found, "in a template with a <<- heredoc")
+    if _PIPE_TO_CODE.search(skeleton):
+        return dict.fromkeys(found, "in a template that pipes into a shell")
     reasons: list[str | None] = _scan(skeleton)
-    out: dict[str, str] = {}
     if len(reasons) != len(found):
         return dict.fromkeys(found, "its quoting cannot be followed")
+    out: dict[str, str] = {}
     for name, reason in zip(found, reasons, strict=True):
         if reason is not None:
             out.setdefault(name, reason)
     return out
+
+
+def _base(word: str) -> str:
+    return word.rsplit("/", 1)[-1]
+
+
+def _code_reason(  # noqa: PLR0911
+    words: list[str], word: str
+) -> str | None:
+    """
+    Why a placeholder after *words* (this command's words so far) and
+    *word* (the start of its own word) runs as code, if it does.
+    """
+    if _SUBSCRIPT.search(word):
+        return "inside an array subscript"
+    bases = [_base(w) for w in words]
+    if any(b in _REPARSE for b in bases):
+        return "in a command that runs it as code"
+    if "[[" in words and "]]" not in words[words.index("[[") :]:
+        return "inside [[ ]]"
+    if any(b in _ARITH_DECL for b in bases) and any(
+        w.startswith("-") for w in words
+    ):
+        return "in a typed declaration"
+    if "printf" in bases and "-v" in words:
+        return "in printf -v"
+    # Skip assignments and wrappers to find the program.
+    rest = [w for w in words if not re.fullmatch(r"[A-Za-z_]\w*=.*", w)]
+    while rest and _base(rest[0]) in _WRAPPERS:
+        rest = rest[1:]
+        while rest and (rest[0].startswith("-") or rest[0][:1].isdigit()):
+            rest = rest[1:]
+    if not rest:
+        return CODE_POSITION if not word else None
+    program = _base(rest[0])
+    if (
+        program in _SHELLS
+        or program in _INTERPRETERS
+        or _PYTHON.fullmatch(program)
+    ):
+        args = rest[1:]
+        if any(
+            w in ("--eval", "--expr", "--command")
+            or (
+                w.startswith("-")
+                and not w.startswith("--")
+                and set(w) & set("ceEpr")
+            )
+            for w in args
+        ):
+            return CODE_POSITION
+        if all(w.startswith("-") for w in args) and not word:
+            return CODE_POSITION
+    return None
 
 
 def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
@@ -103,30 +232,36 @@ def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
     quote or substitution marks every placeholder unsafe.
     """
     out: list[str | None] = []
-    # Each frame: (kind, words of the current command in it)
-    stack: list[tuple[str, list[str]]] = [("top", [])]
+    # Each frame: (kind, words of the current command in it, runs as code)
+    stack: list[tuple[str, list[str], bool]] = [("top", [], False)]
     word = ""
     heredocs: list[str] = []
+    herestring = False
+    closers = {'"': '"', "${": "}", "$((": "))", "((": "))", "$[": "]"}
+    inside = {
+        '"': "inside double quotes",
+        "${": "inside a ${...} expansion",
+        "$((": "inside arithmetic",
+        "((": "inside arithmetic",
+        "$[": "inside arithmetic",
+    }
     i = 0
     n = len(s)
 
     def end_word() -> None:
-        nonlocal word
+        nonlocal word, herestring
         if word:
             stack[-1][1].append(word)
+            herestring = False
         word = ""
 
-    def reparsed(words: list[str]) -> bool:
-        names = [w.rsplit("/", 1)[-1] for w in words]
-        if any(w in _REPARSE for w in names):
-            return True
-        return any(w in _SHELLS for w in names) and any(
-            w.startswith("-") and "c" in w for w in words
-        )
+    def push(kind: str) -> None:
+        _kind, words, code = stack[-1]
+        stack.append((kind, [], code or _code_reason(words, word) is not None))
 
     while i < n:
         c = s[i]
-        kind, words = stack[-1]
+        kind, words, code = stack[-1]
         if kind == "'":
             if c == "'":
                 stack.pop()
@@ -134,46 +269,44 @@ def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
                 out.append("inside single quotes")
             i += 1
             continue
-        if kind in ('"', "${", "$(("):
-            close = {'"': '"', "${": "}", "$((": "))"}[kind]
+        if kind in closers:
             if c == _SENTINEL:
-                out.append(
-                    {
-                        '"': "inside double quotes",
-                        "${": "inside a ${...} expansion",
-                        "$((": "inside arithmetic",
-                    }[kind]
-                )
+                out.append(inside[kind])
             elif c == "\\":
                 i += 2
                 continue
-            elif s.startswith(close, i):
+            elif s.startswith(closers[kind], i):
                 stack.pop()
-                i += len(close)
+                i += len(closers[kind])
                 continue
             elif s.startswith("$((", i):
-                stack.append(("$((", []))
+                push("$((")
                 i += 3
                 continue
             elif s.startswith("$(", i):
-                stack.append(("$(", []))
+                push("$(")
                 i += 2
                 continue
             elif s.startswith("${", i):
-                stack.append(("${", []))
+                push("${")
+                i += 2
+                continue
+            elif s.startswith("$[", i):
+                push("$[")
                 i += 2
                 continue
             elif c == "`":
-                stack.append(("`", []))
+                push("`")
             i += 1
             continue
-        # Unquoted: the top level, $(...) or `...`.
+        # Unquoted: the top level, $(...), `...` or <(...).
         if c == _SENTINEL:
-            out.append(
-                "in a command that runs it as code"
-                if reparsed([*words, word])
-                else None
-            )
+            if herestring:
+                out.append("in a here-string")
+            elif code:
+                out.append("in output a command runs as code")
+            else:
+                out.append(_code_reason(words, word))
             word += "x"
             i += 1
             continue
@@ -188,21 +321,26 @@ def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
                 i += 1
             continue
         if c in "'\"":
-            stack.append((c, []))
+            stack.append((c, [], code))
             word += "q"
             i += 1
             continue
-        if s.startswith("$((", i):
-            stack.append(("$((", []))
-            i += 3
+        for opener in ("$((", "$(", "${", "$[", "<(", ">("):
+            if s.startswith(opener, i):
+                push("$(" if opener in ("<(", ">(") else opener)
+                i += len(opener)
+                break
+        else:
+            opener = ""
+        if opener:
             continue
-        if s.startswith("$(", i) or (c == "`" and kind != "`"):
-            stack.append(("$(" if c == "$" else "`", []))
-            i += 2 if c == "$" else 1
-            continue
-        if s.startswith("${", i):
-            stack.append(("${", []))
+        if s.startswith("((", i) and not word:
+            push("((")
             i += 2
+            continue
+        if c == "`" and kind != "`":
+            push("`")
+            i += 1
             continue
         if (c == ")" and kind == "$(") or (c == "`" and kind == "`"):
             end_word()
@@ -212,11 +350,12 @@ def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
             continue
         if s.startswith("<<<", i):
             end_word()
+            herestring = True
             i += 3
             continue
         if heredoc := _HEREDOC.match(s, i):
             end_word()
-            heredocs.append(heredoc.group(2))
+            heredocs.append(heredoc.group(3))
             i = heredoc.end()
             continue
         if c == "\n" and heredocs:
@@ -231,7 +370,7 @@ def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
                         "inside a heredoc" for _ in line.split(_SENTINEL)[1:]
                     )
                     i = n if eol < 0 else eol + 1
-                    if line.lstrip("\t") == delim:
+                    if line == delim:
                         break
                 else:
                     return []
@@ -241,6 +380,7 @@ def _scan(s: str) -> list[str | None]:  # noqa: PLR0912, PLR0915
             end_word()
         elif c in ";&|\n(){}":
             end_word()
+            herestring = False
             words.clear()
         else:
             word += c

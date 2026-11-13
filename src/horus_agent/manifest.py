@@ -32,7 +32,11 @@ from typing import Any
 
 import yaml
 
-from horus_agent.template import placeholders, unsafe_placeholders
+from horus_agent.template import (
+    CODE_POSITION,
+    placeholders,
+    unsafe_placeholders,
+)
 
 SCHEMA = 1
 WORKFLOW_MEMBER = "workflow.yaml"
@@ -52,7 +56,9 @@ RESERVED_ENV = re.compile(
     r"JAVA_TOOL_OPTIONS|_JAVA_OPTIONS|JDK_JAVA_OPTIONS|RUBYOPT|RUBYLIB|"
     r"GCONV_PATH|OPENSSL_.*|PS4|SHELLOPTS|BASHOPTS|PROMPT_COMMAND|CDPATH|"
     r"GLOBIGNORE|BASH_FUNC_.*|R_PROFILE.*|R_ENVIRON.*|R_LIBS.*|GIT_.*|"
-    r"TMPDIR|SSL_CERT_.*|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|.*_PROXY",
+    r"TMPDIR|SSL_CERT_.*|CURL_CA_BUNDLE|REQUESTS_CA_BUNDLE|.*_PROXY|"
+    r"APPTAINERENV_.*|SINGULARITYENV_.*|CLASSPATH|LUA_.*|XDG_.*|ZDOTDIR|"
+    r"PIP_.*|CONDA.*|NXF_.*|PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE",
     re.IGNORECASE,
 )
 """Environment names a task's secrets may not set on an agent."""
@@ -357,7 +363,7 @@ class _Builder:
                 task, chain, shared, roots, fed
             )
 
-    def _task(
+    def _task(  # noqa: PLR0912
         self,
         task: dict[str, Any],
         chain: list[dict[str, Any]],
@@ -391,28 +397,38 @@ class _Builder:
         runtime = self._runtime(where, task.get("runtime") or {}, inputs)
         templates = [runtime.get("command", ""), runtime.get("args", "")]
         ids = set(inputs) | set(outputs)
+        if runtime["kind"] == "python_script":
+            # The arguments follow the interpreter and the script.
+            templates = ["", f"python3 script.py {runtime['args']}"]
         for template in templates:
             self._check_placeholders(where, template, ids)
             unsafe = unsafe_placeholders(
                 template, ids | {"task.id", "task.name"}
             )
             for name, why in sorted(unsafe.items()):
+                spec = inputs.get(name) or {}
+                if why == CODE_POSITION and (
+                    spec.get("role") == "constant" and "sha256" in spec
+                ):
+                    continue  # a verified copy the release ships
                 raise ManifestError(
-                    f"{where}: ${{{name}}} is {why}; write it as a bare word "
-                    "(the agent quotes every value), not inside quotes"
+                    f"{where}: ${{{name}}} is {why}; use it as a plain "
+                    "argument (the agent quotes every value)"
                 )
         for name, item in sorted(inputs.items()):
             if item.get("role") == "param":
                 self.warnings.append(
-                    f"{where}: the launcher chooses {name!r} at run time; "
-                    "its command gets it as one quoted word"
+                    f"{where}: the launcher chooses {name!r} at run time "
+                    "(checked against its kind); read the command for what "
+                    "it does with it"
                 )
             elif item.get("role") == "edge" and (
                 item["kind"] in VALUE_KINDS or item["kind"] == "item"
             ):
                 self.warnings.append(
-                    f"{where}: {name!r} is a value chosen at run time; its "
-                    "command gets it as one quoted word"
+                    f"{where}: {name!r} is a value chosen at run time "
+                    "(checked against its kind); read the command for what "
+                    "it does with it"
                 )
         for name in sorted(task.get("secrets") or {}):
             self.warnings.append(
@@ -437,8 +453,14 @@ class _Builder:
     ) -> dict[str, Any]:
         kind = str(artifact.get("kind", "file"))
         source = fed.get((task_id, artifact["id"]))
+        options = {}
+        if kind in ("choice", "multichoice"):
+            options["options"] = [
+                _option(o.get("value") if isinstance(o, dict) else o)
+                for o in artifact.get("options") or []
+            ]
         if source is not None and not source.startswith("artifact-"):
-            return {"kind": kind, "role": "edge"}
+            return {"kind": kind, "role": "edge", **options}
         if source is not None:
             artifact = roots.get(source.removeprefix("artifact-"), artifact)
         if artifact.get("value") is not None:
@@ -453,7 +475,7 @@ class _Builder:
             digest = self._bundled(_archive_path(artifact["path"]))
             if digest is not None:
                 return {"kind": kind, "role": "constant", "sha256": digest}
-        return {"kind": kind, "role": "param"}
+        return {"kind": kind, "role": "param", **options}
 
     def _bundled(self, path: str) -> str | None:
         """Digest of the file or folder bundled at *path*, if any."""
