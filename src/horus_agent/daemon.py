@@ -19,6 +19,7 @@ import random
 import socket
 import ssl
 import time
+from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -28,7 +29,7 @@ import pydantic
 from horus_runtime.logging import horus_logger
 
 from horus_agent.config import AgentConfig, JobsPolicy
-from horus_agent.guard import Guard
+from horus_agent.guard import MONITOR_READS, Guard
 from horus_agent.logs import describe_args, describe_result, summarize
 from horus_agent.ops import OpRunner
 from horus_agent.policy import Approvals, Policy
@@ -300,7 +301,11 @@ class Agent:
         took = time.monotonic() - started
         if result.error is not None:
             # Only the method and error: args carry task secrets in env.
-            horus_logger.log.warning(
+            quiet = (
+                op.method == "get_file"
+                and Path(str(op.args.get("path"))).name in MONITOR_READS
+            )
+            (horus_logger.log.debug if quiet else horus_logger.log.warning)(
                 f"{op.method} failed: {result.error.type}: "
                 f"{result.error.message}"
             )

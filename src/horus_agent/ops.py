@@ -425,7 +425,14 @@ class OpRunner:
             await self._check(guard, op, admitted)
         except PolicyRefusedError as exc:
             guard.audit(op, "refused", str(exc))
-            horus_logger.log.warning(f"Refused {op.method}: {exc}")
+            quiet = (
+                op.method == "get_file"
+                and Path(str(op.args.get("path"))).name
+                in guard_mod.MONITOR_READS
+            )
+            (horus_logger.log.debug if quiet else horus_logger.log.warning)(
+                f"Refused {op.method}: {exc}"
+            )
             raise
         guard.audit(op, "allowed")
         return admitted

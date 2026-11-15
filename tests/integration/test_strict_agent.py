@@ -25,7 +25,7 @@ from horus_builtin.artifact.string import StringArtifact
 from horus_builtin.executor.shell import ShellExecutor
 from horus_builtin.runtime.command import CommandRuntime
 from horus_builtin.task.horus_task import HorusTask
-from horus_runtime.context import running_task
+from horus_runtime.context import HorusContext, running_task
 from horus_runtime.core.target.exceptions import OperationRefusedError
 from horus_runtime.core.task.exceptions import TaskExecutionError
 
@@ -34,6 +34,7 @@ from horus_agent import policy
 from horus_agent import target as target_mod
 from horus_agent.config import AgentConfig
 from horus_agent.daemon import Agent
+from horus_agent.guard import EXECUTION_ID
 from horus_agent.manifest import build_manifest_from_workflow
 from horus_agent.target import AgentTarget
 from tests.conftest import AGENT_NAME, AGENT_TOKEN
@@ -301,3 +302,121 @@ async def test_a_runtime_staging_sequence_passes_the_strict_agent(
         await target.put_file(buf.getvalue(), pkg)
         with pytest.raises(TaskExecutionError, match="link"):
             await target.unpack_folder(pkg, str(wd / "cfg"))
+
+
+@pytest.fixture
+async def real_agent(
+    broker: FakeBroker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Path]:
+    """A strict agent whose release is the workflow of the test below."""
+    async with _serving(
+        broker, tmp_path, monkeypatch, (REAL_RELEASE, REAL_FILES, ())
+    ) as run:
+        yield run
+
+
+REAL_COMMAND = (
+    "printf 'hostname=lab\\ncpus_host=4\\n' > .horus_host.txt && "
+    "sh ${script} ${data} ${cfg} > ${out} && cp ${out} ${deep}"
+)
+REAL_RELEASE = {
+    "name": "real",
+    "tasks": [
+        {
+            "id": "crunch",
+            "name": "Crunch",
+            "target": {"kind": "agent", "agent": AGENT_NAME},
+            "executor": {"kind": "shell"},
+            "runtime": {"kind": "command", "command": REAL_COMMAND},
+            "inputs": [
+                {"id": "script", "kind": "file", "path": "scripts/c.sh"},
+                {"id": "cfg", "kind": "folder", "path": "data/cfg"},
+                {"id": "data", "kind": "file", "path": "data.txt"},
+            ],
+            "outputs": [
+                {"id": "out", "kind": "file", "path": "o"},
+                {"id": "deep", "kind": "file", "path": "sub/deep/n.txt"},
+            ],
+        }
+    ],
+}
+REAL_FILES = {
+    "scripts/c.sh": RUN_SCRIPT,
+    "data/cfg/a.txt": b"A\n",
+    "data/cfg/sub/b.txt": b"B\n",
+}
+
+
+async def test_a_real_runtime_run_passes_the_strict_agent(
+    real_agent: Path,
+    horus_context: HorusContext,
+    tmp_path: Path,
+) -> None:
+    """The runtime's own sequence: per-execution directory, script and
+    folder constants, data in, outputs (one nested), resource files."""
+    del horus_context
+    from horus_builtin.target.local import LocalTarget
+    from horus_builtin.workflow.horus_workflow import HorusWorkflow
+    from horus_runtime.core.workflow.status import WorkflowStatus
+
+    work = tmp_path / "orchestrator"
+    (work / "scripts").mkdir(parents=True)
+    (work / "scripts" / "c.sh").write_bytes(RUN_SCRIPT)
+    (work / "cfg" / "sub").mkdir(parents=True)
+    (work / "cfg" / "a.txt").write_text("A\n")
+    (work / "cfg" / "sub" / "b.txt").write_text("B\n")
+    (work / "data.txt").write_text("data\n")
+    target = AgentTarget(agent=AGENT_NAME, working_directory=str(real_agent))
+    task = HorusTask(
+        id="crunch",
+        name="Crunch",
+        target=target,
+        executor=ShellExecutor(),
+        runtime=CommandRuntime(command=REAL_COMMAND),
+        inputs=[
+            FileArtifact(id="script", path=work / "scripts" / "c.sh"),
+            FolderArtifact(id="cfg", path=work / "cfg"),
+            FileArtifact(id="data", path=work / "data.txt"),
+        ],
+        outputs=[
+            FileArtifact(id="out", path=Path("o")),
+            FileArtifact(id="deep", path=Path("sub/deep/n.txt")),
+        ],
+    )
+    workflow = HorusWorkflow(
+        name="real",
+        tasks=[task],
+        edges=[],
+        orchestrator_target=LocalTarget(working_directory=str(work)),
+    )
+    await workflow.run(trigger_id="crunch")
+    assert workflow.status == WorkflowStatus.COMPLETED
+    done = [p for p in real_agent.rglob("o") if p.is_file()]
+    assert done and done[0].read_text() == "data\nA\nB\n"
+    # The monitor's read-backs: quiet, from the task's own working dir.
+    (cwd,) = (real_agent / "crunch").iterdir()
+    assert EXECUTION_ID.fullmatch(cwd.name)
+    await asyncio.sleep(1.5)  # the sampler writes its file as the job ends
+    with running_task("crunch"):
+        host = await target.get_file(str(cwd / ".horus_host.txt"))
+        usage = await target.get_file(str(cwd / ".horus_resource.txt"))
+    assert host.startswith(b"hostname=lab")
+    assert b"Maximum resident set size" in usage
+    await _refused_below_the_execution_dir(target, real_agent / "crunch", cwd)
+
+
+async def _refused_below_the_execution_dir(
+    target: AgentTarget, task_dir: Path, cwd: Path
+) -> None:
+    """One level of execution folder only, and the working dir's rules."""
+    with running_task("crunch"):
+        for bad in (
+            task_dir / "nothex" / "o",
+            task_dir / ("a" * 32).upper() / "o",
+            task_dir / cwd.name / ("b" * 32) / "o",
+            cwd / "undeclared.txt",
+            cwd / "setup.py",
+        ):
+            with pytest.raises(TaskExecutionError, match=r"release|code that"):
+                await target.put_file(b"x", str(bad))
+        await target.put_file(b"x", str(task_dir / ("d" * 32) / "o"))
