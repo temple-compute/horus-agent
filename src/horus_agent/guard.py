@@ -47,6 +47,11 @@ RUN_ID = re.compile(
     r"|[0-9a-f]{32}"
 )
 """Run ids are opaque UUIDs, so one can never name another run's folder."""
+HORUS_PACKAGE = re.compile(r".+\.[0-9a-f]{8}\.horuspkg")
+"""
+The runtime's folder package, ``<name>.<8 hex>.horuspkg`` in a working
+directory: staged, unpacked (under the rules of any package) and removed.
+"""
 SAFE_PATH = re.compile(r"[A-Za-z0-9._+,=@:/\[\]-]+")
 """
 Characters a path rendered into a command may hold: none of them means
@@ -533,6 +538,7 @@ class Guard:
         return (
             name in allowed
             or name.split("[", maxsplit=1)[0] in allowed
+            or HORUS_PACKAGE.fullmatch(name) is not None
             or name.endswith(".horus-sha256")  # the agent's unpack markers
             or ".horus-tmp" in name  # an unpack in progress
             or ".horus-old" in name
@@ -573,6 +579,7 @@ class Guard:
                 if (
                     rel[depth] not in allowed
                     and rel[depth].split("[")[0] not in allowed
+                    and not HORUS_PACKAGE.fullmatch(rel[depth])
                 ):
                     raise PolicyRefusedError(
                         f"{rel[depth]!r} is not an input, output, script or "
@@ -935,7 +942,7 @@ class Guard:
             self.note_made(run_id, path)
             if approved and code_suffix(path.name) is not None:
                 self.add_code_ok(run_id, path)
-        if path in self.roots(run_id):
+        if path in self.roots(run_id) and how != "mkdir":
             raise PolicyRefusedError(f"{how} refused: the run's directory")
         meta = _meta_name(path)
         from_runtime = how == "put_file" and runtime_meta(path)

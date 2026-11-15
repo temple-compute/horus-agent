@@ -10,12 +10,17 @@ only: checked ops end to end, through the broker.
 """
 
 import asyncio
+import contextlib
 import dataclasses
+import io
+import tarfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from horus_builtin.artifact.file import FileArtifact
+from horus_builtin.artifact.folder import FolderArtifact
 from horus_builtin.artifact.string import StringArtifact
 from horus_builtin.executor.shell import ShellExecutor
 from horus_builtin.runtime.command import CommandRuntime
@@ -37,40 +42,19 @@ from tests.fake_broker import RUN_ID, FakeBroker
 COMMAND = 'printf "%s|%s" ${msg} "$TOKEN" > ${out}'
 
 
-@pytest.fixture
-async def strict_agent(
-    broker: FakeBroker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@contextlib.asynccontextmanager
+async def _serving(
+    broker: FakeBroker,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wf: dict[str, Any],
+    files: dict[str, bytes],
+    names: tuple[str, ...] = (),
 ) -> AsyncGenerator[Path]:
-    """A strict agent with one approved release; yields its run dir."""
+    """A strict agent with the approved release of *wf*; its run dir."""
     monkeypatch.setattr(broker_mod, "_INFOS", {})
-    wf = {
-        "name": "echo",
-        "tasks": [
-            {
-                "id": "say",
-                "name": "Say",
-                "target": {"kind": "agent", "agent": AGENT_NAME},
-                "executor": {"kind": "shell"},
-                "runtime": {"kind": "command", "command": COMMAND},
-                "inputs": [{"id": "msg", "kind": "string"}],
-                "outputs": [{"id": "out", "kind": "file", "path": "o"}],
-                "secrets": {"TOKEN": "${secret:t}"},
-            }
-        ],
-    }
-    manifest = build_manifest_from_workflow(wf, {})
-    manifest = dataclasses.replace(
-        manifest,
-        layout=(
-            *manifest.layout,
-            "src",
-            "src.tgz",
-            "moved",
-            "out",
-            "dest",
-            "copy",
-        ),
-    )
+    manifest = build_manifest_from_workflow(wf, files)
+    manifest = dataclasses.replace(manifest, layout=(*manifest.layout, *names))
     policy.approve(manifest, "root")
     broker.release_hash = manifest.release_hash
     home = tmp_path / "agent-home"
@@ -87,16 +71,40 @@ async def strict_agent(
     )
     stop = asyncio.Event()
     task = asyncio.create_task(running.serve(stop))
-    run_dir = home / "echo" / RUN_ID
     try:
         for _ in range(100):
             if AGENT_NAME in broker.reported:
                 break
             await asyncio.sleep(0.05)
-        yield run_dir
+        yield home / wf["name"] / RUN_ID
     finally:
         stop.set()
         await asyncio.wait_for(task, 10)
+
+
+@pytest.fixture
+async def strict_agent(
+    broker: FakeBroker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Path]:
+    """A strict agent with one approved release; yields its run dir."""
+    wf = {
+        "name": "echo",
+        "tasks": [
+            {
+                "id": "say",
+                "name": "Say",
+                "target": {"kind": "agent", "agent": AGENT_NAME},
+                "executor": {"kind": "shell"},
+                "runtime": {"kind": "command", "command": COMMAND},
+                "inputs": [{"id": "msg", "kind": "string"}],
+                "outputs": [{"id": "out", "kind": "file", "path": "o"}],
+                "secrets": {"TOKEN": "${secret:t}"},
+            }
+        ],
+    }
+    names = ("src", "src.tgz", "moved", "out", "dest", "copy")
+    async with _serving(broker, tmp_path, monkeypatch, wf, {}, names) as run:
+        yield run
 
 
 async def test_target_speaks_v2_to_a_strict_agent(
@@ -186,3 +194,109 @@ async def test_task_launch_from_the_running_task(
     monkeypatch.setattr(target_mod, "_current_task", lambda: None)
     with pytest.raises(TaskExecutionError, match="running task"):
         await target.slurm_submit(cwd=None, env=None, job_dir=job_dir)
+
+
+RUN_SCRIPT = b'cat "$1" "$2/a.txt" "$2/sub/b.txt"\n'
+
+
+def _package(members: dict[str, bytes]) -> bytes:
+    """A folder package as the runtime builds it (``tar -C src .``)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for name, body in members.items():
+            info = tarfile.TarInfo(f"./{name}")
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+@pytest.fixture
+async def staging_agent(
+    broker: FakeBroker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Path]:
+    """A strict agent whose release ships a script in ``scripts/``, a folder
+    in ``data/``."""
+    wf = {
+        "name": "crunch",
+        "tasks": [
+            {
+                "id": "crunch",
+                "name": "Crunch",
+                "target": {"kind": "agent", "agent": AGENT_NAME},
+                "executor": {"kind": "shell"},
+                "runtime": {
+                    "kind": "command",
+                    "command": "sh ${script} ${data} ${cfg} > ${out}",
+                },
+                "inputs": [
+                    {"id": "script", "kind": "file", "path": "scripts/c.sh"},
+                    {"id": "cfg", "kind": "folder", "path": "data/cfg"},
+                    {"id": "data", "kind": "file", "path": "data.txt"},
+                ],
+                "outputs": [{"id": "out", "kind": "file", "path": "o"}],
+            }
+        ],
+    }
+    files = {
+        "scripts/c.sh": RUN_SCRIPT,
+        "data/cfg/a.txt": b"A\n",
+        "data/cfg/sub/b.txt": b"B\n",
+    }
+    async with _serving(broker, tmp_path, monkeypatch, wf, files) as run:
+        yield run
+
+
+async def test_a_runtime_staging_sequence_passes_the_strict_agent(
+    staging_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Script in a sub-folder, a folder constant, a data input and an output: staged as the runtime does, then run."""
+    wd = staging_agent
+    target = AgentTarget(agent=AGENT_NAME, working_directory=str(wd))
+    task = HorusTask(
+        id="crunch",
+        name="Crunch",
+        runtime=CommandRuntime(command="sh ${script} ${data} ${cfg} > ${out}"),
+        executor=ShellExecutor(),
+        inputs=[
+            FileArtifact(id="script", path=wd / "c.sh"),
+            FolderArtifact(id="cfg", path=wd / "cfg"),
+            FileArtifact(id="data", path=wd / "data.txt"),
+        ],
+        outputs=[FileArtifact(id="out", path=wd / "o")],
+    )
+    monkeypatch.setattr(target_mod, "_current_task", lambda: task)
+    folders = {"cfg": {"a.txt": b"A\n", "sub/b.txt": b"B\n"}}
+    with running_task("crunch"):
+        await target.mkdir(str(wd))
+        await target.put_file(RUN_SCRIPT, str(wd / "c.sh"))
+        for name, members in folders.items():
+            pkg = str(wd / f"{name}.1a2b3c4d.horuspkg")
+            await target.put_file(_package(members), pkg)
+            await target.unpack_folder(pkg, str(wd / name))
+            await target.remove(pkg)
+        await target.put_file(b"data\n", str(wd / "data.txt"))
+        proc = await target.run_command(
+            "ignored", cwd=str(wd), env={}, task=task
+        )
+        assert await proc.wait() == 0
+    assert (wd / "o").read_text() == "data\nA\nB\n"
+    assert not list(wd.glob("*.horuspkg"))
+
+    # What the strict agent still refuses on the same release.
+    with running_task("crunch"):
+        with pytest.raises(TaskExecutionError, match="ships"):
+            await target.put_file(b"touch PWNED\n", str(wd / "c.sh"))
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            body = b"touch PWNED\n"
+            info = tarfile.TarInfo("real.txt")
+            info.size = len(body)
+            tar.addfile(info, io.BytesIO(body))
+            link = tarfile.TarInfo("a.txt")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "real.txt"
+            tar.addfile(link)
+        pkg = str(wd / "cfg.5e6f7a8b.horuspkg")
+        await target.put_file(buf.getvalue(), pkg)
+        with pytest.raises(TaskExecutionError, match="link"):
+            await target.unpack_folder(pkg, str(wd / "cfg"))

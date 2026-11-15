@@ -266,3 +266,50 @@ async def test_code_staged_while_a_launch_checks_never_runs(
     await started
     assert not (env.run / "json").exists()
     await env.call("cancel_run", release=release)
+
+
+# --- C1/C2: the runtime's own staging ----------------------------------------
+
+
+async def test_a_large_folder_package_arrives_by_fetch(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    approved = manifest(
+        "ls cfg",
+        inputs=[{"id": "cfg", "kind": "folder", "path": "data/cfg"}],
+        outputs=[],
+        files={"data/cfg/a.txt": b"A\n"},
+    )
+    policy.approve(approved, "root")
+    pkg = env.run / "cfg.1a2b3c4d.horuspkg"
+    _tar(pkg, lambda tar: _file(tar, "a.txt", b"A\n"))
+    data = pkg.read_bytes()
+    pkg.unlink()
+
+    async def download(url: str, path: Path, limit: int | None) -> None:
+        path.write_bytes(data)
+
+    monkeypatch.setattr("horus_agent.ops.blobs.download_to", download)
+    await env.call(
+        "fetch",
+        release=approved.release_hash,
+        path=str(pkg),
+        url="https://files.example.org/x",
+    )
+    await env.call(
+        "unpack",
+        release=approved.release_hash,
+        pkg=str(pkg),
+        dest=str(env.run / "cfg"),
+    )
+    await env.call("remove", release=approved.release_hash, path=str(pkg))
+    assert (env.run / "cfg" / "a.txt").read_bytes() == b"A\n"
+    # Only the runtime's file name is let through, not any name.
+    await refused(
+        env,
+        "put_file",
+        "nothing may be staged",
+        release=approved.release_hash,
+        path=str(env.run / "cfg.horuspkg"),
+        data=b64(b"x"),
+    )
