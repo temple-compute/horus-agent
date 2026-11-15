@@ -11,6 +11,7 @@ Config file, the CLI and the agent loop's resilience.
 import asyncio
 import io
 import os
+import pwd
 import random
 import socket
 import ssl
@@ -22,7 +23,7 @@ import pytest
 from horus_runtime.logging import horus_logger
 
 from horus_agent import config, logs
-from horus_agent.cli import main
+from horus_agent.cli import _work_dir, layout_problem, main
 from horus_agent.config import AgentConfig
 from horus_agent.daemon import (
     Agent,
@@ -461,3 +462,92 @@ def test_approve_by_id_names_the_missing_config(
     monkeypatch.setenv(config.CONFIG_ENV, str(tmp_path / "none.json"))
     assert main(["approve", "some-release"]) == 1
     assert config.CONFIG_ENV in capsys.readouterr().err
+
+
+# --- work dir layout under run_as ---------------------------------------
+
+
+@pytest.fixture
+def job_user() -> config.JobsPolicy:
+    """``run_as`` the current user: its group is the work dir's group."""
+    return config.JobsPolicy(run_as=pwd.getpwuid(os.getuid()).pw_name)
+
+
+def test_a_new_work_dir_gets_the_sticky_layout(
+    tmp_path: Path, job_user: config.JobsPolicy
+) -> None:
+    work = _work_dir(str(tmp_path / "w"), job_user)
+    assert stat.S_IMODE(work.stat().st_mode) == 0o3770
+    plain = _work_dir(str(tmp_path / "p"), config.JobsPolicy())
+    assert stat.S_IMODE(plain.stat().st_mode) == 0o700
+
+
+def test_register_repairs_only_a_plain_0770_work_dir(
+    tmp_path: Path, job_user: config.JobsPolicy
+) -> None:
+    work = tmp_path / "w"
+    work.mkdir()
+    work.chmod(0o770)
+    _work_dir(str(work), job_user)
+    assert stat.S_IMODE(work.stat().st_mode) == 0o3770
+    work.chmod(0o700)  # stricter: not loosened
+    _work_dir(str(work), job_user)
+    assert stat.S_IMODE(work.stat().st_mode) == 0o700
+    work.chmod(0o775)  # others lose access, nothing more
+    _work_dir(str(work), job_user)
+    assert stat.S_IMODE(work.stat().st_mode) == 0o770
+
+
+def test_a_symlinked_work_dir_is_not_changed(
+    tmp_path: Path,
+    job_user: config.JobsPolicy,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    real.chmod(0o770)
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    _work_dir(str(link), job_user)
+    assert stat.S_IMODE(real.stat().st_mode) == 0o770
+    assert "symlink" in capsys.readouterr().err
+
+
+def test_layout_problem_names_the_command(
+    tmp_path: Path, job_user: config.JobsPolicy
+) -> None:
+    work = tmp_path / "w"
+    work.mkdir()
+    work.chmod(0o770)
+    assert layout_problem(work, job_user) == (
+        f"The work dir needs the run_as layout; run: chmod 3770 {work}"
+    )
+    work.chmod(0o3770)
+    assert layout_problem(work, job_user) is None
+    assert layout_problem(work, config.JobsPolicy()) is None
+
+
+@pytest.mark.usefixtures("config_file")
+def test_run_prints_the_layout_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    job_user: config.JobsPolicy,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    work = tmp_path / "w"
+    work.mkdir()
+    work.chmod(0o770)
+    config.save(
+        AgentConfig(
+            url="https://b",
+            agent_id="i",
+            name="n",
+            token="t",
+            work_dir=str(work),
+        ),
+        config.config_path(),
+    )
+    monkeypatch.setattr(config, "load_jobs_policy", lambda *_: job_user)
+    assert main(["run"]) == 1
+    assert f"chmod 3770 {work}" in capsys.readouterr().err
+    assert stat.S_IMODE(work.stat().st_mode) == 0o770
