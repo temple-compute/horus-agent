@@ -650,6 +650,8 @@ async def test_slurm_submit_status_cancel(env: Env) -> None:
             break
         await asyncio.sleep(0.05)
     assert status["final"]["state"] == "CANCELLED"
+    record = env.guard.job(RUN1, job)
+    assert record is not None and not guard_mod.job_running(job, record)
 
 
 def test_sbatch_values_cannot_break_lines(env: Env) -> None:

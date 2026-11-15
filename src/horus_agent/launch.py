@@ -232,6 +232,14 @@ async def prepare(
     for name, binding in args.bindings.items():
         values[name] = await _bind(guard, run_id, name, task, binding, store)
     _check_env(task, args.env)
+    names = {*task["env"], *args.env}
+    for name, value in values.items():
+        # Bash evaluates a variable named in arithmetic: a value that is the
+        # name of one of the job's variables could run what that holds.
+        if names & set(value if isinstance(value, list) else [value]):
+            raise PolicyRefusedError(
+                f"{name!r} may not be the name of an environment variable"
+            )
     side = cwd / "side-artifacts"
     if SIDE_ENV in args.env:
         side = guard.confine_bound(run_id, args.env[SIDE_ENV])
