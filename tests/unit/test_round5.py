@@ -19,6 +19,7 @@ import pytest
 
 from horus_agent import launch, policy
 from horus_agent.manifest import Manifest, ManifestError
+from horus_agent.template import unsafe_placeholders
 from tests.unit.test_guard import Env, env, refused
 from tests.unit.test_policy_hardening import manifest, wait_exit
 
@@ -343,3 +344,28 @@ def test_unclassifiable_shapes_are_refused(command: str) -> None:
 @pytest.mark.parametrize("command", ACCEPTED)
 def test_ordinary_commands_still_pass_round5(command: str) -> None:
     manifest(command, inputs=[{"id": "x", "kind": "file"}], outputs=[])
+
+
+# --- minors: bounded scan ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo " + '"a" ' * 12000 + "${x}",
+        "echo " + "a " * 25000 + "${x}",
+        "echo " + "$(a) " * 6000 + "${x}",
+        "echo " + "$(" * 150 + ")" * 150 + " ${x}",
+        '"' * 30000 + "${x}",
+    ],
+    ids=["quotes", "words", "substitutions", "nesting", "quote-run"],
+)
+def test_the_scan_stays_fast_and_refuses_what_it_cannot_bound(
+    command: str,
+) -> None:
+    import time
+
+    started = time.monotonic()
+    found = unsafe_placeholders(command, {"x"})
+    assert time.monotonic() - started < 1.0
+    assert found

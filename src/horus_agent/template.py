@@ -54,6 +54,10 @@ def render(text: str, values: Mapping[str, str | list[str]]) -> str:
     return DotTemplate(text).safe_substitute(quoted)
 
 
+MAX_COMMAND_WORDS = 200
+"""Words of one command (up to a separator) the scanner reads."""
+MAX_NESTING = 100
+"""Quotes and substitutions inside one another the scanner follows."""
 _SENTINEL = "\0"
 _QUOTED = "\x01"
 """Stands for a quoted part in a word the scanner is building."""
@@ -936,6 +940,13 @@ def _scan(  # noqa: PLR0912, PLR0915
             return
         herestring = False
         words = stack[-1][1]
+        if len(words) >= MAX_COMMAND_WORDS:  # keeps the scan linear
+            whole.append(
+                f"in a command of over {MAX_COMMAND_WORDS} words, which "
+                "cannot be checked"
+            )
+            word = ""
+            return
         match = None if _in_test(words) else _OPERATOR.match(word)
         if (skip or match) and any(_base(w) == "exec" for w in words):
             if _command(words) == []:  # exec 3< file; bash <&3
@@ -1014,6 +1025,8 @@ def _scan(  # noqa: PLR0912, PLR0915
 
     def push(kind: str) -> None:
         nonlocal word
+        if len(stack) > MAX_NESTING:
+            whole.append("in a template nested too deeply to check")
         parent, words, code = stack[-1]
         if parent in ("top", "$(", "`"):
             why = _code_reason(words, word)
@@ -1031,6 +1044,8 @@ def _scan(  # noqa: PLR0912, PLR0915
         return None
 
     while i < n:
+        if whole:  # nothing in the template can be trusted: stop reading
+            return [], whole[0]
         c = s[i]
         kind, words, code = stack[-1]
         if kind == "'":
