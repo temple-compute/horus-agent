@@ -44,6 +44,8 @@ SCHEMA = 1
 WORKFLOW_MEMBER = "workflow.yaml"
 MAX_ARCHIVE_BYTES = 2 * 1024**3
 MAX_TEMPLATE_CHARS = 64 * 1024
+MAX_RELEASE_CHARS = 2 * 1024 * 1024
+"""Characters of all the commands of one release that approve will read."""
 MAX_PLACEHOLDERS = 1000
 """Largest uncompressed release the builder reads."""
 
@@ -384,6 +386,8 @@ class _Builder:
         self.warnings: list[str] = []
         self.layout: set[str] = set()
         self.consts: set[tuple[str, str]] = set()
+        self.read = 0
+        """Characters of commands read so far."""
 
     def _declare(self, raw: Any) -> None:
         """Note the names a declared path puts at the top of a folder."""
@@ -467,6 +471,12 @@ class _Builder:
             # The arguments follow the interpreter and the script.
             templates = ["", f"python3 script.py {runtime['args']}"]
         for template in templates:
+            self.read += len(template)
+            if self.read > MAX_RELEASE_CHARS:
+                raise ManifestError(
+                    f"{where}: the commands of this release are over "
+                    f"{MAX_RELEASE_CHARS} characters, too many to check"
+                )
             self._check_placeholders(where, template, ids)
             unsafe = unsafe_placeholders(
                 template, ids | {"task.id", "task.name"}

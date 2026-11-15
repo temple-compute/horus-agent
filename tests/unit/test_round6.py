@@ -373,3 +373,24 @@ def test_the_checker_flags_what_runs_a_placeholder(command: str) -> None:
 )
 def test_the_checker_still_passes_data_commands(command: str) -> None:
     assert not unsafe_placeholders(command, {"x"}), command
+
+
+def test_a_release_has_a_total_budget_of_command_text() -> None:
+    from horus_agent.manifest import (
+        MAX_TEMPLATE_CHARS,
+        ManifestError,
+        build_manifest_from_workflow,
+    )
+
+    command = "echo " + "a " * (MAX_TEMPLATE_CHARS // 2 - 10)
+    tasks = [
+        {
+            "id": f"t{i}",
+            "target": {"kind": "agent", "agent": "lab"},
+            "executor": {"kind": "shell"},
+            "runtime": {"kind": "command", "command": command},
+        }
+        for i in range(40)
+    ]
+    with pytest.raises(ManifestError, match="too many to check"):
+        build_manifest_from_workflow({"name": "w", "tasks": tasks}, {})
