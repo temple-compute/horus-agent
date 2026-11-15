@@ -189,7 +189,7 @@ HOST_FILE = ".horus_host.txt"
 """The monitor's host snapshot: ``key=value`` lines a task's wrapper writes."""
 HOST_LINE = re.compile(r"[A-Za-z0-9_]{1,64}=[ -~]{0,512}")
 HOST_MAX_BYTES = 8 * 1024
-MONITOR_READS = frozenset({HOST_FILE, ".horus_resource.txt"})
+MONITOR_READS = frozenset({HOST_FILE, ".horus_resource.txt", ".horus_gpu.csv"})
 """Files the resource monitor polls; their refusals are not warnings."""
 LOG_NAMES = frozenset({"stdout.log", "stderr.log"})
 META_MAX_BYTES = 64 * 1024
@@ -1006,7 +1006,11 @@ class Guard:
             raise PolicyRefusedError(f"{how} refused: {path} is run metadata")
         record = self.run_record(run_id) or {}
         for job in map(Path, record.get("jobs") or {}):
-            if not (
+            # A folder above a job may be made again: later tasks of the
+            # run stage their own directories there (check_layout limits
+            # the names).
+            above = how == "mkdir" and job.is_relative_to(path) and path != job
+            if above or not (
                 path == job
                 or path.is_relative_to(job)
                 or job.is_relative_to(path)
@@ -1111,6 +1115,23 @@ class Guard:
             fh.write(line + "\n")
 
 
+def process_alive(pid: int) -> bool:
+    """Whether process *pid* still runs (a zombie has ended)."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        if raw[raw.rfind(")") + 2 :].startswith("Z"):
+            return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 def job_running(job_dir: Path, info: dict[str, Any]) -> bool:
     """Whether a job may still run: no exit code, not ended, group alive."""
     if (job_dir / "exit_code").exists() or info.get("ended"):
@@ -1122,6 +1143,9 @@ def job_running(job_dir: Path, info: dict[str, Any]) -> bool:
         return "slurm_job_id" in info or (
             started is not None and time.time() - started < IDLE_RUN_S
         )
+    pid = info.get("pid")
+    if pid == pgid and not process_alive(pid):
+        return False  # the leader is gone (a zombie nobody reaped)
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:

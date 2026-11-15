@@ -264,7 +264,7 @@ def materialise(src: Path, store: Path, expected: str) -> Path:
                 raise ValueError(
                     f"{src.name} is not the approved file or folder"
                 )
-            tmp.chmod(0o750)
+            tmp.chmod(0o2750)
             with contextlib.suppress(OSError):  # another launch won the race
                 tmp.rename(folder)
         finally:
@@ -301,15 +301,15 @@ def _copy_file(src: Path, dst: Path, info: os.stat_result) -> str:
 def _copy_tree(src: Path, dst: Path) -> dict[str, str]:
     """Copy a folder of files and folders; relative path -> file digest."""
     leaves: dict[str, str] = {}
-    dst.mkdir(mode=0o750)
+    dst.mkdir(mode=0o2750)
     for root, dirs, names in os.walk(src):
         rel = Path(root).relative_to(src)
         for name in [*dirs, *names]:
             info = (Path(root) / name).lstat()
             target = dst / rel / name
             if stat_mod.S_ISDIR(info.st_mode):
-                target.mkdir(mode=0o750)
-                target.chmod(0o750)
+                target.mkdir(mode=0o2750)
+                target.chmod(0o2750)
             elif stat_mod.S_ISREG(info.st_mode):
                 leaves[(rel / name).as_posix()] = _copy_file(
                     Path(root) / name, target, info
@@ -319,5 +319,5 @@ def _copy_tree(src: Path, dst: Path) -> dict[str, str]:
                     f"{src.name} holds {rel / name}, which is not a file "
                     "or folder"
                 )
-    dst.chmod(0o750)
+    dst.chmod(0o2750)
     return leaves
