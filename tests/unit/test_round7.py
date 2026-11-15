@@ -218,7 +218,7 @@ def test_removal_does_not_cross_a_mount_point(
             return os.stat_result(values)
         return info
 
-    monkeypatch.setattr(seal.os, "lstat", lstat)
+    monkeypatch.setattr(os, "lstat", lstat)
     with pytest.raises(PolicyRefusedError):
         seal.seal(run, ("cfg",), stored, frozenset({os.geteuid()}))
     assert keep.read_text() == "keep"
