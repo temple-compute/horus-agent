@@ -10,6 +10,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import dataclasses
 import getpass
 import grp
@@ -29,6 +30,7 @@ import httpx
 from horus_runtime.logging import horus_logger
 
 from horus_agent import config, dryrun, logs, ops, policy
+from horus_agent import guard as guard_mod
 from horus_agent.daemon import (
     Agent,
     AgentUnauthorizedError,
@@ -99,8 +101,11 @@ def _work_dir(
     if linked:
         return path
     if repair and jobs.run_as and info.st_uid == os.geteuid():
-        if fresh and (group := _job_group(jobs)) and os.geteuid() == 0:
-            os.chown(path, -1, group[1])
+        group = _job_group(jobs)
+        if group and info.st_gid != group[1]:
+            # Root may; so may a member of the group.
+            with contextlib.suppress(PermissionError):
+                os.chown(path, -1, group[1])
         if fresh or stat.S_IMODE(mode) == 0o770:
             path.chmod(0o3770)
             return path
@@ -135,7 +140,10 @@ def _register(args: argparse.Namespace) -> int:
         sys.stderr.write("No registration token given.\n")
         return 1
     ca_bundle = str(Path(args.ca_bundle).resolve()) if args.ca_bundle else ""
-    directory = _work_dir(args.work_dir, config.load_jobs_policy())
+    jobs = config.load_jobs_policy()
+    directory = _work_dir(args.work_dir, jobs)
+    if problem := layout_problem(directory, jobs):
+        sys.stderr.write(f"{problem}\n")  # run asks for the same fix
     name: str | None = args.name
     body = {
         "token": token,
@@ -534,6 +542,109 @@ def _policy_check() -> int:
     return 0
 
 
+def _doctor_checks() -> list[tuple[str, str | None]]:
+    """``(what was checked, problem or None)`` for this machine's layout."""
+    found: list[tuple[str, str | None]] = []
+
+    def check(what: str, problem: str | None) -> None:
+        found.append((what, problem))
+
+    try:
+        registered = config.load(config.config_path())
+        work_dir = Path(registered.work_dir)
+    except (FileNotFoundError, PermissionError):
+        work_dir = config.default_work_dir()
+    path = policy.policy_path()
+    try:
+        for protected in (path, policy.approved_dir()):
+            if protected.exists():
+                policy.check_protected(protected)
+        check("policy file", None)
+    except (policy.PolicyError, OSError) as exc:
+        check("policy file", str(exc))
+    try:
+        jobs = config.load_jobs_policy()
+    except ValueError as exc:
+        check("jobs policy", str(exc))
+        jobs = config.JobsPolicy()
+    if jobs.run_as:
+        try:
+            pwd.getpwnam(jobs.run_as)
+            check("run_as user", None)
+        except KeyError:
+            check("run_as user", f"user {jobs.run_as!r} does not exist")
+    if work_dir.is_dir():
+        info = work_dir.stat()
+        what = (
+            f"work dir {work_dir} mode {stat.S_IMODE(info.st_mode):o} "
+            f"group {_group_name(info.st_gid)}"
+        )
+        problem = layout_problem(work_dir, jobs)
+        if not problem and not os.access(work_dir, os.W_OK):
+            problem = f"{work_dir} is not writable by the agent"
+        check(what, problem)
+    else:
+        check(f"work dir {work_dir}", "missing; run horus-agent register")
+    state = work_dir / guard_mod.STATE_DIR
+    if state.is_dir():
+        mode = stat.S_IMODE(state.stat().st_mode)
+        check(
+            f"state dir mode {mode:o}",
+            None if not mode & 0o022 else f"chmod 711 {state}",
+        )
+    if jobs.run_as:
+        check(*_switch_check(jobs))
+    return found
+
+
+def _group_name(gid: int) -> str:
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
+
+
+def _switch_check(jobs: config.JobsPolicy) -> tuple[str, str | None]:
+    """Whether the agent may switch to ``run_as``, and the job's Python."""
+    what = f"{jobs.run_as_via} rule for {jobs.run_as}"
+    try:
+        prefix = ops.switch_user(jobs.run_as, jobs.run_as_via)
+        env = {"PATH": ops.job_environment(dict(os.environ)).get("PATH", "")}
+        probe = (
+            "for p in python python3; do command -v $p >/dev/null && "
+            "$p -I -c 'import sys; print(*sys.version_info[:2])'; done"
+        )
+        done = subprocess.run(
+            [*prefix, "/bin/sh", "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=ops.SPAWN_ENV | env,
+            check=False,
+        )
+    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as exc:
+        return what, str(exc)
+    if done.returncode not in (0, 1):  # 1: the last python is missing
+        return what, done.stderr.strip() or f"exit {done.returncode}"
+    versions = [ln.replace(" ", ".") for ln in done.stdout.split("\n") if ln]
+    return (
+        f"{what}; job python {' '.join(versions) or 'none on PATH'}",
+        None if versions else "no python on the tasks' PATH",
+    )
+
+
+def _doctor() -> int:
+    bad = 0
+    for what, problem in _doctor_checks():
+        bad += problem is not None
+        sys.stdout.write(
+            f"ok    {what}\n"
+            if problem is None
+            else f"FAIL  {what}: {problem}\n"
+        )
+    return 1 if bad else 0
+
+
 def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
     """Entry point of the ``horus-agent`` command."""
     parser = argparse.ArgumentParser(
@@ -610,6 +721,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
         "--yes", action="store_true", help="Do not ask for confirmation."
     )
     commands.add_parser("approvals", help="List approved releases.")
+    commands.add_parser("doctor", help="Check this machine's layout.")
     revoke = commands.add_parser("revoke", help="Withdraw an approval (root).")
     revoke.add_argument("hash", help="Release hash.")
     policy_cmd = commands.add_parser("policy", help="Show the policy.")
@@ -632,6 +744,8 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
             return _approve(args)
         case "approvals":
             return _approvals()
+        case "doctor":
+            return _doctor()
         case "revoke":
             return _revoke(args.hash)
         case "policy" if args.action == "init":

@@ -317,15 +317,19 @@ class OpRunner:
         """``None`` while the job runs, then its exit code (-1: lost)."""
         if code := _job_file(job_dir, "exit_code").strip():
             return int(code)
-        if pid is None:
-            return None
+        return None if pid is None or guard_mod.process_alive(pid) else -1
+
+    def _exited(self, job_dir: str) -> bool:
+        """Whether the job wrote its exit code or its process is gone."""
+        if (_path(job_dir) / "exit_code").exists():
+            return True
         try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return -1
-        except PermissionError:
-            pass
-        return None
+            pid = self._pids.get(job_dir) or int(
+                _job_file(job_dir, "pid").strip() or 0
+            )
+        except ValueError:
+            return False
+        return pid > 1 and not guard_mod.process_alive(pid)
 
     async def run(self, op: Op) -> OpResult:
         """
@@ -544,12 +548,11 @@ class OpRunner:
             case "read_output" if (
                 guard is not None and guard.policy.logs == "off"
             ):
-                job = Path(args["job_dir"])
                 return {
                     "stdout": "",
                     "stderr": "",
                     "more": False,
-                    "exited": (job / "exit_code").exists(),
+                    "exited": self._exited(args["job_dir"]),
                 }
             case "digest":
                 path = Path(args["path"])
@@ -951,9 +954,8 @@ class OpRunner:
                 f"scancel failed: {err.decode(errors='replace')}"
             )
 
-    @staticmethod
     def _read_output(
-        job_dir: str, stdout_offset: int, stderr_offset: int
+        self, job_dir: str, stdout_offset: int, stderr_offset: int
     ) -> dict[str, Any]:
         limit = INLINE_LIMIT // 2
         out = _job_file(job_dir, "stdout.log", stdout_offset, limit)
@@ -962,7 +964,7 @@ class OpRunner:
             "stdout": b64e(out),
             "stderr": b64e(err),
             "more": len(out) == limit or len(err) == limit,
-            "exited": (_path(job_dir) / "exit_code").exists(),
+            "exited": self._exited(job_dir),
         }
 
     async def _cancel_run(self, run_id: str | None) -> int:

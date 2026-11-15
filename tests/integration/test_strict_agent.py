@@ -420,3 +420,152 @@ async def _refused_below_the_execution_dir(
             with pytest.raises(TaskExecutionError, match=r"release|code that"):
                 await target.put_file(b"x", str(bad))
         await target.put_file(b"x", str(task_dir / ("d" * 32) / "o"))
+
+
+def _chain_task(
+    tid: str, command: str, target: AgentTarget, **io: Any
+) -> HorusTask:
+    return HorusTask(
+        id=tid,
+        name=tid,
+        target=target,
+        executor=ShellExecutor(),
+        runtime=CommandRuntime(command=command),
+        inputs=io.get("inputs", []),
+        outputs=io["outputs"],
+    )
+
+
+CHAIN_RELEASE = {
+    "name": "chain",
+    "tasks": [
+        {
+            "id": "prep",
+            "name": "prep",
+            "target": {"kind": "agent", "agent": AGENT_NAME},
+            "executor": {"kind": "shell"},
+            "runtime": {"kind": "command", "command": "cp ${raw} ${p}"},
+            "inputs": [{"id": "raw", "kind": "file", "path": "raw.txt"}],
+            "outputs": [{"id": "p", "kind": "file", "path": "p.txt"}],
+        },
+        {
+            "id": "dock",
+            "name": "dock",
+            "target": {"kind": "agent", "agent": AGENT_NAME},
+            "executor": {"kind": "shell"},
+            "runtime": {"kind": "command", "command": "cp ${p} ${d}"},
+            "inputs": [{"id": "p", "kind": "file", "path": "p.txt"}],
+            "outputs": [{"id": "d", "kind": "file", "path": "d.txt"}],
+        },
+        {
+            "id": "side",
+            "name": "side",
+            "target": {"kind": "agent", "agent": AGENT_NAME},
+            "executor": {"kind": "shell"},
+            "runtime": {"kind": "command", "command": "echo s > ${s}"},
+            "outputs": [{"id": "s", "kind": "file", "path": "s.txt"}],
+        },
+        {
+            "id": "wait",
+            "name": "wait",
+            "target": {"kind": "agent", "agent": AGENT_NAME},
+            "executor": {"kind": "shell"},
+            "runtime": {
+                "kind": "command",
+                "command": "sleep 60 && echo w > ${w}",
+            },
+            "outputs": [{"id": "w", "kind": "file", "path": "w.txt"}],
+        },
+    ],
+}
+
+
+@pytest.fixture
+async def chain_agent(
+    broker: FakeBroker, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> AsyncGenerator[Path]:
+    """A strict agent whose release has two chained tasks and a third."""
+    async with _serving(
+        broker, tmp_path, monkeypatch, (CHAIN_RELEASE, {}, ())
+    ) as run:
+        yield run
+
+
+async def test_later_tasks_of_a_release_run_and_a_cancel_ends_them(
+    chain_agent: Path,
+    horus_context: HorusContext,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The runtime's own sequence for tasks after the first (one after the
+    other, and in parallel), then a cancelled job."""
+    del horus_context
+    from horus_builtin.target.local import LocalTarget
+    from horus_builtin.workflow.horus_workflow import HorusWorkflow
+    from horus_runtime.core.workflow.edge import WorkflowEdge
+    from horus_runtime.core.workflow.status import WorkflowStatus
+
+    work = tmp_path / "orchestrator"
+    work.mkdir()
+    (work / "raw.txt").write_text("raw\n")
+    target = AgentTarget(agent=AGENT_NAME, working_directory=str(chain_agent))
+    prep = _chain_task(
+        "prep",
+        "cp ${raw} ${p}",
+        target,
+        inputs=[FileArtifact(id="raw", path=work / "raw.txt")],
+        outputs=[FileArtifact(id="p", path=Path("p.txt"))],
+    )
+    dock = _chain_task(
+        "dock",
+        "cp ${p} ${d}",
+        target,
+        inputs=[FileArtifact(id="p", path=Path("p.txt"))],
+        outputs=[FileArtifact(id="d", path=Path("d.txt"))],
+    )
+    side = _chain_task(
+        "side",
+        "echo s > ${s}",
+        target,
+        outputs=[FileArtifact(id="s", path=Path("s.txt"))],
+    )
+    workflow = HorusWorkflow(
+        name="chain",
+        tasks=[prep, dock, side],
+        edges=[
+            WorkflowEdge(
+                source="prep",
+                source_output="p",
+                target="dock",
+                target_input="p",
+            ),
+            WorkflowEdge(source="prep", target="side", transfer=False),
+        ],
+        orchestrator_target=LocalTarget(working_directory=str(work)),
+    )
+    await workflow.run(trigger_id="prep")
+    assert workflow.status == WorkflowStatus.COMPLETED
+    for name in ("d.txt", "s.txt"):
+        assert [p for p in chain_agent.rglob(name) if p.is_file()], name
+
+    # A job killed with its group never writes an exit code: it still ends.
+    monkeypatch.setattr(AgentTarget, "poll_interval", 0.2)
+    wait = HorusTask(
+        id="wait",
+        name="wait",
+        runtime=CommandRuntime(command="sleep 60 && echo w > ${w}"),
+        executor=ShellExecutor(),
+        outputs=[FileArtifact(id="w", path=Path("w.txt"))],
+    )
+    monkeypatch.setattr(target_mod, "_current_task", lambda: wait)
+    with running_task("wait"):
+        proc = await target.run_command(
+            "ignored", cwd=str(chain_agent), env={}, task=wait
+        )
+        await asyncio.sleep(0.5)
+        handle = proc._handle  # type: ignore[attr-defined]
+        assert await target.poll(handle) is None
+        await target._call("cancel_run")
+        code = await asyncio.wait_for(proc.wait(), 20)
+        assert code != 0
+        await target.read_output(handle)
