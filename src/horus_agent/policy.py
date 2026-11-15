@@ -251,6 +251,7 @@ def _parse(  # noqa: PLR0912
     values["jobs"] = JobsPolicy(
         run_as=_typed(jobs.pop("run_as", ""), str, "run_as", src),
         run_as_via=_typed(jobs.pop("run_as_via", "sudo"), str, "via", src),
+        home=_typed(jobs.pop("home", ""), str, "home", src),
     )
     if "read_roots" in data:
         values["read_roots"] = tuple(

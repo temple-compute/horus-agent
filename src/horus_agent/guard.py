@@ -120,6 +120,10 @@ class Admitted:
     task: dict[str, Any] | None
     paths: dict[str, Path]
     """Each path argument, resolved and confined."""
+    unpack_sha: str | None = None
+    """``unpack``: the package's digest, taken once when it was checked."""
+    unpacked: bool = False
+    """``unpack``: the destination already holds this package."""
 
 
 class Guard:
@@ -412,6 +416,8 @@ class Guard:
         Refuse a path in the work dir naming a tool's config file or folder,
         or any hidden name but the runtime's own.
         """
+        if not self.policy.strict:
+            return  # an open agent runs any command anyway
         for part in path.relative_to(self.work_dir).parts:
             if bad_name(part):
                 raise PolicyRefusedError(
@@ -436,6 +442,19 @@ class Guard:
             str(job_dir)
         )
         return job
+
+    def refused_member(self, name: str) -> bool:
+        """
+        A name a strict agent does not unpack: a tool config name, or run
+        metadata (``.horus``, the agent's job and monitor files).
+        """
+        return self.policy.strict and (
+            bad_name(name)
+            or name == ".horus"
+            or name in META_NAMES
+            or name in RESERVED_NAMES
+            or name.endswith(".horus-sha256")
+        )
 
     def end_job(self, run_id: str | None, job_dir: Path) -> None:
         """Note that a job was killed or lost: it holds no run open."""
@@ -463,7 +482,7 @@ class Guard:
         (or holds or sits in one) or a file the agent writes itself. A
         finished job's dir may be removed.
         """
-        if path.name in RESERVED_NAMES:
+        if path.name in RESERVED_NAMES or path.name.endswith(".horus-sha256"):
             raise PolicyRefusedError(f"{how} may not write {path.name}")
         if how != "remove":
             self.check_name(path)

@@ -18,6 +18,7 @@ command string.
 import asyncio
 import contextlib
 import os
+import pwd
 import re
 import shlex
 import stat
@@ -45,7 +46,15 @@ NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?")
 LIST_KINDS = frozenset({"list", "multichoice"})
 HOME_SUBDIR = "home"
 """Each approved job's own fresh home, inside its job dir."""
-UNSET_ENV = ("NODE_PATH", "BASH_ENV", "ENV")
+UNSET_ENV = (
+    "NODE_PATH",
+    "NODE_OPTIONS",
+    "BASH_ENV",
+    "ENV",
+    "PERL5OPT",
+    "PERL_USE_UNSAFE_INC",
+    "RUBYOPT",
+)
 """Variables an approved job never sees."""
 TASK_ID = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(\[\d+\])?")
 """A task id as the runtime writes it: ``sub/task`` or a map clone ``x[3]``."""
@@ -135,16 +144,32 @@ async def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
         ) from exc
 
 
-def job_env(job_dir: Path) -> dict[str, str]:
+def job_home(guard: Guard, job_dir: Path) -> Path:
     """
-    What every approved job's environment pins: a fresh home of its own,
-    and no user startup files for R or Python.
+    An approved job's ``HOME``: ``[jobs] home``, else the task user's home
+    (outside any run, so no op can write there), else a fresh one in the
+    job dir.
+    """
+    jobs = guard.policy.jobs
+    if jobs.home:
+        return Path(jobs.home)
+    if jobs.run_as:
+        with contextlib.suppress(KeyError):
+            return Path(pwd.getpwnam(jobs.run_as).pw_dir)
+    return job_dir / HOME_SUBDIR
+
+
+def job_env(home: Path) -> dict[str, str]:
+    """
+    What every approved job's environment pins: its home, no user startup
+    files for R, and Python never importing from the working directory
+    (``python -m``/``-c`` would put it first on ``sys.path``).
     """
     return {
-        "HOME": str(job_dir / HOME_SUBDIR),
+        "HOME": str(home),
         "R_PROFILE_USER": os.devnull,
         "R_ENVIRON_USER": os.devnull,
-        "PYTHONNOUSERSITE": "1",
+        "PYTHONSAFEPATH": "1",
     }
 
 
@@ -203,7 +228,7 @@ async def prepare(
     if SIDE_ENV in args.env:
         side = guard.confine_bound(run_id, args.env[SIDE_ENV])
     command = render(template, values)
-    env = {**args.env, **job_env(job_dir)}
+    env = {**args.env, **job_env(job_home(guard, job_dir))}
     return Prepared(command, env, cwd, job_dir, side, task)
 
 

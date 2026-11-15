@@ -93,24 +93,28 @@ def pack(src: Path, pkg: Path) -> None:
         tar.add(src, arcname=".", filter=_no_links)
 
 
-def unpack(
+def unpack(  # noqa: PLR0913, PLR0917
     pkg: Path,
     dest: Path,
     refuse: Callable[[str], bool] | None = None,
     max_bytes: int | None = None,
     max_files: int | None = None,
+    sha: str | None = None,
 ) -> None:
     """
     Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
     ``..``, links leaving it and device files, and a package holding more
     than *max_files* entries or *max_bytes* bytes. *dest* is swapped in
     whole, and left alone when it already holds this package (sha256
-    marker).
+    marker). With *sha* the caller already decided to extract (the
+    package's digest when it checked it): the marker is not read again.
+    macOS ``.DS_Store`` and ``._*`` files are left out.
     """
     marker = dest.parent / f".{dest.name}.horus-sha256"
-    sha = _sha256(pkg)
-    if dest.is_dir() and marker.is_file() and read_text(marker) == sha:
-        return
+    if sha is None:
+        sha = _sha256(pkg)
+        if dest.is_dir() and marker.is_file() and read_text(marker) == sha:
+            return
     tmp = dest.with_name(f"{dest.name}.horus-tmp{os.getpid()}")
     old = dest.with_name(f"{dest.name}.horus-old{os.getpid()}")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +124,9 @@ def unpack(
         with open_file(pkg) as fh, tarfile.open(fileobj=fh, mode="r:*") as tar:
             members, total = [], 0
             for member in tar:  # headers only; nothing is written yet
+                base = member.name.rstrip("/").rsplit("/", 1)[-1]
+                if base == ".DS_Store" or base.startswith("._"):
+                    continue
                 members.append(member)
                 total += member.size
                 if max_files is not None and len(members) > max_files:

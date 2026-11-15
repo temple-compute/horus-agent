@@ -30,6 +30,11 @@ class JobsPolicy:
     """Unix user that runs task commands. Empty: the agent's own user."""
     run_as_via: str = "sudo"
     """How to switch to :attr:`run_as`: ``sudo`` or ``setpriv``."""
+    home: str = ""
+    """
+    ``HOME`` of approved jobs. Empty: the :attr:`run_as` user's home, or a
+    fresh one per job without :attr:`run_as`.
+    """
 
 
 def load_jobs_policy(path: Path | None = None) -> JobsPolicy:

@@ -396,16 +396,17 @@ class OpRunner:
                 if guard_mod.runtime_meta(path):
                     guard.add_meta(op.run_id, path)
             case "unpack":
+                # Decided once: what runs later never reads the marker again.
                 dest = paths["dest"]
                 marker = dest.parent / f".{dest.name}.horus-sha256"
-                same = (
+                sha = await asyncio.to_thread(native.digest, paths["pkg"])
+                admitted.unpack_sha = sha
+                admitted.unpacked = (
                     dest.is_dir()
                     and marker.is_file()
-                    and (
-                        native.read_text(marker) == native.digest(paths["pkg"])
-                    )
+                    and native.read_text(marker) == sha
                 )
-                if not same:
+                if not admitted.unpacked:
                     guard.check_writable(op.run_id, dest, "unpack")
             case "poll" | "signal" | "slurm_status" | "slurm_cancel":
                 if policy.strict and not guard.job(
@@ -463,13 +464,16 @@ class OpRunner:
                 )
                 return None
             case "unpack":
+                if admitted is not None and admitted.unpacked:
+                    return None
                 await asyncio.to_thread(
                     native.unpack,
                     Path(args["pkg"]),
                     Path(args["dest"]),
-                    None if guard is None else guard_mod.bad_name,
+                    None if guard is None else guard.refused_member,
                     None if guard is None else guard.policy.max_unpack_bytes,
                     None if guard is None else guard.policy.max_unpack_files,
+                    None if admitted is None else admitted.unpack_sha,
                 )
                 return None
             case "move":
@@ -645,7 +649,8 @@ class OpRunner:
         log = horus_logger.log
         log.info(f"[run {(op.run_id or '-')[:8]}] {op.method} {args.task_id}")
         job_dir.mkdir(parents=True)
-        (job_dir / launch.HOME_SUBDIR).mkdir()
+        if Path(prepared.env["HOME"]).parent == job_dir:
+            (job_dir / launch.HOME_SUBDIR).mkdir()
         if slurm:
             return await self._sbatch(op.run_id, prepared)
         result = await self._launch(
