@@ -103,6 +103,60 @@ Suffixes of files an interpreter or the dynamic loader loads on its own
 (case-insensitive, and ``.so`` with a version tail). No op may write one
 into a run unless ``allow_code_suffixes`` in the policy names it.
 """
+SCRIPT_SUFFIXES = (
+    ".sh",
+    ".bash",
+    ".zsh",
+    ".ksh",
+    ".csh",
+    ".fish",
+    ".php",
+    ".jl",
+    ".m",
+    ".tcl",
+    ".ps1",
+    ".ts",
+    ".groovy",
+    ".gradle",
+    ".nf",
+    ".smk",
+    ".rules",
+    ".mk",
+    ".cmake",
+    ".bat",
+    ".cmd",
+    ".vbs",
+    ".pyz",
+    ".whl",
+)
+SCRIPT_NAMES = frozenset(
+    {
+        "Rakefile",
+        "justfile",
+        "Justfile",
+        "Taskfile.yml",
+        "Taskfile.yaml",
+        "Dockerfile",
+        "Jenkinsfile",
+        "CMakeLists.txt",
+        "Vagrantfile",
+        "Gemfile",
+        "Pipfile",
+        "Procfile",
+        "gulpfile.js",
+        "Gruntfile.js",
+        "build.xml",
+        "pom.xml",
+        "meson.build",
+        "Earthfile",
+        "docker-compose.yml",
+    }
+)
+"""
+Names a build tool or a shell runs as code when started in their folder or
+given on its command line. Below the top of a run, a file with one of them
+is staged only where the release declares the name.
+"""
 CODE_DIRS = frozenset({"__pycache__", "node_modules", "site-packages"})
 """Folder names interpreters search for code; never allowed."""
 _SHARED_OBJECT = re.compile(r"\.so(\.[0-9]+)*")
@@ -502,6 +556,9 @@ class Guard:
             if not path.is_relative_to(root) or path == root:
                 continue
             rel = path.relative_to(root).parts
+            for part in rel[1:]:
+                if problem := self.script_problem(part, allowed):
+                    raise PolicyRefusedError(problem)
             tops = [tuple(t.split("/")) for t in manifest.tasks]
             tops += [tuple(t.split("[")[0].split("/")) for t in manifest.tasks]
             depth = 0
@@ -523,6 +580,19 @@ class Guard:
                 if not inside:
                     return
                 depth = max(len(t) for t in inside)
+
+    @staticmethod
+    def script_problem(name: str, allowed: frozenset[str]) -> str | None:
+        """Why a script or build file named *name* may not be staged."""
+        low = name.lower()
+        if name in allowed or name.split("[", 1)[0] in allowed:
+            return None
+        if name in SCRIPT_NAMES or low.endswith(SCRIPT_SUFFIXES):
+            return (
+                f"{name!r} is a script or build file the release does not "
+                "declare, so it cannot be staged there"
+            )
+        return None
 
     def check_name(self, path: Path, *, code_ok: bool = False) -> None:
         """
@@ -626,12 +696,15 @@ class Guard:
         """
         if manifest is None or not self.policy.strict:
             return None
+        allowed = self.layout_names(manifest)
 
         def check(tree: Path) -> None:
             if self.shipped(dest, digest(tree, "deep"), manifest):
                 return
             for root, dirs, names in os.walk(tree):
                 for name in dirs + names:
+                    if problem := self.script_problem(name, allowed):
+                        raise PolicyRefusedError(problem)
                     where = dest / Path(root, name).relative_to(tree)
                     if not self.holds_shipped(where, manifest):
                         continue

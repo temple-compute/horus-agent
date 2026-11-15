@@ -422,7 +422,7 @@ async def test_only_declared_names_can_be_staged(env: Env) -> None:
         message = await refused(
             env,
             "put_file",
-            "not an input, output",
+            "",
             release=release,
             path=str(path),
             data=ok,

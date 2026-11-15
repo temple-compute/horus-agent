@@ -408,3 +408,55 @@ async def test_cancel_run_spares_a_recycled_pid_that_leads_its_own_group(
         with contextlib.suppress(ProcessLookupError):
             os.killpg(stranger.pid, signal.SIGKILL)
         stranger.wait()
+
+
+# --- minors: no scripts below the top of a run unless declared --------------
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Rakefile",
+        "justfile",
+        "Taskfile.yml",
+        "main.nf",
+        "x.sh",
+        "x.php",
+        "x.jl",
+    ],
+)
+async def test_no_script_or_build_file_below_a_declared_folder(
+    env: Env, name: str
+) -> None:
+    approved = _layout_release_deep()
+    policy.approve(approved, "root")
+    release = approved.release_hash
+    await env.call(
+        "put_file",
+        release=release,
+        path=str(env.run / "results" / "a.bam"),
+        data=b64(b"x"),
+    )
+    await refused(
+        env,
+        "put_file",
+        "script or build file",
+        release=release,
+        path=str(env.run / "results" / "sub" / name),
+        data=b64(b"x"),
+    )
+    await refused(
+        env,
+        "unpack",
+        "script or build file",
+        release=release,
+        pkg=str(_package(env.run / "p.tgz", {f"d/{name}": b"x"})),
+        dest=str(env.run / "results" / "u"),
+    )
+
+
+def _layout_release_deep() -> Manifest:
+    return manifest(
+        "ls ${inp}",
+        outputs=[{"id": "out", "kind": "file", "path": "results/a.bam"}],
+    )

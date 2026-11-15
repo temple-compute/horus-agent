@@ -176,9 +176,9 @@ async def test_staged_files_are_not_executable(env: Env) -> None:
     await env.call("put_file", path=str(path), data=b64(b"echo"))
     assert not path.stat().st_mode & 0o111
     pkg = env.run / "p.tgz"
-    package(pkg, {"bin/run.sh": b"#!/bin/sh\n"}, mode=0o755)
+    package(pkg, {"bin/run.txt": b"#!/bin/sh\n"}, mode=0o755)
     await env.call("unpack", pkg=str(pkg), dest=str(env.run / "out"))
-    assert not (env.run / "out" / "bin" / "run.sh").stat().st_mode & 0o111
+    assert not (env.run / "out" / "bin" / "run.txt").stat().st_mode & 0o111
 
 
 # --- agent-owned folders ----------------------------------------------------
