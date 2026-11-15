@@ -159,7 +159,7 @@ ACCEPTED = [
     "sed -n 1,5p ${inp} > ${out}",
     "awk '{print $1}' ${inp} > ${out}",
     "grep -v ${msg} ${inp} > ${out}",
-    "mkdir -p x && cd x && tool ${inp}",
+    "mkdir -p x && cd x && fastqc ${inp}",
     "if [ -s ${inp} ]; then cat ${inp} > ${out}; fi",
     "sort -k1,1 -T tmp ${inp} > ${out}",
     "find . -name x -exec cat {} ; ; cat ${inp} > ${out}",

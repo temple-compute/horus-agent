@@ -15,6 +15,7 @@ runtime version is installed next to them.
 import re
 import shlex
 from collections.abc import Mapping
+from contextvars import ContextVar
 from string import Template
 
 
@@ -54,7 +55,9 @@ def render(text: str, values: Mapping[str, str | list[str]]) -> str:
 
 
 _SENTINEL = "\0"
-_SHELLS = "sh bash dash zsh ksh ash tcsh csh fish busybox source ."
+_QUOTED = "\x01"
+"""Stands for a quoted part in a word the scanner is building."""
+_SHELLS = "sh bash dash zsh ksh ash tcsh csh fish busybox rbash rzsh source ."
 _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
     # program: (options taking a value, flags, options whose value is code,
     #           options making the first positional the code, positionals:
@@ -103,9 +106,9 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
         "first",
     ),
     "node": (
-        "-r --require --import --loader --input-type --conditions",
+        "--input-type --conditions",
         "--no-warnings --enable-source-maps --trace-warnings",
-        "-e --eval -p --print",
+        "-e --eval -p --print -r --require --import --loader",
         "",
         "first",
     ),
@@ -134,7 +137,6 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
         "",
         "first",
     ),
-    "tclsh": ("", "", "", "", "first"),
     "java": (
         "--add-modules --add-opens --add-exports -D -X",
         "-server -client -ea -da -esa -dsa -verbose",
@@ -187,6 +189,18 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
         "",
         "data",
     ),
+    **dict.fromkeys(
+        ("ipython", "groovy", "octave", "bun", "expect", "tclsh", "wish"),
+        ("", "", "-c -f -e --eval", "", "first"),
+    ),
+    **dict.fromkeys(
+        ("deno", "pytest", "py.test", "tox", "pip", "pip3", "npm", "npx"),
+        ("", "", "", "", "all"),
+    ),
+    **dict.fromkeys(
+        ("yarn", "pnpm", "bunx", "cmake", "gdb", "sqlite3", "psql", "duckdb"),
+        ("", "", "-P -x --command -ex -iex -f -c", "", "all"),
+    ),
     "nextflow": (
         "-profile -params-file -w -work-dir -name -revision -r -entry "
         "-with-report -with-trace -with-timeline -with-dag -log -bucket-dir",
@@ -235,7 +249,9 @@ _CODE_OPTIONS: dict[str, tuple[str, ...]] = {
         "-Xbootclasspath",
     ),
 }
-_EVERYWHERE = frozenset({"eval", "ssh", "su", "xargs", "parallel", "watch"})
+_EVERYWHERE = frozenset(
+    {"eval", "ssh", "su", "xargs", "parallel", "watch", "alias"}
+)
 """Commands that make every placeholder of a template untrustworthy."""
 _EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 _SCRIPT_AFTER_CODE = frozenset({"lua"})
@@ -259,6 +275,11 @@ _AWK_RUNS = re.compile(
     r"system[ \t]*\(|\|[ \t]*getline|\|&|print[^;\n]*\|[ \t]*\""
 )
 _PYTHON = re.compile(r"python[0-9.]*|pypy[0-9.]*")
+_VERSIONED = re.compile(r"[-_.]?[0-9][0-9._-]*$")
+_STDIN_CODE = frozenset(
+    {"R", "sqlite3", "psql", "duckdb", "octave", "ipython", "groovy"}
+)
+"""Programs that run what they read from stdin as code (a script or SQL)."""
 _SLURM_MPI = (
     "-n -N -c -p -t -J -A -x -w -G -np -H --np --ntasks --nodes "
     "--cpus-per-task --partition --time --job-name --host --hostfile "
@@ -347,6 +368,27 @@ _WRAPPERS: dict[str, tuple[str, str, str, int, str]] = {
     ),
     "setsid": ("", "-f -w -c --fork --wait --ctty", "", 0, ""),
     **dict.fromkeys(
+        (
+            "fakeroot",
+            "eatmydata",
+            "tini",
+            "dumb-init",
+            "gosu",
+            "su-exec",
+            "ssh-agent",
+            "unbuffer",
+            "rlwrap",
+            "ltrace",
+            "firejail",
+            "bwrap",
+            "nsenter",
+            "cgexec",
+        ),
+        ("-u -g -t -p -n -s -o -e", "-- -f -a --", "-c --command", 0, ""),
+    ),
+    "perf": ("-e -o -p -C -x -r -F -c", "-a -d -v -B", "", 1, ""),
+    "faketime": ("", "-f", "", 1, ""),
+    **dict.fromkeys(
         ("conda", "mamba", "micromamba"),
         (
             "-n --name -p --prefix --cwd",
@@ -396,6 +438,41 @@ _WRAPPERS: dict[str, tuple[str, str, str, int, str]] = {
     ),
 }
 """Commands that run their arguments as another command."""
+_DATA_TOOLS = frozenset(
+    """
+    [ test train predict cat head tail wc sort uniq cut paste tr tee ls rm cp
+    mv ln mkdir rmdir
+    touch chmod chown stat du df file basename dirname readlink realpath
+    md5sum sha1sum sha256sum sha512sum cksum gzip gunzip zcat bzip2 bunzip2
+    xz unxz zstd pigz unpigz tar unzip zip cmp diff comm join split fold nl
+    od hexdump seq echo printf true false test sleep date pwd grep egrep
+    fgrep zgrep rev tac shuf column expand unexpand strings truncate sync
+    mktemp install rename gawk rsync curl wget git du find xargs cd
+    samtools bcftools bedtools bwa bwa-mem2 bowtie bowtie2 hisat2 STAR
+    fastqc multiqc trimmomatic cutadapt fastp salmon kallisto picard gatk
+    tabix bgzip seqtk minimap2 blastn blastp makeblastdb mafft muscle
+    iqtree fasttree raxml-ng hmmer hmmsearch hmmbuild bamtools vcftools
+    plink plink2 featureCounts htseq-count stringtie cufflinks bismark
+    macs2 deeptools bamCoverage multiBamSummary sambamba bbduk bbmap
+    bbsplit dupradar qualimap preseq rseqc spades megahit prokka
+    quast busco diamond mmseqs fastx_toolkit seqkit vsearch
+    gmx cpptraj pdb4amber tleap antechamber parmchk2 sander pmemd
+    obabel vina autodock4 reduce
+    """.split()
+)
+"""Programs that treat their arguments as data (files, values), never as
+code to run: a placeholder as their first argument is a path or a value."""
+_AT_PROGRAM = frozenset({"alias"})
+"""Commands that matter only as the program of a command."""
+_FUNCTION_DEF = re.compile(
+    r"(?m)(?:^|[;&{(])[ \t]*(?:function[ \t]+)?([A-Za-z_][\w.-]*)[ \t]*\(\)"
+)
+_DEFINED: ContextVar[frozenset[str]] = ContextVar(
+    "defined", default=frozenset()
+)
+"""Functions the template under scan defines: their bodies are scanned too."""
+_COPIERS = frozenset({"cp", "mv", "ln", "install", "rsync", "scp", "dd"})
+"""Programs that write a copy of their first arguments to the last one."""
 _KEYWORDS = frozenset(
     {"if", "then", "else", "elif", "while", "until", "do", "!", "coproc", "{"}
 )
@@ -460,6 +537,7 @@ def _classify(
     skeleton += text[last:]
     if not found:
         return {}
+    _DEFINED.set(frozenset(_FUNCTION_DEF.findall(skeleton)))
     if why := _whole_reason(skeleton):
         return dict.fromkeys(found, (why, False))
     marks, whole = _scan(skeleton)
@@ -474,7 +552,7 @@ def _classify(
     return out
 
 
-def _whole_reason(skeleton: str) -> str | None:
+def _whole_reason(skeleton: str) -> str | None:  # noqa: PLR0911
     """Why no placeholder of a template can be trusted, from its text."""
     if "<<-" in skeleton:
         return "in a template with a <<- heredoc"
@@ -484,11 +562,44 @@ def _whole_reason(skeleton: str) -> str | None:
         return "in a template that runs a script named by a variable"
     if _pipes_into_code(skeleton):
         return "in a template that pipes into a shell"
+    if _runs_data_lines(skeleton):
+        return (
+            "in a template with an editor or inline script that runs commands"
+        )
     if re.search(r"\bawk\b|\bgawk\b|\bmawk\b", skeleton) and _AWK_RUNS.search(
         skeleton
     ):
         return "in a template with an awk program that runs commands"
     return None
+
+
+_SED_E = re.compile(
+    r"\bs([/|#,:@!%])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[0-9a-zA-Z]*e"
+)
+_SED_ECMD = re.compile(r"(?<![A-Za-z_/\\-])e(?:[ \t;'\"}]|$)")
+_SED_CALL = re.compile(r"\b[gs]?sed\b([^\n|]*)")
+_INLINE_CODE = re.compile(
+    r"\b(?:perl|ruby|node|php|lua|julia|Rscript|python[0-9.]*)\b[^\n;|]*"
+    r"[ \t]-[a-zA-Z]*[ceErp]\b"
+)
+_INLINE_RUNS = re.compile(
+    r"\b(?:system|exec|popen|spawn|spawnSync|execSync|child_process|"
+    r"subprocess|qx|shell_exec|passthru|proc_open|execute)\b|`"
+)
+
+
+def _runs_data_lines(skeleton: str) -> bool:
+    """
+    Whether an editor or an inline script in *skeleton* can run the lines
+    of a file it is given: ``sed`` with the ``e`` flag or command, or
+    inline ``perl``/``ruby``/``python``... code that starts programs.
+    """
+    for call in _SED_CALL.finditer(skeleton):
+        if _SED_E.search(call.group(1)) or _SED_ECMD.search(call.group(1)):
+            return True
+    return bool(
+        _INLINE_CODE.search(skeleton) and _INLINE_RUNS.search(skeleton)
+    )
 
 
 def uses_python_code(text: str) -> bool:
@@ -533,6 +644,9 @@ def _base(word: str) -> str:
 def _spec(program: str) -> tuple[str, str, str, str, str] | None:
     if _PYTHON.fullmatch(program):
         return _PROGRAMS["python"]
+    for name in (program, program.lower(), _VERSIONED.sub("", program)):
+        if len(name) > 1 and name in _PROGRAMS:
+            return _PROGRAMS[name]
     return _PROGRAMS.get(program)
 
 
@@ -647,7 +761,9 @@ def _program_reason(rest: list[str], word: str) -> str | None:  # noqa: PLR0911
         return None  # -exec anywhere refuses the whole template
     spec = _spec(program)
     if spec is None:
-        return None
+        return _unknown_reason(rest, word)
+    if program == "R" and rest[1:2] == ["CMD"]:
+        return CODE_POSITION  # R CMD BATCH/INSTALL/SHLIB run what they get
     kind = spec[4]
     args = rest[1:]
     expect, positionals, code_given, unknown = _read_args(spec, args)
@@ -677,11 +793,38 @@ def _program_reason(rest: list[str], word: str) -> str | None:  # noqa: PLR0911
     return None
 
 
+def _unknown_reason(rest: list[str], word: str) -> str | None:
+    """
+    Why a placeholder after a program the agent has no entry for may be
+    code: it is the program's first non-option argument (``fakeroot
+    ${x}``, ``eatmydata ${x}``) and the program is not a known data tool,
+    or a later word is an interpreter or a shell that runs it.
+    """
+    program = rest[0]
+    if (
+        "/" in program
+        or program == "-"
+        or program in _DATA_TOOLS
+        or program in _DEFINED.get()
+    ):
+        return None
+    for k, other in enumerate(rest[1:], 1):
+        if _spec(_base(other)) is not None and _base(other) != program:
+            return _program_reason(rest[k:], word)
+    if word.startswith("-"):
+        return None
+    if len(rest) == 1 or rest[-1] == "--":
+        return "after a program the agent does not know"
+    return None
+
+
 def _reads_stdin_code(words: list[str]) -> bool:
     """Whether the command in *words* reads its code from stdin."""
     rest = _command(words)
     if isinstance(rest, str) or not rest:
         return False
+    if _base(rest[0]) in _STDIN_CODE:
+        return True
     spec = _spec(_base(rest[0]))
     if spec is None or spec[4] == "all":
         return False
@@ -691,6 +834,7 @@ def _reads_stdin_code(words: list[str]) -> bool:
         return False
     if spec[4] == "data":
         return _base(rest[0]) == "R"
+
     return positionals == 0 or "-" in args[:1]
 
 
@@ -793,6 +937,11 @@ def _scan(  # noqa: PLR0912, PLR0915
         herestring = False
         words = stack[-1][1]
         match = None if _in_test(words) else _OPERATOR.match(word)
+        if (skip or match) and any(_base(w) == "exec" for w in words):
+            if _command(words) == []:  # exec 3< file; bash <&3
+                whole.append(
+                    "in a template that holds a redirection open with exec"
+                )
         if skip:
             if (
                 ">" in skip
@@ -811,8 +960,20 @@ def _scan(  # noqa: PLR0912, PLR0915
             ):
                 targets.append(word[match.end() :])
         else:
+            if (
+                _command(words) == []
+                and not _ASSIGN.match(word)
+                and (_QUOTED in word or "\\" in word)
+            ):
+                whole.append(
+                    "in a template that runs a program named with quotes "
+                    "or an escape"
+                )
+            at_program = _command(words) == []
             words.append(word)
-            if _base(word) in _EVERYWHERE:
+            if _base(word) in _EVERYWHERE and (
+                at_program or _base(word) not in _AT_PROGRAM
+            ):
                 whole.append(f"in a template that runs {word}")
         word = ""
 
@@ -822,7 +983,28 @@ def _scan(  # noqa: PLR0912, PLR0915
         if (rest := _command(words)) and not isinstance(rest, str):
             if _spec(_base(rest[0])) is not None:
                 ran.update(_base(w) for w in rest[1:] if w[:1] != "-")
+                ran.update(w for w in rest[1:] if "/" in w)
             ran.add(_base(rest[0]))
+        if (
+            (rest := _command(words))
+            and not isinstance(rest, str)
+            and _base(rest[0]) in _COPIERS
+            and len(out) > started
+        ):
+            pos = [w for w in rest[1:] if w[:1] != "-"]
+            if len(pos) > 1:
+                dest = pos[-1]
+                if dest in (".", "..") or dest.endswith("/"):
+                    # into a folder: the copy keeps the source's own name
+                    targets.extend(
+                        _base(w)
+                        for w in pos[:-1]
+                        if not set(w) & {_SENTINEL, "$", "*", "?"}
+                    )
+                    if dest.endswith("/") and dest != "/":
+                        targets.append(dest)  # whatever lands in the folder
+                elif _SENTINEL not in dest:
+                    targets.append(dest)  # cp ${x} y.sh; bash y.sh
         if targets and len(out) > started:
             generated.extend((t, started, len(out)) for t in targets)
         targets.clear()
@@ -925,7 +1107,7 @@ def _scan(  # noqa: PLR0912, PLR0915
                 )
         if c in "'\"":
             push(c)
-            word += "q"
+            word += _QUOTED
             i += 1
             continue
         for opener in ("$((", "$(", "${", "$[", "<(", ">("):
@@ -1025,7 +1207,13 @@ def _scan(  # noqa: PLR0912, PLR0915
     if len(stack) != 1 or heredocs:
         return [], None
     for target, first, end in generated:
-        if _base(target) in ran or target in ran:
+        if (
+            _base(target) in ran
+            or target in ran
+            or (
+                target.endswith("/") and any(r.startswith(target) for r in ran)
+            )
+        ):
             for k in range(first, end):
                 if out[k][0] is None:
                     out[k] = (

@@ -18,7 +18,7 @@ from typing import Any
 import pytest
 
 from horus_agent import launch, policy
-from horus_agent.manifest import Manifest
+from horus_agent.manifest import Manifest, ManifestError
 from tests.unit.test_guard import Env, env, refused
 from tests.unit.test_policy_hardening import manifest, wait_exit
 
@@ -277,3 +277,69 @@ async def test_real_interpreters_on_a_job_env(
     else:
         await call
         await wait_exit(env.run / "j")
+
+
+# --- M4: the checker fails closed on shapes it has no entry for -------------
+
+REFUSED = [
+    "'bash' ${x}",
+    '"bash" ${x}',
+    "\\bash ${x}",
+    "b'a'sh ${x}",
+    "rbash ${x}",
+    "shopt -s expand_aliases; alias b=bash; b ${x}",
+    "cp ${x} y.sh; bash y.sh",
+    "ln -s ${x} y.sh; sh y.sh",
+    "mv ${x} y.sh; bash y.sh",
+    "cp ${x} d/; bash d/x.sh",
+    "exec 3< ${x}; bash <&3",
+    "fakeroot ${x}",
+    "eatmydata ${x}",
+    "ssh-agent ${x}",
+    "nsenter bash ${x}",
+    "perf stat ${x}",
+    "mytool run python ${x}",
+    "bun ${x}",
+    "deno run ${x}",
+    "ipython ${x}",
+    "octave ${x}",
+    "groovy ${x}",
+    "pytest ${x}",
+    "pip install ${x}",
+    "cmake -P ${x}",
+    "gdb -x ${x}",
+    "expect -f ${x}",
+    "node -r ${x}",
+    "R CMD BATCH ${x}",
+    "sqlite3 db < ${x}",
+    "psql -f ${x}",
+    "Rscript-4.3 ${x}",
+    "rscript ${x}",
+    "sed 's/^/ /e' ${x}",
+    "sed -n 's/a/b/ge' ${x}",
+    "perl -ne 'system($_)' ${x}",
+    "unknowntool ${x}",
+]
+ACCEPTED = [
+    "samtools sort -@ 4 ${x} -o out.bam",
+    "fastqc ${x}",
+    "grep python ${x}",
+    "cp ${x} copy.txt; cat copy.txt",
+    "sed 's/a/b/' ${x}",
+    "sed -n 's/e/x/p' ${x}",
+    "apptainer exec img.sif tool --in ${x}",
+    "docker exec box tool --in ${x}",
+    "stage() { cp $1 .; }; stage ${x}",
+    "tool --in ${x}",
+]
+
+
+@pytest.mark.parametrize("command", REFUSED)
+def test_unclassifiable_shapes_are_refused(command: str) -> None:
+    with pytest.raises(ManifestError):
+        manifest(command, inputs=[{"id": "x", "kind": "file"}], outputs=[])
+
+
+@pytest.mark.parametrize("command", ACCEPTED)
+def test_ordinary_commands_still_pass_round5(command: str) -> None:
+    manifest(command, inputs=[{"id": "x", "kind": "file"}], outputs=[])

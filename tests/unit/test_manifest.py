@@ -112,7 +112,7 @@ def test_constant_file_byte_changes_the_hash() -> None:
 
 def test_roles() -> None:
     t = task(
-        runtime={"kind": "command", "command": "x $a $c $d $e $f"},
+        runtime={"kind": "command", "command": "cat $a $c $d $e $f"},
         inputs=[
             {"id": "a", "kind": "file", "path": "inputs/a.txt"},
             {"id": "c", "kind": "string"},
