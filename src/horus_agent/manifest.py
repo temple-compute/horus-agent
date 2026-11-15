@@ -37,6 +37,7 @@ from horus_agent.template import (
     embedded_placeholders,
     placeholders,
     unsafe_placeholders,
+    uses_python_code,
 )
 
 SCHEMA = 1
@@ -135,6 +136,18 @@ class Manifest:
         """Task id -> what the task runs."""
         tasks: dict[str, dict[str, Any]] = self.body["tasks"]
         return tasks
+
+    @property
+    def digests(self) -> frozenset[str]:
+        """Digests of every constant file, folder and script it approves."""
+        found = set(self.body.get("files") or ())
+        for task in self.tasks.values():
+            found |= {
+                v["sha256"] for v in task["inputs"].values() if "sha256" in v
+            }
+            if sha := task["runtime"].get("script_sha256"):
+                found.add(sha)
+        return frozenset(found)
 
     def task(self, task_id: str) -> dict[str, Any] | None:
         """The task serving *task_id*; a map clone ``x[3]`` serves ``x``."""
@@ -268,6 +281,14 @@ def build_manifest_from_workflow(
     info = {"name": workflow.get("name")}
     info.update(about or {})
     return Manifest(body=body, about=info, warnings=tuple(builder.warnings))
+
+
+def task_runs_python_code(task: Mapping[str, Any]) -> bool:
+    """Whether a manifest task's command runs ``python -c`` or ``-m``."""
+    runtime = task["runtime"]
+    return runtime["kind"] == "command" and uses_python_code(
+        str(runtime["command"])
+    )
 
 
 def _check_text(value: Any, where: str = "") -> None:

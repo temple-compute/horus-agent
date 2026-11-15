@@ -20,6 +20,7 @@ import pwd
 import re
 import stat
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -27,7 +28,8 @@ from urllib.parse import urlsplit
 
 import pydantic
 
-from horus_agent.manifest import Manifest
+from horus_agent.manifest import Manifest, file_digest
+from horus_agent.native import digest
 from horus_agent.policy import Approvals, Policy
 from horus_agent.protocol import ARGS, PROTOCOL, Args, Op, PolicyRefusedError
 
@@ -75,6 +77,35 @@ Names tools read code or settings from in their working directory or a
 folder above a script. Together with every name starting with ``.`` (but
 the runtime's own ``.horus*``), no op may write them into a run.
 """
+CODE_SUFFIXES = (
+    ".py",
+    ".pyc",
+    ".pyo",
+    ".pth",
+    ".pyd",
+    ".dll",
+    ".dylib",
+    ".jar",
+    ".class",
+    ".lua",
+    ".rb",
+    ".pl",
+    ".pm",
+    ".js",
+    ".mjs",
+    ".cjs",
+    ".node",
+    ".r",
+    ".rprofile",
+)
+"""
+Suffixes of files an interpreter or the dynamic loader loads on its own
+(case-insensitive, and ``.so`` with a version tail). No op may write one
+into a run unless ``allow_code_suffixes`` in the policy names it.
+"""
+CODE_DIRS = frozenset({"__pycache__", "node_modules", "site-packages"})
+"""Folder names interpreters search for code; never allowed."""
+_SHARED_OBJECT = re.compile(r"\.so(\.[0-9]+)*")
 IDLE_RUN_S = 600.0
 """A run with no job yet counts as active this long after its last op."""
 RESERVED_NAMES = frozenset({"pid", "exit_code", "slurm_job_id", "env"})
@@ -83,6 +114,8 @@ META_NAMES = frozenset(
     {".horus_resource.txt", ".horus_gpu.csv", "resource-usage.csv"}
 )
 """Names of files the agent writes for the resource monitor."""
+HORUS_OWN = frozenset({".horus", ".horus_job"}) | META_NAMES
+"""The only hidden names the runtime and the agent write into a run."""
 LOG_NAMES = frozenset({"stdout.log", "stderr.log"})
 META_MAX_BYTES = 64 * 1024
 WRITES = {
@@ -413,10 +446,13 @@ class Guard:
                 return path
         return self.confine(run_id, raw)
 
-    def confine_bound(self, run_id: str | None, raw: str) -> Path:
+    def confine_bound(
+        self, run_id: str | None, raw: str, *, code_ok: bool = False
+    ) -> Path:
         """
         A path rendered into a command or a job's directory: confined, made
         of :data:`SAFE_PATH` characters only, and not agent bookkeeping.
+        *code_ok*: the file is a constant or script that gets verified.
         """
         if not SAFE_PATH.fullmatch(raw):
             raise PolicyRefusedError(
@@ -425,22 +461,27 @@ class Guard:
         path = self.confine(run_id, raw)
         if _meta_name(path):
             raise PolicyRefusedError(f"Path is run metadata: {raw}")
-        self.check_name(path)
+        self.check_name(path, code_ok=code_ok)
         return path
 
-    def check_name(self, path: Path) -> None:
+    def check_name(self, path: Path, *, code_ok: bool = False) -> None:
         """
         Refuse a path in the work dir naming a tool's config file or folder,
-        or any hidden name but the runtime's own.
+        code an interpreter loads on its own, or any hidden name but the
+        runtime's own. With *code_ok* the file at the end of the path is an
+        approved constant (its content was checked), so its own code suffix
+        passes.
         """
         if not self.policy.strict:
             return  # an open agent runs any command anyway
-        for part in path.relative_to(self.work_dir).parts:
-            if bad_name(part):
-                raise PolicyRefusedError(
-                    f"{part!r} is a name tools read settings or code from; "
-                    "it cannot be written into a run"
-                )
+        allow = self.policy.allow_code_suffixes
+        parts = path.relative_to(self.work_dir).parts
+        for i, part in enumerate(parts):
+            problem = name_problem(
+                part, allow, code_ok=code_ok and i == len(parts) - 1
+            )
+            if problem:
+                raise PolicyRefusedError(problem)
 
     # --- jobs ---------------------------------------------------------------
 
@@ -460,18 +501,47 @@ class Guard:
         )
         return job
 
-    def refused_member(self, name: str) -> bool:
+    def refused_member(self, name: str, trusted: bool = False) -> str | None:
         """
-        A name a strict agent does not unpack: a tool config name, or run
-        metadata (``.horus``, the agent's job and monitor files).
+        Why a strict agent does not unpack *name*: a tool config or code
+        name, or run metadata (``.horus``, the agent's job and monitor
+        files).
         """
-        return self.policy.strict and (
-            bad_name(name)
-            or name == ".horus"
+        if not self.policy.strict:
+            return None
+        if (
+            name == ".horus"
             or name in META_NAMES
             or name in RESERVED_NAMES
             or name.endswith(".horus-sha256")
+        ):
+            return f"{name!r} is run metadata"
+        return name_problem(
+            name, self.policy.allow_code_suffixes, code_ok=trusted
         )
+
+    def trusts_tree(self, manifest: Manifest | None) -> Callable[[Path], bool]:
+        """Whether a folder is a constant folder *manifest* approves."""
+
+        def trusted(tree: Path) -> bool:
+            return manifest is not None and (
+                digest(tree, "deep") in manifest.digests
+            )
+
+        return trusted
+
+    def code_ok(self, run_id: str | None) -> set[str]:
+        """Paths holding code the release approves, by content."""
+        return set((self.run_record(run_id) or {}).get("code_ok") or ())
+
+    def add_code_ok(self, run_id: str | None, path: Path) -> None:
+        """Remember that *path* holds code the release approves."""
+        record = self.run_record(run_id)
+        if run_id is None or record is None:
+            return
+        if str(path) not in record.setdefault("code_ok", []):
+            record["code_ok"].append(str(path))
+            self._save(run_id, record)
 
     def end_job(self, run_id: str | None, job_dir: Path) -> None:
         """Note that a job was killed or lost: it holds no run open."""
@@ -493,7 +563,14 @@ class Guard:
         record["meta"].append(str(path))
         self._save(run_id, record)
 
-    def check_writable(self, run_id: str | None, path: Path, how: str) -> None:
+    def check_writable(
+        self,
+        run_id: str | None,
+        path: Path,
+        how: str,
+        data: bytes | None = None,
+        manifest: Manifest | None = None,
+    ) -> None:
         """
         Refuse writing *path* when it is run metadata, a job dir of the run
         (or holds or sits in one) or a file the agent writes itself. A
@@ -502,7 +579,14 @@ class Guard:
         if path.name in RESERVED_NAMES or path.name.endswith(".horus-sha256"):
             raise PolicyRefusedError(f"{how} may not write {path.name}")
         if how != "remove":
-            self.check_name(path)
+            approved = (
+                data is not None
+                and manifest is not None
+                and file_digest(data) in manifest.digests
+            )
+            self.check_name(path, code_ok=approved)
+            if approved and code_suffix(path.name) is not None:
+                self.add_code_ok(run_id, path)
         if path in self.roots(run_id):
             raise PolicyRefusedError(f"{how} refused: the run's directory")
         meta = _meta_name(path)
@@ -610,11 +694,58 @@ def job_running(job_dir: Path, info: dict[str, Any]) -> bool:
     return True
 
 
-def bad_name(name: str) -> bool:
-    """A tool config name, or hidden and not the runtime's (``.horus*``)."""
-    if name.startswith(".horus") or name.endswith(".horus-sha256"):
-        return False
-    return name in TOOL_CONFIG or name.startswith(".") or name.endswith(".pth")
+def code_suffix(name: str, allow: tuple[str, ...] = ()) -> str | None:
+    """
+    The suffix that makes *name* code an interpreter loads implicitly (not
+    among *allow*), or ``None``.
+    """
+    low = name.lower()
+    if name in CODE_DIRS:
+        return name
+    if _SHARED_OBJECT.search(low):
+        found: str | None = ".so"
+    else:
+        found = next((s for s in CODE_SUFFIXES if low.endswith(s)), None)
+    if found is None or found in {a.lower() for a in allow}:
+        return None
+    return found
+
+
+def name_problem(
+    name: str, allow: tuple[str, ...] = (), *, code_ok: bool = False
+) -> str | None:
+    """
+    Why *name* may not be written into a run, or ``None``. With *code_ok*
+    (the file is an approved constant) a code suffix is no problem.
+    """
+    if name in HORUS_OWN or name.endswith(".horus-sha256"):
+        return None
+    if name in TOOL_CONFIG or name.startswith(".") or name.endswith(".pth"):
+        return _tool_message(name)
+    if code_ok and name not in CODE_DIRS:
+        return None
+    if (found := code_suffix(name, allow)) is not None:
+        return (
+            f"{name!r} is code that interpreters load on their own "
+            f"({found}), so it cannot be staged in a run; to allow it, set "
+            f'allow_code_suffixes = ["{found}"] in policy.toml'
+            if found.startswith(".")
+            else f"{name!r} is a folder interpreters load code from, so it "
+            "cannot be staged in a run"
+        )
+    return None
+
+
+def _tool_message(name: str) -> str:
+    return (
+        f"{name!r} is a name tools read settings or code from; it cannot be "
+        "written into a run"
+    )
+
+
+def bad_name(name: str, allow: tuple[str, ...] = ()) -> bool:
+    """A name no op may write into a run (see :func:`name_problem`)."""
+    return name_problem(name, allow) is not None
 
 
 def runtime_meta(path: Path) -> bool:

@@ -392,7 +392,13 @@ class OpRunner:
                     and _read(path) == data
                 )
                 if not same:
-                    guard.check_writable(op.run_id, path, "put_file")
+                    guard.check_writable(
+                        op.run_id,
+                        path,
+                        "put_file",
+                        data,
+                        admitted.manifest,
+                    )
                 if guard_mod.runtime_meta(path):
                     guard.add_meta(op.run_id, path)
             case "unpack":
@@ -477,7 +483,7 @@ class OpRunner:
             case "unpack":
                 if admitted is not None and admitted.unpacked:
                     return None
-                await asyncio.to_thread(
+                needed_trust = await asyncio.to_thread(
                     native.unpack,
                     Path(args["pkg"]),
                     Path(args["dest"]),
@@ -486,7 +492,12 @@ class OpRunner:
                     None if guard is None else guard.policy.max_unpack_files,
                     None if admitted is None else admitted.unpack_sha,
                     guard is not None and guard.policy.strict,
+                    None
+                    if guard is None or admitted is None
+                    else guard.trusts_tree(admitted.manifest),
                 )
+                if guard is not None and needed_trust:
+                    guard.add_code_ok(op.run_id, Path(args["dest"]))
                 return None
             case "move":
                 native.move(Path(args["src"]), Path(args["dst"]))
@@ -656,7 +667,11 @@ class OpRunner:
                 f"{job_dir} already exists; each job starts in a new job dir"
             )
         prepared = await launch.prepare(
-            guard, op.run_id, admitted, slurm=slurm
+            guard,
+            op.run_id,
+            admitted,
+            slurm=slurm,
+            python_version=self._python_version,
         )
         log = horus_logger.log
         log.info(f"[run {(op.run_id or '-')[:8]}] {op.method} {args.task_id}")
@@ -683,6 +698,23 @@ class OpRunner:
             self._samplers.add(task)
             task.add_done_callback(self._samplers.discard)
         return result
+
+    async def _python_version(self) -> tuple[int, int] | None:
+        """
+        The ``(major, minor)`` of the Python a job's ``python`` and
+        ``python3`` resolve to as the task user (the oldest), if any.
+        """
+        script = (
+            "for p in python python3; do command -v $p >/dev/null && "
+            "$p -I -c 'import sys; print(*sys.version_info[:2])'; done"
+        )
+        _code, out, _err = await self._shell(script, None, capture=True)
+        found = []
+        for line in out.decode(errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) == 2 and all(p.isdigit() for p in parts):
+                found.append((int(parts[0]), int(parts[1])))
+        return min(found) if found else None
 
     async def stop_revoked(self) -> int:
         """

@@ -17,6 +17,7 @@ import os
 import platform
 import signal
 import socket
+import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import quote
@@ -32,7 +33,12 @@ from horus_agent.daemon import (
     broker_tls,
     check_broker_url,
 )
-from horus_agent.manifest import Manifest, ManifestError, build_manifest
+from horus_agent.manifest import (
+    Manifest,
+    ManifestError,
+    build_manifest,
+    task_runs_python_code,
+)
 from horus_agent.protocol import Registration
 
 TOKEN_ENV = "HORUS_AGENT_TOKEN"
@@ -281,7 +287,47 @@ def _show(manifest: Manifest) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _approve(args: argparse.Namespace) -> int:
+def _python_problem(manifest: Manifest) -> str | None:
+    """
+    Why a release running ``python -c``/``-m`` cannot be approved here: this
+    machine's Python is older than 3.11 and the policy lets code files into
+    runs, so such a task would import them from its working directory.
+    """
+    tasks = [
+        t
+        for t, v in sorted(manifest.tasks.items())
+        if task_runs_python_code(v)
+    ]
+    if not tasks or not policy.configured_code_suffixes():
+        return None
+    probe = subprocess.run(
+        [
+            "/usr/bin/env",
+            "python3",
+            "-I",
+            "-c",
+            "import sys; print(*sys.version_info[:2])",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    parts = probe.stdout.split()
+    if (
+        len(parts) == 2
+        and all(p.isdigit() for p in parts)
+        and (int(parts[0]), int(parts[1])) >= (3, 11)
+    ):
+        return None
+    return (
+        f"task {tasks[0]!r} runs python -c or -m, python3 here is older than "
+        "3.11 (or missing), and allow_code_suffixes lets code files into "
+        "runs, which such a Python would import from the task's working "
+        "directory; use Python 3.11 or newer, or empty allow_code_suffixes"
+    )
+
+
+def _approve(args: argparse.Namespace) -> int:  # noqa: PLR0911
     if os.geteuid() not in config.POLICY_OWNERS:
         sys.stderr.write("Only root can approve releases (use sudo).\n")
         return 1
@@ -292,6 +338,9 @@ def _approve(args: argparse.Namespace) -> int:
         return 1
     if not manifest.tasks:
         sys.stderr.write("This release runs nothing on agents.\n")
+        return 1
+    if problem := _python_problem(manifest):
+        sys.stderr.write(f"Cannot approve: {problem}\n")
         return 1
     if args.expect_hash and args.expect_hash != manifest.release_hash:
         sys.stderr.write(

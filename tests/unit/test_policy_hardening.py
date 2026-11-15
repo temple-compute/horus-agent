@@ -170,6 +170,7 @@ async def test_runs_folders_never_overlap(env: Env) -> None:
 
 
 async def test_sibling_modules_of_the_script_do_not_load(env: Env) -> None:
+    env.with_policy(allow_code_suffixes=(".py",))  # -I is the last defence
     approved_src = b"import json\nprint(json.dumps({'ok': 1}))\n"
     approved = manifest(
         "",
@@ -205,6 +206,7 @@ async def test_sibling_modules_of_the_script_do_not_load(env: Env) -> None:
 
 
 async def test_constant_folders_hold_files_and_folders_only(env: Env) -> None:
+    env.with_policy(allow_code_suffixes=(".py",))
     approved = manifest(
         "ls ${inp} > ${out}",
         inputs=[{"id": "inp", "kind": "folder", "path": "tools"}],

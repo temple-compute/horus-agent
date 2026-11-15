@@ -527,12 +527,13 @@ async def test_task_launch_runs_the_agents_copy_of_inputs(env: Env) -> None:
 async def test_python_script_hash_is_checked(env: Env) -> None:
     manifest = build_manifest((DATA / "script.zip").read_bytes())
     policy.approve(manifest, "root")
-    script = env.run / "qc.py"
+    (env.run / "s").mkdir()
+    script = env.run / "s" / "qc.py"
     script.write_text("import os  # changed\n")
     args = {
         "task_id": "make",
         "job_dir": str(env.run / "j"),
-        "cwd": str(env.run),
+        "cwd": str(env.run / "c"),
         "script": str(script),
         "bindings": {
             "data": {"path": str(env.run / "d")},

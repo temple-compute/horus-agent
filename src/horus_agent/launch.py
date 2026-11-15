@@ -23,15 +23,20 @@ import re
 import shlex
 import stat
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from horus_agent import native
 from horus_agent.blobs import open_file
-from horus_agent.guard import SAFE_PATH, Admitted, Guard, bad_name
-from horus_agent.manifest import RESERVED_ENV, VALUE_KINDS
+from horus_agent.guard import SAFE_PATH, Admitted, Guard, name_problem
+from horus_agent.manifest import (
+    RESERVED_ENV,
+    VALUE_KINDS,
+    Manifest,
+    task_runs_python_code,
+)
 from horus_agent.protocol import PolicyRefusedError, TaskLaunchArgs
 from horus_agent.template import placeholders, render
 
@@ -100,7 +105,9 @@ def _template(task: dict[str, Any], script: Path | None) -> str:
     return f"{head} {runtime['args']}".rstrip()
 
 
-def _working_dir(guard: Guard, run_id: str | None, raw: str) -> Path:
+def _working_dir(
+    guard: Guard, run_id: str | None, raw: str, manifest: Manifest
+) -> Path:
     """
     The task's working directory, where the runtime runs a task and puts
     its relative outputs: confined to the run, reached through no link
@@ -122,20 +129,68 @@ def _working_dir(guard: Guard, run_id: str | None, raw: str) -> Path:
             f"made: {raw}"
         )
     root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
-    folder = cwd
-    while True:
+    allow = guard.policy.allow_code_suffixes
+    if found := held_code(
+        cwd, root, allow, guard.code_ok(run_id), manifest.digests
+    ):
+        raise PolicyRefusedError(
+            f"{found[0]} holds settings or code a tool would read on its "
+            f"own; it was not made by an approved task: {found[1]}"
+        )
+    return cwd
+
+
+SCAN_CAP = 200_000
+"""Entries of the working directory looked at; beyond it the scan stops."""
+
+
+def held_code(
+    cwd: Path,
+    root: Path,
+    allow: tuple[str, ...],
+    approved: set[str] = frozenset(),  # type: ignore[assignment]
+    digests: frozenset[str] = frozenset(),
+) -> tuple[Path, str] | None:
+    """
+    The first entry the agent's own user wrote (an op, not a job) that a
+    tool or an interpreter would load on its own, and why: anywhere below
+    *cwd*, and directly in each folder from *cwd* up to *root*. Code the
+    release approves passes: paths in *approved*, and files whose content
+    hashes to one of its *digests*.
+    """
+    mine = os.geteuid()
+    seen = 0
+    folders = [cwd]
+    while folders[-1] != root:
+        folders.append(folders[-1].parent)
+    ancestors = set(folders[1:])
+    pending = list(folders)
+    while pending and seen < SCAN_CAP:  # shortcut: very large trees pass
+        folder = pending.pop()
         with os.scandir(folder) as entries:
             for entry in entries:
-                if bad_name(entry.name) and (
-                    entry.stat(follow_symlinks=False).st_uid == os.geteuid()
-                ):
-                    raise PolicyRefusedError(
-                        f"{entry.path} holds settings or code a tool would "
-                        "read; it was not made by an approved task"
-                    )
-        if folder == root:
-            return cwd
-        folder = folder.parent
+                seen += 1
+                info = entry.stat(follow_symlinks=False)
+                if entry.is_dir(follow_symlinks=False):
+                    if folder not in ancestors:
+                        pending.append(Path(entry.path))
+                if info.st_uid != mine:
+                    continue
+                if why := name_problem(entry.name, allow):
+                    if _approved(Path(entry.path), approved, digests):
+                        continue
+                    return Path(entry.path), why
+    return None
+
+
+def _approved(path: Path, approved: set[str], digests: frozenset[str]) -> bool:
+    """Whether *path* is code the release approves, by place or content."""
+    if any(str(p) in approved for p in (path, *path.parents)):
+        return True
+    try:
+        return path.is_file() and native.digest(path) in digests
+    except OSError:
+        return False
 
 
 async def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
@@ -181,8 +236,51 @@ def job_env(home: Path) -> dict[str, str]:
     }
 
 
+PythonVersion = Callable[[], Awaitable[tuple[int, int] | None]]
+"""Asks which Python a job gets (as the task user), ``None`` if none."""
+SAFE_PATH_PYTHON = (3, 11)
+"""First Python that honours ``PYTHONSAFEPATH``."""
+
+
+async def _check_python(  # noqa: PLR0913, PLR0917
+    guard: Guard,
+    manifest: Manifest,
+    task: dict[str, Any],
+    cwd: Path,
+    run_id: str | None,
+    probe: PythonVersion | None,
+) -> None:
+    """
+    A task running ``python -c``/``-m`` on a Python before 3.11 imports
+    from its working directory, whatever ``PYTHONSAFEPATH`` says: it starts
+    only when that directory holds no code at all, even what the policy's
+    ``allow_code_suffixes`` lets in.
+    """
+    if not (task_runs_python_code(task) and guard.policy.allow_code_suffixes):
+        return
+    root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
+    if (
+        held_code(cwd, root, (), guard.code_ok(run_id), manifest.digests)
+        is None
+        or probe is None
+    ):
+        return
+    version = await probe()
+    if version is None or version < SAFE_PATH_PYTHON:
+        raise PolicyRefusedError(
+            "This task runs python -c or -m, the job's Python is older "
+            "than 3.11 and the working directory holds code (see "
+            "allow_code_suffixes); use Python 3.11 or newer"
+        )
+
+
 async def prepare(
-    guard: Guard, run_id: str | None, admitted: Admitted, *, slurm: bool
+    guard: Guard,
+    run_id: str | None,
+    admitted: Admitted,
+    *,
+    slurm: bool,
+    python_version: PythonVersion | None = None,
 ) -> Prepared:
     """
     Check an admitted ``task_launch`` / ``slurm_submit`` against its manifest
@@ -195,7 +293,11 @@ async def prepare(
         PolicyRefusedError: Anything does not match the approved release.
     """
     args, task = admitted.args, admitted.task
-    if not isinstance(args, TaskLaunchArgs) or task is None:
+    if (
+        not isinstance(args, TaskLaunchArgs)
+        or task is None
+        or admitted.manifest is None
+    ):
         raise PolicyRefusedError("Not a task launch of an approved release")
     task_id = args.task_id
     if not TASK_ID.fullmatch(task_id):
@@ -205,14 +307,17 @@ async def prepare(
         method = "slurm_submit" if chain[0] == "slurm" else "task_launch"
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
     job_dir = guard.confine_bound(run_id, args.job_dir)
-    cwd = _working_dir(guard, run_id, args.cwd)
+    cwd = _working_dir(guard, run_id, args.cwd, admitted.manifest)
+    await _check_python(
+        guard, admitted.manifest, task, cwd, run_id, python_version
+    )
     store = guard.const_store
     script = None
     if task["runtime"]["kind"] == "python_script":
         if args.script is None:
             raise PolicyRefusedError("A python_script task needs its script")
         script = await _verified(
-            guard.confine_bound(run_id, args.script),
+            guard.confine_bound(run_id, args.script, code_ok=True),
             store,
             task["runtime"]["script_sha256"],
             "script",
@@ -266,7 +371,9 @@ async def _bind(  # noqa: PLR0913, PLR0917
                     "safely"
                 )
             return str(guard.confine_param(run_id, binding.path))
-        path = guard.confine_bound(run_id, binding.path)
+        path = guard.confine_bound(
+            run_id, binding.path, code_ok=role == "constant"
+        )
         if role == "constant":
             expected = spec.get("sha256") if spec else None
             if expected is None:

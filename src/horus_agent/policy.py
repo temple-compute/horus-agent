@@ -73,6 +73,11 @@ class Policy:
     """The ``[jobs]`` table: which Unix user task commands run as."""
     read_roots: tuple[str, ...] = ()
     """Extra directories a path-valued run parameter may name."""
+    allow_code_suffixes: tuple[str, ...] = ()
+    """
+    Code suffixes (``.py``, ``.js``...) a run may hold although interpreters
+    load them on their own. Empty: none.
+    """
     source: str = "defaults"
     """The file it was read from, or ``defaults``."""
     extra: dict[str, Any] = field(default_factory=dict)
@@ -190,6 +195,15 @@ def load_policy(work_dir: str, api_url: str) -> Policy:
     return policy
 
 
+def configured_code_suffixes() -> tuple[str, ...]:
+    """``allow_code_suffixes`` of the policy file, empty when unreadable."""
+    try:
+        raw = tomllib.loads(policy_path().read_text())
+        return tuple(str(x) for x in raw.get("allow_code_suffixes") or ())
+    except (OSError, tomllib.TOMLDecodeError, AttributeError, TypeError):
+        return ()
+
+
 def same_user_problem(policy: Policy) -> str | None:
     """Why *policy* may not run: strict, with tasks as the agent's user."""
     if policy.jobs.run_as:
@@ -253,6 +267,21 @@ def _parse(  # noqa: PLR0912
         run_as_via=_typed(jobs.pop("run_as_via", "sudo"), str, "via", src),
         home=_typed(jobs.pop("home", ""), str, "home", src),
     )
+    if "allow_code_suffixes" in raw:
+        suffixes = tuple(
+            _typed(x, str, "allow_code_suffixes", src)
+            for x in _typed(
+                raw.pop("allow_code_suffixes"),
+                list,
+                "allow_code_suffixes",
+                src,
+            )
+        )
+        if not all(x.startswith(".") and len(x) > 1 for x in suffixes):
+            raise PolicyError(
+                f"{src}: allow_code_suffixes entries look like .py"
+            )
+        values["allow_code_suffixes"] = suffixes
     if "read_roots" in data:
         values["read_roots"] = tuple(
             str(Path(_typed(r, str, "read_roots", src)).resolve())

@@ -400,6 +400,24 @@ def _classify(
     return out
 
 
+def uses_python_code(text: str) -> bool:
+    """
+    Whether a command in *text* runs Python with ``-c`` or ``-m``, which
+    put the working directory on the module path before Python 3.11.
+    """
+    for part in re.split(r"[;&|()\n`]+", text):
+        rest = _command(part.split())
+        if isinstance(rest, str) or not rest:
+            continue
+        if _PYTHON.fullmatch(_base(rest[0])) and any(
+            w in ("-c", "-m") or (w[:2] in ("-c", "-m") and w[0] == "-")
+            for w in rest[1:]
+            if w.startswith("-") and not w.startswith("--")
+        ):
+            return True
+    return False
+
+
 def _pipes_into_code(skeleton: str) -> bool:
     """Whether a pipe feeds a shell or an interpreter its code."""
     for target in re.split(r"\|&?", skeleton)[1:]:

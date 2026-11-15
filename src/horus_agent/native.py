@@ -94,31 +94,51 @@ def pack(src: Path, pkg: Path) -> None:
 
 
 def _vet_tree(
-    tree: Path, refuse: Callable[[str], bool] | None, strip_exec: bool
-) -> None:
-    """Refuse a name *refuse* rejects; clear execute bits when asked."""
+    tree: Path,
+    refuse: Callable[[str, bool], str | None] | None,
+    strip_exec: bool,
+    trust: Callable[[Path], bool] | None,
+) -> bool:
+    """
+    Refuse a name *refuse* rejects, unless *trust* says the whole tree is
+    an approved one (then code names pass); clear execute bits when asked.
+    Whether that trust was needed.
+    """
+    names_seen: list[str] = []
     for root, dirs, names in os.walk(tree):
         if strip_exec:  # unpacked data is never executable
             for name in names:
                 file = Path(root, name)
                 if not file.is_symlink():
                     file.chmod(file.stat().st_mode & ~0o111)
-        if refuse and (bad := [n for n in dirs + names if refuse(n)]):
-            raise PolicyRefusedError(
-                f"The package holds {bad[0]!r}, a name tools read "
-                "settings or code from"
-            )
+        names_seen += dirs + names
+    if refuse is None:
+        return False
+    problems = [n for n in names_seen if refuse(n, False)]
+    if not problems:
+        return False
+    if trust is not None and trust(tree):
+        for name in names_seen:
+            if why := refuse(name, True):
+                raise PolicyRefusedError(
+                    f"The package cannot be unpacked: {why}"
+                )
+        return True
+    raise PolicyRefusedError(
+        f"The package cannot be unpacked: {refuse(problems[0], False)}"
+    )
 
 
 def unpack(  # noqa: PLR0913, PLR0917
     pkg: Path,
     dest: Path,
-    refuse: Callable[[str], bool] | None = None,
+    refuse: Callable[[str, bool], str | None] | None = None,
     max_bytes: int | None = None,
     max_files: int | None = None,
     sha: str | None = None,
     strip_exec: bool = False,
-) -> None:
+    trust: Callable[[Path], bool] | None = None,
+) -> bool:
     """
     Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
     ``..``, links leaving it and device files, and a package holding more
@@ -126,13 +146,15 @@ def unpack(  # noqa: PLR0913, PLR0917
     whole, and left alone when it already holds this package (sha256
     marker). With *sha* the caller already decided to extract (the
     package's digest when it checked it): the marker is not read again.
+    With *trust*, a tree it approves may hold code names; returns whether
+    that was needed.
     macOS ``.DS_Store`` and ``._*`` files are left out.
     """
     marker = dest.parent / f".{dest.name}.horus-sha256"
     if sha is None:
         sha = _sha256(pkg)
         if dest.is_dir() and marker.is_file() and read_text(marker) == sha:
-            return
+            return False
     tmp = dest.with_name(f"{dest.name}.horus-tmp{os.getpid()}")
     old = dest.with_name(f"{dest.name}.horus-old{os.getpid()}")
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -158,7 +180,7 @@ def unpack(  # noqa: PLR0913, PLR0917
                         "(max_unpack_bytes)"
                     )
             tar.extractall(tmp, members=members, filter="data")
-        _vet_tree(tmp, refuse, strip_exec)
+        trusted = _vet_tree(tmp, refuse, strip_exec, trust)
         if dest.exists() or dest.is_symlink():
             dest.rename(old)
         tmp.rename(dest)
@@ -167,6 +189,7 @@ def unpack(  # noqa: PLR0913, PLR0917
         shutil.rmtree(old, ignore_errors=True)
     with open_file(marker, "w") as out:
         out.write(f"{sha}\n")
+    return trusted
 
 
 def read_text(path: Path) -> str:

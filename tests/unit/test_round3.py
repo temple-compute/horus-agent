@@ -21,7 +21,7 @@ from horus_agent.manifest import ManifestError
 from horus_agent.policy import Approvals, Policy
 from horus_agent.protocol import PolicyRefusedError
 from tests.unit.test_guard import Env, env, refused
-from tests.unit.test_policy_hardening import launch_t, manifest, wait_exit
+from tests.unit.test_policy_hardening import launch_t, manifest
 
 __all__ = ["env"]
 
@@ -76,7 +76,7 @@ async def test_unpack_refuses_run_metadata_members(env: Env) -> None:
     pkg = env.run / "m.tgz"
     package(pkg, {".horus": b"x"})
     await refused(
-        env, "unpack", "name tools read", pkg=str(pkg), dest=str(env.run / "o")
+        env, "unpack", "run metadata", pkg=str(pkg), dest=str(env.run / "o")
     )
 
 
@@ -91,12 +91,11 @@ async def test_python_does_not_import_from_the_cwd(env: Env) -> None:
         "open('PWNED', 'w').write('x')\n"
     )
     (env.run / "in.json").write_text("{}")
-    await launch_t(
-        env, approved, env.run, "j", inp={"path": str(env.run / "in.json")}
-    )
-    await wait_exit(env.run / "j")
+    with pytest.raises(RuntimeError, match="holds settings or code"):
+        await launch_t(
+            env, approved, env.run, "j", inp={"path": str(env.run / "in.json")}
+        )
     assert not (env.run / "PWNED").exists()
-    assert (env.run / "j" / "exit_code").read_text().strip() == "0"
 
 
 def test_job_env_pins_interpreters() -> None:
