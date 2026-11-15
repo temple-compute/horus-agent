@@ -223,7 +223,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2024.2.2" },
-    { name = "horus-runtime", git = "https://github.com/temple-compute/horus-runtime?rev=8d97da16ca7af17b5e4317ae8309635b56634184" },
+    { name = "horus-runtime", specifier = ">=0.9.0,<0.11" },
     { name = "httpx", specifier = ">=0.28,<0.29" },
     { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pyyaml", specifier = ">=6,<7" },
@@ -244,8 +244,8 @@ dev = [
 
 [[package]]
 name = "horus-runtime"
-version = "0.9.0.post2.dev0+8d97da1"
-source = { git = "https://github.com/temple-compute/horus-runtime?rev=8d97da16ca7af17b5e4317ae8309635b56634184#8d97da16ca7af17b5e4317ae8309635b56634184" }
+version = "0.10.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "cloudpickle" },
@@ -254,6 +254,10 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "pyyaml" },
     { name = "rich" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/28/5f/fb6c3d188cd0ee7e0966be0bfad50015f1f2bbe7a1a500ca331fb783161f/horus_runtime-0.10.0.tar.gz", hash = "sha256:40219de4c32bc3dd352dddaa608dc7beef4d1ce3a6eeaac75282ec591744189e", size = 456486, upload-time = "2026-11-14T18:58:03.339Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/77/6e/a7de4adf32041cc0e3fcac35d810c395b63822712d0534c4c3bb624cb59b/horus_runtime-0.10.0-py3-none-any.whl", hash = "sha256:680a40a935425f1a23663f378a41e3cdff17c7ef32a100550c3e573c3da57eef", size = 368230, upload-time = "2026-11-14T18:58:01.855Z" },
 ]
 
 [[package]]

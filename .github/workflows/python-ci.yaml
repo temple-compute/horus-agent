@@ -87,7 +87,7 @@ jobs:
 
       - name: Import it with the oldest and newest released runtime
         run: |
-          for runtime in "horus-runtime==0.8.4" "horus-runtime<0.10"; do
+          for runtime in "horus-runtime==0.9.0" "horus-runtime<0.11"; do
             rm -rf /tmp/venv
             uv venv -q -p 3.13 /tmp/venv
             VIRTUAL_ENV=/tmp/venv uv pip install --no-sources dist/*.whl "$runtime"
