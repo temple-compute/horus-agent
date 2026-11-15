@@ -639,10 +639,13 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
         word = ""
 
     def push(kind: str) -> None:
+        nonlocal word
         parent, words, code = stack[-1]
         if parent in ("top", "$(", "`"):
             code = code or _code_reason(words, word) is not None
         stack.append((kind, [], code))
+        if kind in ("$(", "`"):
+            word = ""  # a substitution starts its own command
 
     while i < n:
         c = s[i]

@@ -235,7 +235,9 @@ def test_choice_options_come_from_the_workflow_input() -> None:
         "echo ${c} > ${out}",
         inputs=[{"id": "c", "kind": "choice", "options": ["a", "b"]}],
     )
-    assert approved.task("t")["inputs"]["c"]["options"] == ["a", "b"]
+    task = approved.task("t")
+    assert task is not None
+    assert task["inputs"]["c"]["options"] == ["a", "b"]
 
 
 # --- open mode --------------------------------------------------------------
@@ -271,3 +273,49 @@ async def test_a_value_may_not_name_an_environment_variable(env: Env) -> None:
     policy.approve(approved, "root")
     with pytest.raises(RuntimeError, match="environment variable"):
         await launch_t(env, approved, env.run, "j", n={"value": "TOKEN"})
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "perl -Ilib s.pl ${inp} > ${out}",
+        "perl -ne 'print' ${inp} > ${out}",
+        "Rscript --vanilla s.R ${inp} > ${out}",
+        "nextflow run main.nf -profile docker --in ${inp}",
+        "find . -name x -exec cat {} ; ; cat ${inp} > ${out}",
+        "nice -n 5 timeout 60 cat ${inp} > ${out}",
+        "conda run -n env python s.py ${inp} > ${out}",
+        "command -v ${inp} > ${out}",
+        "cat ${inp} | sort > ${out}",
+        "awk -F , '{print $1}' ${inp} > ${out}",
+        "R --vanilla -f s.R --args ${inp}",
+    ],
+)
+def test_more_ordinary_commands_are_approved(command: str) -> None:
+    manifest(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "perl -e ${inp}",
+        "perl -ne ${inp}",
+        "ruby -e${inp}",
+        "node -p ${inp}",
+        "make -f ${inp}",
+        "nextflow run ${inp}",
+        "find . -exec ${inp} {} +",
+        "timeout -s KILL 5 ${inp}",
+        "sudo -u x ${inp}",
+        "echo ${inp} | python3",
+        "xargs ${inp}",
+        "ssh host ${inp}",
+        "python3 - <<EOF\n${inp}\nEOF",
+        "cat <<-EOF\n${inp}\nEOF",
+        'echo "$(${inp})"',
+        "echo $(( ${inp} + 1 ))",
+    ],
+)
+def test_more_code_positions_are_refused(command: str) -> None:
+    with pytest.raises(ManifestError):
+        manifest(command)
