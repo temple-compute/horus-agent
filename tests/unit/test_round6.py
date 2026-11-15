@@ -6,6 +6,7 @@
 #
 """Regression tests for the sixth review round of the policy work."""
 
+import asyncio
 import base64
 import io
 import os
@@ -15,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from horus_agent import launch as launch_mod
 from horus_agent import native, policy
 from horus_agent.manifest import Manifest, file_digest
 from tests.unit.test_guard import Env, env, refused
@@ -221,4 +223,46 @@ async def test_sealed_paths_are_refused_while_the_task_runs(env: Env) -> None:
         await refused(env, method, "running task", release=release, **args)
     job = env.guard.job(env.run.name, env.run / "j")
     assert job is not None
+    await env.call("cancel_run", release=release)
+
+
+# --- M-A: nothing is staged between the last check and the start ------------
+
+
+async def test_code_staged_while_a_launch_checks_never_runs(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env.with_policy(allow_code_suffixes=(".py",))
+    real = launch_mod._seal
+
+    async def slow(*args: Any) -> None:
+        await asyncio.sleep(0.3)  # a launch busy verifying a large input
+        await real(*args)
+
+    monkeypatch.setattr(launch_mod, "_seal", slow)
+    approved = manifest("sleep 5", inputs=[], outputs=[])
+    policy.approve(approved, "root")
+    release = approved.release_hash
+    started = asyncio.create_task(
+        env.call(
+            "task_launch",
+            release=release,
+            task="t",
+            task_id="t",
+            job_dir=str(env.run / ".horus_job" / "j"),
+            cwd=str(env.run),
+            bindings={},
+            env={},
+        )
+    )
+    await asyncio.sleep(0.05)
+    with pytest.raises(RuntimeError, match="task of this run is running"):
+        await env.call(
+            "put_file",
+            release=release,
+            path=str(env.run / "json" / "__init__.py"),
+            data=b64(b"open('PWNED', 'w')\n"),
+        )
+    await started
+    assert not (env.run / "json").exists()
     await env.call("cancel_run", release=release)

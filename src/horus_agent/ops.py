@@ -19,6 +19,7 @@ import signal
 import tempfile
 import time
 from collections import OrderedDict
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,24 @@ from horus_agent.protocol import (
     b64d,
     b64e,
 )
+
+LOCKED = frozenset(
+    {
+        "put_file",
+        "fetch",
+        "unpack",
+        "pack",
+        "move",
+        "remove",
+        "mkdir",
+        "task_launch",
+        "slurm_submit",
+    }
+)
+"""
+Ops one run takes turns at: every write to its folders and each launch, so
+nothing is staged between a launch's last check and its job's start.
+"""
 
 RESULT_CACHE_SIZE = 1024
 """Answered ops remembered, so a redelivered op is answered, not rerun."""
@@ -196,6 +215,8 @@ class OpRunner:
         """
         self._local = LocalTarget()
         self._answered: OrderedDict[str, OpResult] = OrderedDict()
+        self._locks: dict[str, asyncio.Lock] = {}
+        """Per run: the lock of its writes and launches."""
         self._running: dict[str, asyncio.Task[OpResult]] = {}
         self._run_jobs: dict[str, dict[str, int]] = {}
         """Per run: job dir -> process group of each job launched here."""
@@ -336,19 +357,28 @@ class OpRunner:
         return result
 
     async def _run(self, op: Op) -> OpResult:
+        lock: contextlib.AbstractAsyncContextManager[Any] = (
+            self._locks.setdefault(op.run_id, asyncio.Lock())
+            if self.guard is not None and op.method in LOCKED and op.run_id
+            else contextlib.nullcontext()
+        )
         try:
-            admitted = None
-            if self.guard is not None:
-                admitted = await self._admit(self.guard, op)
-                op = op.model_copy(
-                    update={
-                        "args": {
-                            **op.args,
-                            **{k: str(v) for k, v in admitted.paths.items()},
+            async with lock:
+                admitted = None
+                if self.guard is not None:
+                    admitted = await self._admit(self.guard, op)
+                    op = op.model_copy(
+                        update={
+                            "args": {
+                                **op.args,
+                                **{
+                                    k: str(v)
+                                    for k, v in admitted.paths.items()
+                                },
+                            }
                         }
-                    }
-                )
-            result = await self._dispatch(op, admitted)
+                    )
+                result = await self._dispatch(op, admitted)
         except Exception as exc:  # reported to the caller
             return OpResult(
                 op_id=op.op_id,
@@ -495,7 +525,11 @@ class OpRunner:
                     native.unpack,
                     Path(args["pkg"]),
                     Path(args["dest"]),
-                    None if guard is None else guard.refused_member,
+                    None
+                    if guard is None
+                    else partial(
+                        guard.refused_member, running=guard.running(op.run_id)
+                    ),
                     None if guard is None else guard.policy.max_unpack_bytes,
                     None if guard is None else guard.policy.max_unpack_files,
                     None if admitted is None else admitted.unpack_sha,

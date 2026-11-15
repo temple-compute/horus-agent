@@ -636,11 +636,22 @@ class Guard:
         )
         return job
 
-    def refused_member(self, name: str, trusted: bool = False) -> str | None:
+    def running(self, run_id: str | None) -> bool:
+        """Whether a job of the run is running (or about to start)."""
+        record = self.run_record(run_id) or {}
+        return any(
+            job_running(Path(d), j)
+            for d, j in (record.get("jobs") or {}).items()
+        )
+
+    def refused_member(
+        self, name: str, trusted: bool = False, *, running: bool = False
+    ) -> str | None:
         """
         Why a strict agent does not unpack *name*: a tool config or code
         name, or run metadata (``.horus``, the agent's job and monitor
-        files).
+        files). While a job of the run *running*, not even a code name the
+        policy allows (an approved constant's, with *trusted*, is fine).
         """
         if not self.policy.strict:
             return None
@@ -651,6 +662,8 @@ class Guard:
             or name.endswith(".horus-sha256")
         ):
             return f"{name!r} is run metadata"
+        if running and not trusted and code_suffix(name) is not None:
+            return _running_message(name)
         return name_problem(
             name, self.policy.allow_code_suffixes, code_ok=trusted
         )
@@ -901,6 +914,16 @@ class Guard:
             self.check_name(path, code_ok=approved)
             if (
                 not approved
+                and self.policy.strict
+                and any(
+                    code_suffix(part)
+                    for part in path.relative_to(self.work_dir).parts
+                )
+                and self.running(run_id)
+            ):
+                raise PolicyRefusedError(_running_message(path.name))
+            if (
+                not approved
                 and how not in ("mkdir", "unpack")
                 and self.holds_shipped(path, manifest)
             ):
@@ -1063,6 +1086,13 @@ def name_problem(
             "cannot be staged in a run"
         )
     return None
+
+
+def _running_message(name: str) -> str:
+    return (
+        f"{name!r} is code that interpreters load on their own, and a task "
+        "of this run is running: it cannot be staged until the task ends"
+    )
 
 
 def _tool_message(name: str) -> str:

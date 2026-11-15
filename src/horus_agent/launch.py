@@ -104,16 +104,12 @@ def _template(task: dict[str, Any], script: Path | None) -> str:
     return f"{head} {runtime['args']}".rstrip()
 
 
-def _working_dir(
-    guard: Guard, run_id: str | None, raw: str, manifest: Manifest
-) -> Path:
+def _working_dir(guard: Guard, run_id: str | None, raw: str) -> Path:
     """
     The task's working directory, where the runtime runs a task and puts
     its relative outputs: confined to the run, reached through no link
     below the work dir, and a folder of the agent or of the task user
-    (created here when missing). Neither it nor any folder up to the run's
-    may hold a tool config name an op wrote. Scripts and constants run from
-    the agent's copies, and Python with ``-I`` imports nothing from it.
+    (created here when missing).
     """
     cwd = guard.confine_bound(run_id, raw)
     if cwd != guard.unlinked(raw):
@@ -127,6 +123,17 @@ def _working_dir(
             f"Working directory is not a folder the agent or its tasks "
             f"made: {raw}"
         )
+    return cwd
+
+
+def _scan(
+    guard: Guard, run_id: str | None, manifest: Manifest, cwd: Path
+) -> None:
+    """
+    Neither the working directory nor any folder up to the run's may hold a
+    tool config name or code an op wrote (and no file nobody declared, when
+    tasks run as another user). Done last, just before the task starts.
+    """
     root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
     allow = guard.policy.allow_code_suffixes
     if found := held_code(
@@ -150,7 +157,6 @@ def _working_dir(
                             f"{entry.path} is not an input, output, script or "
                             "task of the approved release, and an op wrote it"
                         )
-    return cwd
 
 
 SCAN_CAP = 200_000
@@ -364,9 +370,8 @@ async def prepare(
         method = "slurm_submit" if chain[0] == "slurm" else "task_launch"
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
     job_dir = guard.confine_bound(run_id, args.job_dir)
-    cwd = _working_dir(guard, run_id, args.cwd, admitted.manifest)
+    cwd = _working_dir(guard, run_id, args.cwd)
     await _seal(guard, run_id, admitted.manifest, cwd)
-    await _check_python(guard, admitted.manifest, cwd, run_id, python_version)
     store = guard.const_store
     script = None
     if task["runtime"]["kind"] == "python_script":
@@ -410,6 +415,10 @@ async def prepare(
             guard.note_made(run_id, Path(str(values[name])))  # an output
     command = render(template, values)
     env = {**args.env, **job_env(job_home(guard, job_dir))}
+    # Last, with the run's lock held: nothing can be staged between this
+    # check and the start of the job.
+    _scan(guard, run_id, admitted.manifest, cwd)
+    await _check_python(guard, admitted.manifest, cwd, run_id, python_version)
     return Prepared(command, env, cwd, job_dir, side, task)
 
 
