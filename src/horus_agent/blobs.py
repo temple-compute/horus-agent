@@ -56,6 +56,8 @@ def open_file(path: Path, mode: str = "rb") -> IO[Any]:
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise ValueError(f"Not a regular file: {path}")
+    if mode[0] != "r":  # what the cloud stages is never executable
+        os.fchmod(fd, stat.S_IMODE(os.fstat(fd).st_mode) & ~0o111)
     return os.fdopen(fd, mode)
 
 

@@ -18,7 +18,7 @@ from typing import Any, cast
 
 import pytest
 
-from horus_agent import cli, launch, policy
+from horus_agent import cli, launch, native, policy
 from horus_agent.manifest import (
     Manifest,
     ManifestError,
@@ -61,16 +61,14 @@ async def wait_exit(job: Path) -> None:
 @pytest.mark.parametrize(
     "command",
     [
-        'cat "${inp}" > ${out}',
         "sh -c 'cat ${inp}' > ${out}",
-        "cat ${inp} > ${out} <<EOF\n${inp}\nEOF",
+        "sh > ${out} <<EOF\ncat ${inp}\nEOF",
         "eval cat ${inp} > ${out}",
         "bash -c ${inp} > ${out}",
         "cat ${HOME:-${inp}} > ${out}",
         "echo $(( ${inp} )) > ${out}",
         "echo \\${inp} > ${out}",
         "cat '${inp} > ${out}",
-        'echo "${task.id}" ${inp} > ${out}',
     ],
 )
 def test_placeholders_outside_bare_words_are_refused(command: str) -> None:
@@ -86,6 +84,14 @@ def test_placeholders_outside_bare_words_are_refused(command: str) -> None:
         "basename $(dirname ${inp}) > ${out}",
         'printf "%s" "$HOME" ${inp} > ${out}',
         "cat `echo ${inp}` > ${out} # ${inp} in a comment",
+        'cat "${inp}" > ${out}',
+        "cat ${inp} > ${out} <<EOF\n${inp}\nEOF",
+        'echo "${task.id}" ${inp} > ${out}',
+        "cat > /tmp/x.sh <<NF\necho ${inp}\nNF\nsh /tmp/x.sh > ${out}",
+        "jq -r .x ${inp} > ${out}",
+        "snakemake --cores ${inp}",
+        "python3 script.py --in ${inp} > ${out}",
+        "Rscript script.R ${inp} ${out}",
     ],
 )
 def test_bare_placeholders_are_accepted(command: str) -> None:
@@ -346,6 +352,7 @@ async def test_planted_job_files_are_never_trusted(env: Env) -> None:
     assert (
         cast(Any, env.guard.job(RUN1, env.run / "job2"))["pid"] == first["pid"]
     )
+    native.pack(env.run / "job2", env.run / "p.tgz")
     await refused(
         env,
         "unpack",
@@ -642,8 +649,9 @@ async def test_open_agents_hand_back_only_their_own_spill_files(
         "a[${msg}]=1; echo > ${out}",
         "printf -v v ${msg}; echo > ${out}",
         "trap ${msg} EXIT; echo > ${out}",
-        "cat > ${out} <<EOF\n\tEOF\n${msg}\nEOF",
+        "sh > ${out} <<EOF\n\tEOF\n${msg}\nEOF",
         "cat > ${out} <<-EOF\n\t${msg}\n\tEOF",
+        "python3 -c ${msg} > ${out}",
         "echo ${msg} | sh > ${out}",
         "sh <<< ${msg} > ${out}",
         ". <(echo ${msg}); echo > ${out}",
@@ -795,7 +803,7 @@ async def test_jobs_get_a_clean_home_and_no_user_startup_files(
     assert seen["HOME"] == str(env.run / "j" / "home")
     assert (env.run / "j" / "home").is_dir()
     assert seen["R_PROFILE_USER"] == seen["R_ENVIRON_USER"] == os.devnull
-    assert seen["PYTHONNOUSERSITE"] == "1"
+    assert seen["PYTHONSAFEPATH"] == "1"
     assert not {"NODE_PATH", "BASH_ENV", "ENV"} & set(seen)
 
 

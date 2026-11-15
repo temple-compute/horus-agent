@@ -673,6 +673,7 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
                     )
                 else:
                     out.append((inside[kind], False))
+                i += 1
             elif c == "\\":
                 i += 2
                 continue

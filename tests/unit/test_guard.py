@@ -459,7 +459,7 @@ async def test_task_command_is_rendered_by_the_agent(env: Env) -> None:
     # Secrets reach the job through stdin, never a file or the command.
     assert prepared.env == {
         "GISAID_TOKEN": "tok",
-        **launch.job_env(Path(raw["job_dir"])),
+        **launch.job_env(launch.job_home(env.guard, Path(raw["job_dir"]))),
     }
     assert not (env.run / ".horus_job" / "j1" / "env").exists()
 

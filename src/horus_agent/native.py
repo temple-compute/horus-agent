@@ -93,6 +93,23 @@ def pack(src: Path, pkg: Path) -> None:
         tar.add(src, arcname=".", filter=_no_links)
 
 
+def _vet_tree(
+    tree: Path, refuse: Callable[[str], bool] | None, strip_exec: bool
+) -> None:
+    """Refuse a name *refuse* rejects; clear execute bits when asked."""
+    for root, dirs, names in os.walk(tree):
+        if strip_exec:  # unpacked data is never executable
+            for name in names:
+                file = Path(root, name)
+                if not file.is_symlink():
+                    file.chmod(file.stat().st_mode & ~0o111)
+        if refuse and (bad := [n for n in dirs + names if refuse(n)]):
+            raise PolicyRefusedError(
+                f"The package holds {bad[0]!r}, a name tools read "
+                "settings or code from"
+            )
+
+
 def unpack(  # noqa: PLR0913, PLR0917
     pkg: Path,
     dest: Path,
@@ -100,6 +117,7 @@ def unpack(  # noqa: PLR0913, PLR0917
     max_bytes: int | None = None,
     max_files: int | None = None,
     sha: str | None = None,
+    strip_exec: bool = False,
 ) -> None:
     """
     Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
@@ -140,12 +158,7 @@ def unpack(  # noqa: PLR0913, PLR0917
                         "(max_unpack_bytes)"
                     )
             tar.extractall(tmp, members=members, filter="data")
-        for _root, dirs, names in os.walk(tmp):
-            if refuse and (bad := [n for n in dirs + names if refuse(n)]):
-                raise PolicyRefusedError(
-                    f"The package holds {bad[0]!r}, a name tools read "
-                    "settings or code from"
-                )
+        _vet_tree(tmp, refuse, strip_exec)
         if dest.exists() or dest.is_symlink():
             dest.rename(old)
         tmp.rename(dest)

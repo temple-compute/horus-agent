@@ -34,6 +34,7 @@ import yaml
 
 from horus_agent.template import (
     CODE_POSITION,
+    embedded_placeholders,
     placeholders,
     unsafe_placeholders,
 )
@@ -415,6 +416,14 @@ class _Builder:
                     f"{where}: ${{{name}}} is {why}; use it as a plain "
                     "argument (the agent quotes every value)"
                 )
+        for template in templates:
+            for name in sorted(
+                embedded_placeholders(template, ids | {"task.id", "task.name"})
+            ):
+                self.warnings.append(
+                    f"{where}: values inserted into an embedded script "
+                    f"or quoted text: {name!r}"
+                )
         for name, item in sorted(inputs.items()):
             if item.get("role") == "param":
                 self.warnings.append(
@@ -453,16 +462,12 @@ class _Builder:
     ) -> dict[str, Any]:
         kind = str(artifact.get("kind", "file"))
         source = fed.get((task_id, artifact["id"]))
-        options = {}
-        if kind in ("choice", "multichoice"):
-            options["options"] = [
-                _option(o.get("value") if isinstance(o, dict) else o)
-                for o in artifact.get("options") or []
-            ]
+        options = self._options(kind, artifact)
         if source is not None and not source.startswith("artifact-"):
             return {"kind": kind, "role": "edge", **options}
         if source is not None:
             artifact = roots.get(source.removeprefix("artifact-"), artifact)
+            options = self._options(kind, artifact) or options
         if artifact.get("value") is not None:
             value = artifact["value"]
             rendered: str | list[str] = (
@@ -476,6 +481,25 @@ class _Builder:
             if digest is not None:
                 return {"kind": kind, "role": "constant", "sha256": digest}
         return {"kind": kind, "role": "param", **options}
+
+    @staticmethod
+    def _options(kind: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        """What a value input accepts besides its kind's plain forms."""
+        if kind in ("choice", "multichoice"):
+            return {
+                "options": [
+                    _option(o.get("value") if isinstance(o, dict) else o)
+                    for o in artifact.get("options") or []
+                ]
+            }
+        if kind == "boolean" and artifact.get("on") is not None:
+            return {
+                "options": [
+                    _option(o.get("value") if isinstance(o, dict) else o)
+                    for o in (artifact.get("on"), artifact.get("off"))
+                ]
+            }
+        return {}
 
     def _bundled(self, path: str) -> str | None:
         """Digest of the file or folder bundled at *path*, if any."""

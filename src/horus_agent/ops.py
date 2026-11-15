@@ -436,14 +436,25 @@ class OpRunner:
             case "task_launch" | "slurm_submit" if admitted is not None:
                 return await self._task_launch(op, admitted)
             case "slurm_status":
-                return await self._slurm_status(
+                status = await self._slurm_status(
                     self._slurm_id(op.run_id, args["job_dir"]),
                     Path(args["job_dir"]),
                 )
+                final = status.get("final")
+                if (
+                    guard is not None
+                    and final
+                    and final["state"] in (FINAL_STATES)
+                ):  # left the queue: it holds no run open
+                    guard.end_job(op.run_id, Path(args["job_dir"]))
+                return status
             case "slurm_cancel":
-                return await self._slurm_cancel(
+                await self._slurm_cancel(
                     self._slurm_id(op.run_id, args["job_dir"])
                 )
+                if guard is not None:
+                    guard.end_job(op.run_id, Path(args["job_dir"]))
+                return None
             case "read_output" if (
                 guard is not None and guard.policy.logs == "off"
             ):
@@ -474,6 +485,7 @@ class OpRunner:
                     None if guard is None else guard.policy.max_unpack_bytes,
                     None if guard is None else guard.policy.max_unpack_files,
                     None if admitted is None else admitted.unpack_sha,
+                    guard is not None and guard.policy.strict,
                 )
                 return None
             case "move":
@@ -831,6 +843,15 @@ class OpRunner:
             # Also the jobs launched before this agent restarted.
             if info.get("pgid") and guard_mod.job_running(Path(job_dir), info):
                 jobs.setdefault(job_dir, info["pgid"])
+        for job_dir, info in ((record or {}).get("jobs") or {}).items():
+            if info.get("slurm_job_id") and guard_mod.job_running(
+                Path(job_dir), info
+            ):
+                with contextlib.suppress(RuntimeError):
+                    await self._slurm_cancel(str(info["slurm_job_id"]))
+                    killed += 1
+                if guard is not None:
+                    guard.end_job(run_id, Path(job_dir))
         for job_dir, pgid in jobs.items():
             if (Path(job_dir) / "exit_code").exists():
                 log.debug(f"Cancel run {run_id}: {job_dir} already finished")
@@ -843,6 +864,22 @@ class OpRunner:
             if guard is not None:
                 guard.end_job(run_id, Path(job_dir))
         return killed
+
+
+FINAL_STATES = frozenset(
+    {
+        "COMPLETED",
+        "FAILED",
+        "CANCELLED",
+        "TIMEOUT",
+        "NODE_FAIL",
+        "PREEMPTED",
+        "OUT_OF_MEMORY",
+        "BOOT_FAIL",
+        "DEADLINE",
+    }
+)
+"""Slurm job states from which a job never runs again."""
 
 
 def _read(path: Path, offset: int = 0, length: int = -1) -> bytes:

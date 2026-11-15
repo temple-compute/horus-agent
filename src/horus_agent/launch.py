@@ -42,7 +42,7 @@ JOB_ID = re.compile(r"\d+(_\d+)?")
 
 SAFE_VALUE = re.compile(r"[A-Za-z0-9._,:=+@/-]*")
 """Characters a free text value chosen at run time may hold."""
-NUMBER = re.compile(r"-?[0-9]+(\.[0-9]+)?")
+NUMBER = re.compile(r"[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?")
 LIST_KINDS = frozenset({"list", "multichoice"})
 HOME_SUBDIR = "home"
 """Each approved job's own fresh home, inside its job dir."""
@@ -52,8 +52,16 @@ UNSET_ENV = (
     "BASH_ENV",
     "ENV",
     "PERL5OPT",
+    "PERL5LIB",
+    "PERLLIB",
     "PERL_USE_UNSAFE_INC",
     "RUBYOPT",
+    "RUBYLIB",
+    "JAVA_TOOL_OPTIONS",
+    "_JAVA_OPTIONS",
+    "JDK_JAVA_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
 )
 """Variables an approved job never sees."""
 TASK_ID = re.compile(r"[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*(\[\d+\])?")
@@ -293,7 +301,15 @@ def check_value(
         if kind == "number":
             ok = bool(NUMBER.fullmatch(item))
         elif kind == "boolean":
-            ok = item in ("true", "false")
+            ok = item in (
+                "true",
+                "false",
+                "1",
+                "0",
+                "on",
+                "off",
+                *(spec.get("options") or ()),
+            )
         elif kind in ("choice", "multichoice"):
             ok = item in (spec.get("options") or ())
         else:

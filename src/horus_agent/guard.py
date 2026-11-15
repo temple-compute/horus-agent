@@ -137,11 +137,25 @@ class Guard:
         self.state = self.work_dir / STATE_DIR
         # Jobs share the work dir's group: they may pass through the state
         # dir to the verified copies, never list or change it.
+        fresh = not self.work_dir.exists()
         self.work_dir.mkdir(parents=True, exist_ok=True)
+        if fresh:  # a folder made here is sticky, whatever the umask gave it
+            self.work_dir.chmod(self.work_dir.stat().st_mode | stat.S_ISVTX)
+        top = self.work_dir.stat().st_mode
+        if (
+            policy.strict
+            and top & (stat.S_IWGRP | stat.S_IWOTH)
+            and not top & stat.S_ISVTX
+        ):
+            raise PolicyRefusedError(
+                f"{self.work_dir} is writable by others without the sticky "
+                "bit: a job could rename the agent's state folder "
+                "(chmod 3770)"
+            )
         for folder, mode in (
             (self.state, 0o711),
             (self.state / "runs", 0o700),
-            (self.const_store, 0o750),
+            (self.const_store, 0o2750),
         ):
             folder.mkdir(mode=mode, exist_ok=True)
             info = folder.lstat()
@@ -150,6 +164,9 @@ class Guard:
                 raise PolicyRefusedError(
                     f"{folder} must be the agent's folder"
                 )
+            if folder == self.const_store:  # readable by the task user's group
+                with contextlib.suppress(PermissionError):
+                    os.chown(folder, -1, self.work_dir.stat().st_gid)
             folder.chmod(mode)
         self.spilled: set[str] = set()
         """Spill files this agent wrote, the only ones it hands back."""
