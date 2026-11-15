@@ -87,7 +87,7 @@ def test_placeholders_outside_bare_words_are_refused(command: str) -> None:
         'cat "${inp}" > ${out}',
         "cat ${inp} > ${out} <<EOF\n${inp}\nEOF",
         'echo "${task.id}" ${inp} > ${out}',
-        "cat > /tmp/x.sh <<NF\necho ${inp}\nNF\nsh /tmp/x.sh > ${out}",
+        "cat > /tmp/x.sh <<NF\necho hi\nNF\nsh /tmp/x.sh ${inp} > ${out}",
         "jq -r .x ${inp} > ${out}",
         "snakemake --cores ${inp}",
         "python3 script.py --in ${inp} > ${out}",

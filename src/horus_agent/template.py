@@ -63,10 +63,10 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
     **dict.fromkeys(
         _SHELLS.split(),
         (
-            "-o +o -O +O --rcfile --init-file",
+            "-o +o -O +O",
             "-e -u -x -v -l -i -s -n -f -a -h -m -B -C -E -H -P -T -p "
             "--login --norc --noprofile --posix --restricted --verbose",
-            "",
+            "--rcfile --init-file",
             "-c",
             "first",
         ),
@@ -135,6 +135,24 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
         "first",
     ),
     "tclsh": ("", "", "", "", "first"),
+    "java": (
+        "--add-modules --add-opens --add-exports -D -X",
+        "-server -client -ea -da -esa -dsa -verbose",
+        "-jar -cp -classpath --class-path -p --module-path -m --module",
+        "",
+        "first",
+    ),
+    **dict.fromkeys(
+        ("jupyter", "papermill"),
+        (
+            "--to --output --output-dir --template --kernel -k -p -y -f "
+            "--parameters_file --log-level",
+            "--no-input --stdout --inplace --log-output --progress-bar",
+            "",
+            "",
+            "all",
+        ),
+    ),
     **dict.fromkeys(
         ("awk", "gawk", "mawk", "nawk"),
         (
@@ -180,6 +198,66 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
     ),
 }
 """Interpreters and tools whose arguments can be code, and how to read them."""
+_CODE_OPTIONS: dict[str, tuple[str, ...]] = {
+    # program: options whose value is a command, a script or a library that
+    # the program then runs or loads. One table for every tool.
+    "git": (
+        "-c",
+        "--exec",
+        "--exec-path",
+        "--upload-pack",
+        "--receive-pack",
+        "-u",
+        "--config-env",
+    ),
+    "tar": (
+        "--to-command",
+        "--checkpoint-action",
+        "--use-compress-program",
+        "-I",
+        "--info-script",
+        "-F",
+        "--new-volume-script",
+        "--rmt-command",
+        "--rsh-command",
+    ),
+    "rsync": ("-e", "--rsh", "--rsync-path"),
+    **dict.fromkeys(("scp", "sftp", "ssh-keygen"), ("-o", "-S", "-F", "-D")),
+    "sort": ("--compress-program",),
+    "wget": ("-e", "--execute"),
+    "curl": ("-K", "--config"),
+    "pandoc": ("--filter", "-F", "--lua-filter", "-L"),
+    "zip": ("-TT",),
+    "java": (
+        "-javaagent:",
+        "-agentpath:",
+        "-agentlib:",
+        "-Xbootclasspath",
+    ),
+}
+_EVERYWHERE = frozenset({"eval", "ssh", "su", "xargs", "parallel", "watch"})
+"""Commands that make every placeholder of a template untrustworthy."""
+_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+_SCRIPT_AFTER_CODE = frozenset({"lua"})
+"""Programs whose script still follows an ``-e`` of code."""
+_ASSIGNERS = frozenset({"export", "declare", "typeset", "readonly", "local"})
+_ASSIGNMENT = "in a variable assignment"
+_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=")
+_OPERATOR = re.compile(r"(?:\d*(?:>>|>\||>&|>|<&|<>|<)|&>>|&>)")
+_INTERPRETERS = "|".join(
+    [
+        *(re.escape(k) for k, v in _PROGRAMS.items() if v[4] == "first"),
+        r"python[0-9.]*",
+        r"pypy[0-9.]*",
+    ]
+)
+_DYNAMIC_ARG = re.compile(
+    rf"(?<![\w./-])(?:{_INTERPRETERS})(?:[ \t]+-[^ \t;&|]*)*[ \t]+[\"']?"
+    r"\$[A-Za-z_{(@*0-9]"
+)
+_AWK_RUNS = re.compile(
+    r"system[ \t]*\(|\|[ \t]*getline|\|&|print[^;\n]*\|[ \t]*\""
+)
 _PYTHON = re.compile(r"python[0-9.]*|pypy[0-9.]*")
 _SLURM_MPI = (
     "-n -N -c -p -t -J -A -x -w -G -np -H --np --ntasks --nodes "
@@ -382,15 +460,11 @@ def _classify(
     skeleton += text[last:]
     if not found:
         return {}
-    if "<<-" in skeleton:
-        return dict.fromkeys(
-            found, ("in a template with a <<- heredoc", False)
-        )
-    if _pipes_into_code(skeleton):
-        return dict.fromkeys(
-            found, ("in a template that pipes into a shell", False)
-        )
-    marks = _scan(skeleton)
+    if why := _whole_reason(skeleton):
+        return dict.fromkeys(found, (why, False))
+    marks, whole = _scan(skeleton)
+    if whole:
+        return dict.fromkeys(found, (whole, False))
     if len(marks) != len(found):
         return dict.fromkeys(found, ("its quoting cannot be followed", False))
     out: dict[str, tuple[str | None, bool]] = {}
@@ -398,6 +472,23 @@ def _classify(
         old_reason, old_embedded = out.get(name, (None, False))
         out[name] = (old_reason or reason, old_embedded or embedded)
     return out
+
+
+def _whole_reason(skeleton: str) -> str | None:
+    """Why no placeholder of a template can be trusted, from its text."""
+    if "<<-" in skeleton:
+        return "in a template with a <<- heredoc"
+    if "$'" in skeleton:
+        return "in a template with $'...' quoting"
+    if _DYNAMIC_ARG.search(skeleton.replace("\\\n", " ")):
+        return "in a template that runs a script named by a variable"
+    if _pipes_into_code(skeleton):
+        return "in a template that pipes into a shell"
+    if re.search(r"\bawk\b|\bgawk\b|\bmawk\b", skeleton) and _AWK_RUNS.search(
+        skeleton
+    ):
+        return "in a template with an awk program that runs commands"
+    return None
 
 
 def uses_python_code(text: str) -> bool:
@@ -418,10 +509,27 @@ def uses_python_code(text: str) -> bool:
     return False
 
 
+def _strip_redirects(words: list[str]) -> list[str]:
+    """*words* without redirection operators and their targets."""
+    out: list[str] = []
+    skip = False
+    for word in words:
+        match = _OPERATOR.match(word)
+        if skip:
+            skip = False
+        elif match:
+            skip = match.end() == len(word)
+        else:
+            out.append(word)
+    return out
+
+
 def _pipes_into_code(skeleton: str) -> bool:
     """Whether a pipe feeds a shell or an interpreter its code."""
     for target in re.split(r"\|&?", skeleton)[1:]:
-        words = re.split(r"[;&|)\n]", target, maxsplit=1)[0].split()
+        words = _strip_redirects(
+            re.split(r"[;&|)\n]", target, maxsplit=1)[0].split()
+        )
         if words and _reads_stdin_code(words):
             return True
     return False
@@ -465,6 +573,8 @@ def _command(words: list[str]) -> list[str] | str:
             if key in code.split():
                 return "in a command that runs it as code"
             if key in takes.split() and "=" not in option:
+                if not rest:
+                    return ["-"]  # the next word is this option's value
                 rest = rest[1:]
             elif not (
                 key in takes.split()
@@ -491,13 +601,17 @@ def _read_args(  # noqa: PLR0912
     takes_l, flags_l, code_l = takes.split(), flags.split(), code_opts.split()
     expect = "positional"
     positionals = 0
-    code_given = unknown = False
+    code_given = unknown = ended = False
     for word in args:
         if expect in ("code", "data"):
             expect = "positional"
             continue
+        if word == "--" and not ended:
+            ended = True  # no more options, and not a positional itself
+            continue
         if (
-            word.startswith(("-", "+"))
+            not ended
+            and word.startswith(("-", "+"))
             and word not in ("-", "--")
             and (positionals == 0 or _kind in ("data", "all", "run"))
         ):
@@ -539,18 +653,15 @@ def _program_reason(rest: list[str], word: str) -> str | None:  # noqa: PLR0911
     """Why a placeholder in the arguments *rest* of a program is code."""
     program = _base(rest[0])
     if program == "find":
-        for marker in ("-exec", "-execdir", "-ok", "-okdir"):
-            if marker in rest:
-                after = rest[rest.index(marker) + 1 :]
-                return _code_reason(after, word) if ";" not in after else None
-        return None
+        return None  # -exec anywhere refuses the whole template
     spec = _spec(program)
     if spec is None:
         return None
     kind = spec[4]
-    args = [w for w in rest[1:] if not _REDIRECT.match(w)]
+    args = rest[1:]
     expect, positionals, code_given, unknown = _read_args(spec, args)
-    if word:  # attached: --in=${x}, -e${x}
+    if word.startswith("-") and "--" not in args:
+        # attached to an option: --in=${x}, -e${x}
         key = word.split("=", 1)[0] if "=" in word else word[:2]
         return CODE_POSITION if key in spec[2].split() else None
     if expect == "code":
@@ -568,8 +679,10 @@ def _program_reason(rest: list[str], word: str) -> str | None:  # noqa: PLR0911
     if kind == "first" and not code_given:
         if positionals == 0 or (unknown and positionals == 1):
             return CODE_POSITION
-    if kind == "first" and spec[3] and code_given and positionals == 0:
-        return CODE_POSITION  # sh -c ${x}
+    if kind == "first" and spec[3] and code_given:
+        return CODE_POSITION  # sh -c ${x}, sh -c 'true' ${x}
+    if program in _SCRIPT_AFTER_CODE and positionals == 0:
+        return CODE_POSITION  # lua -e 1 ${x}
     return None
 
 
@@ -581,7 +694,7 @@ def _reads_stdin_code(words: list[str]) -> bool:
     spec = _spec(_base(rest[0]))
     if spec is None or spec[4] == "all":
         return False
-    args = [w for w in rest[1:] if not _REDIRECT.match(w)]
+    args = rest[1:]
     _e, positionals, code_given, _u = _read_args(spec, args)
     if code_given:
         return False
@@ -604,6 +717,8 @@ def _code_reason(  # noqa: PLR0911
         return "in a command that runs it as code"
     if _in_test(words):
         return "inside [[ ]]"
+    if _EXEC_FLAGS.intersection(words):
+        return "in a find -exec command"
     if any(b in _ARITH_DECL for b in bases) and any(
         w.startswith("-") for w in words
     ):
@@ -613,9 +728,30 @@ def _code_reason(  # noqa: PLR0911
     rest = _command(words)
     if isinstance(rest, str):
         return rest
+    if why := _assign_reason(words, word):
+        return why
     if not rest:
-        return CODE_POSITION if not word else None
+        return CODE_POSITION
+    program = _base(rest[0])
+    options = _CODE_OPTIONS.get(program, ())
+    if options and (
+        (rest[1:] and rest[-1] in options)
+        or (word.startswith("-") and word.startswith(options))
+    ):
+        return f"in an option of {program} that runs what it is given"
     return _program_reason(rest, word)
+
+
+def _assign_reason(words: list[str], word: str) -> str | None:
+    """Why a placeholder in *word* sets a shell or environment variable."""
+    rest = _command(words)
+    if isinstance(rest, str):
+        return None
+    if (
+        _ASSIGN.match(word) and (not rest or _base(rest[0]) in _ASSIGNERS)
+    ) or (rest and _base(rest[0]) in _ASSIGNERS):
+        return _ASSIGNMENT
+    return None
 
 
 def _in_test(words: list[str]) -> bool:
@@ -626,19 +762,29 @@ def _in_test(words: list[str]) -> bool:
     return "]]" not in words[last:]
 
 
-def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
+def _scan(  # noqa: PLR0912, PLR0915
+    s: str,
+) -> tuple[list[tuple[str | None, bool]], str | None]:
     """
     Walk shell text where each placeholder is a NUL and say, for each in
     order, why its spot runs it as code (``None``: it does not), and
-    whether it sits in quoted text or a heredoc. An unbalanced quote or
-    substitution gives an empty list.
+    whether it sits in quoted text or a heredoc; and, when the text as a
+    whole cannot be trusted, why. An unbalanced quote or substitution gives
+    an empty list.
     """
     out: list[tuple[str | None, bool]] = []
     # Each frame: (kind, words of the current command in it, runs as code)
     stack: list[tuple[str, list[str], bool]] = [("top", [], False)]
     word = ""
-    heredocs: list[tuple[str, bool]] = []
+    heredocs: list[tuple[str, bool, bool, list[str], int]] = []
     herestring = False
+    skip = ""  # a redirection operator whose target is the next word
+    targets: list[str] = []  # files the current command writes
+    started = 0  # len(out) when the current command began
+    generated: list[tuple[str, int, int]] = []  # file, first mark, end
+    bodies: list[tuple[list[str], int, str]] = []  # files, first mark, text
+    ran: set[str] = set()  # words given to a program or an interpreter
+    whole: list[str] = []
     closers = {"${": "}", "$((": "))", "((": "))", "$[": "]"}
     inside = {
         "${": "inside a ${...} expansion",
@@ -650,20 +796,66 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
     n = len(s)
 
     def end_word() -> None:
-        nonlocal word, herestring
-        if word:
-            stack[-1][1].append(word)
-            herestring = False
+        nonlocal word, herestring, skip
+        if not word:
+            return
+        herestring = False
+        words = stack[-1][1]
+        match = None if _in_test(words) else _OPERATOR.match(word)
+        if skip:
+            if (
+                ">" in skip
+                and word[:1] not in "&-0123456789"
+                and _SENTINEL not in word
+            ):
+                targets.append(word)
+            skip = ""
+        elif match:
+            if match.end() == len(word):
+                skip = word
+            elif (
+                ">" in match.group(0)
+                and word[match.end() :][:1] not in "&-0123456789"
+                and _SENTINEL not in word
+            ):
+                targets.append(word[match.end() :])
+        else:
+            words.append(word)
+            if _base(word) in _EVERYWHERE:
+                whole.append(f"in a template that runs {word}")
         word = ""
+
+    def new_command() -> None:
+        nonlocal skip, started
+        words = stack[-1][1]
+        if (rest := _command(words)) and not isinstance(rest, str):
+            if _spec(_base(rest[0])) is not None:
+                ran.update(_base(w) for w in rest[1:] if w[:1] != "-")
+            ran.add(_base(rest[0]))
+        if targets and len(out) > started:
+            generated.extend((t, started, len(out)) for t in targets)
+        targets.clear()
+        words.clear()
+        skip = ""
+        started = len(out)
 
     def push(kind: str) -> None:
         nonlocal word
         parent, words, code = stack[-1]
         if parent in ("top", "$(", "`"):
-            code = code or _code_reason(words, word) is not None
+            why = _code_reason(words, word)
+            code = code or (why is not None and why != _ASSIGNMENT)
         stack.append((kind, [], code))
         if kind in ("$(", "`"):
             word = ""  # a substitution starts its own command
+
+    def quoted_reason(code: bool) -> str | None:
+        if code:
+            return "inside text a command runs as code"
+        parent = stack[-2]
+        if parent[0] in ("top", "$(", "`"):
+            return _assign_reason(parent[1], word)
+        return None
 
     while i < n:
         c = s[i]
@@ -672,26 +864,14 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
             if c == "'":
                 stack.pop()
             elif c == _SENTINEL:
-                out.append(
-                    (
-                        "inside text a command runs as code" if code else None,
-                        True,
-                    )
-                )
+                out.append((quoted_reason(code), True))
             i += 1
             continue
         if kind == '"' or kind in closers:
             close = '"' if kind == '"' else closers[kind]
             if c == _SENTINEL:
                 if kind == '"':
-                    out.append(
-                        (
-                            "inside text a command runs as code"
-                            if code
-                            else None,
-                            True,
-                        )
-                    )
+                    out.append((quoted_reason(code), True))
                 else:
                     out.append((inside[kind], False))
                 i += 1
@@ -719,10 +899,21 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
                 out.append(("in a here-string", False))
             elif code:
                 out.append(("in output a command runs as code", False))
+            elif skip or _OPERATOR.fullmatch(word):
+                # a redirection target; a shell reads its code from `<`
+                op = skip or word
+                reads = "<" in op and ">" not in op
+                why = None
+                if reads and _reads_stdin_code(list(words)):
+                    why = "in input a shell or interpreter reads as code"
+                out.append((why, False))
             else:
                 out.append((_code_reason(words, word), False))
-            word += "x"
+            word += _SENTINEL
             i += 1
+            continue
+        if s.startswith("\\\n", i):  # a line continuation
+            i += 2
             continue
         if c == "\\":
             word += s[i : i + 2]
@@ -734,6 +925,15 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
                     out.append((None, False))  # a comment
                 i += 1
             continue
+        if (
+            (c in "$`"
+            and not _ASSIGN.match(word))
+            or (not word and c in "'\"" and s[i + 1 : i + 2] == "$")
+        ):
+            if _command(words) == []:
+                whole.append(
+                    "in a template that runs a command named by a variable"
+                )
         if c in "'\"":
             push(c)
             word += "q"
@@ -760,6 +960,7 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
             c == "`" and kind == "`"
         ):
             end_word()
+            new_command()
             stack.pop()
             word = "x"
             i += 1
@@ -772,18 +973,30 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
         if heredoc := _HEREDOC.match(s, i):
             end_word()
             heredocs.append(
-                (heredoc.group(3), code or _reads_stdin_code(list(words)))
+                (
+                    heredoc.group(3),
+                    code or _reads_stdin_code(list(words)),
+                    not heredoc.group(2),
+                    list(targets),
+                    started,
+                )
             )
             i = heredoc.end()
             continue
         if c == "\n" and heredocs:
             end_word()
-            words.clear()
             i += 1
-            for delim, feeds_code in heredocs:
+            for delim, feeds_code, expands, files, first in heredocs:
+                body: list[str] = []
+                body_start = len(out)
                 while i < n:
                     eol = s.find("\n", i)
                     line = s[i : n if eol < 0 else eol]
+                    if expands and ("$(" in line or "`" in line):
+                        whole.append(
+                            "in a template with a command substitution in a "
+                            "heredoc"
+                        )
                     out.extend(
                         (
                             "inside a heredoc a shell or interpreter runs"
@@ -796,11 +1009,17 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
                     i = n if eol < 0 else eol + 1
                     if line == delim:
                         break
+                    body.append(line)
                 else:
-                    return []
+                    return [], None
+                generated.extend((t, first, body_start) for t in files)
+                bodies.append((files, body_start, "\n".join(body)))
             heredocs.clear()
+            new_command()
             continue
-        if c in " \t":
+        if c == "&" and (word.endswith((">", "<")) or s.startswith("&>", i)):
+            word += c  # 2>&1, >&2, &>file: part of a redirection
+        elif c in " \t":
             end_word()
         elif c in ";&|\n(){}":
             end_word()
@@ -808,10 +1027,35 @@ def _scan(s: str) -> list[tuple[str | None, bool]]:  # noqa: PLR0912, PLR0915
                 words.append(c)  # [[ ... && ... ]] is still one test
             else:
                 herestring = False
-                words.clear()
+                new_command()
         else:
             word += c
         i += 1
+    end_word()
+    new_command()
     if len(stack) != 1 or heredocs:
-        return []
-    return out
+        return [], None
+    for target, first, end in generated:
+        if _base(target) in ran or target in ran:
+            for k in range(first, end):
+                if out[k][0] is None:
+                    out[k] = (
+                        "in a script the template writes and then runs",
+                        out[k][1],
+                    )
+    for files, first, text in bodies:
+        if not any(_base(t) in ran or t in ran for t in files):
+            continue
+        # The heredoc is a script the template runs: read it as shell text.
+        count = text.count(_SENTINEL)
+        inner, bad = (
+            _scan(text + "\n") if _whole_reason(text) is None else ([], "x")
+        )
+        for k in range(count):
+            reason = (
+                "in a script the template writes and then runs"
+                if bad or len(inner) != count
+                else inner[k][0]
+            )
+            out[first + k] = (reason, True)
+    return out, whole[0] if whole else None

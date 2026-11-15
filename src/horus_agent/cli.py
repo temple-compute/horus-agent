@@ -25,7 +25,7 @@ from urllib.parse import quote
 import httpx
 from horus_runtime.logging import horus_logger
 
-from horus_agent import config, logs, ops, policy
+from horus_agent import config, dryrun, logs, ops, policy
 from horus_agent.daemon import (
     Agent,
     AgentUnauthorizedError,
@@ -327,7 +327,22 @@ def _python_problem(manifest: Manifest) -> str | None:
     )
 
 
+def _dry_run(directory: str) -> int:
+    """Say which tasks under *directory* ``approve`` would accept."""
+    folder = Path(directory)
+    if not folder.is_dir():
+        sys.stderr.write(f"{directory} is not a folder.\n")
+        return 1
+    result = dryrun.dry_run(folder)
+    sys.stdout.write(result.summary())
+    for where, message in result.refusals:
+        sys.stdout.write(f"  {_safe(where)}: {_safe(message)}\n")
+    return 0
+
+
 def _approve(args: argparse.Namespace) -> int:  # noqa: PLR0911
+    if args.dry_run:
+        return _dry_run(args.release)
     if os.geteuid() not in config.POLICY_OWNERS:
         sys.stderr.write("Only root can approve releases (use sudo).\n")
         return 1
@@ -490,7 +505,15 @@ def main(argv: list[str] | None = None) -> int:  # noqa: PLR0911
     approve = commands.add_parser(
         "approve", help="Approve a workflow release on this machine (root)."
     )
-    approve.add_argument("release", help="Release id or archive file.")
+    approve.add_argument(
+        "release",
+        help="Release id or archive file (with --dry-run: a folder).",
+    )
+    approve.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Check every task of the workflows under a folder; approve none.",
+    )
     approve.add_argument("--expect-hash", help="Refuse any other hash.")
     approve.add_argument(
         "--yes", action="store_true", help="Do not ask for confirmation."

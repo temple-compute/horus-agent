@@ -43,6 +43,8 @@ from horus_agent.template import (
 SCHEMA = 1
 WORKFLOW_MEMBER = "workflow.yaml"
 MAX_ARCHIVE_BYTES = 2 * 1024**3
+MAX_TEMPLATE_CHARS = 64 * 1024
+MAX_PLACEHOLDERS = 1000
 """Largest uncompressed release the builder reads."""
 
 VALUE_KINDS = frozenset(
@@ -452,13 +454,11 @@ class _Builder:
                     "(checked against its kind); read the command for what "
                     "it does with it"
                 )
-            elif item.get("role") == "edge" and (
-                item["kind"] in VALUE_KINDS or item["kind"] == "item"
-            ):
+            elif item.get("role") == "edge":
                 self.warnings.append(
-                    f"{where}: {name!r} is a value chosen at run time "
-                    "(checked against its kind); read the command for what "
-                    "it does with it"
+                    f"{where}: {name!r} is a path or value chosen at run "
+                    "time; the command may read, run or load it, so read "
+                    "the command for what it does with it"
                 )
         for name in sorted(task.get("secrets") or {}):
             self.warnings.append(
@@ -579,6 +579,13 @@ class _Builder:
 
     @staticmethod
     def _check_placeholders(where: str, template: str, ids: set[str]) -> None:
+        if len(template) > MAX_TEMPLATE_CHARS or (
+            template.count("$") > MAX_PLACEHOLDERS
+        ):
+            raise ManifestError(
+                f"{where}: a command over {MAX_TEMPLATE_CHARS} characters or "
+                f"{MAX_PLACEHOLDERS} placeholders cannot be checked"
+            )
         for name in placeholders(template):
             root, _dot, attr = name.partition(".")
             if root == "task":

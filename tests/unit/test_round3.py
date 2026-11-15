@@ -125,7 +125,7 @@ def test_job_env_pins_interpreters() -> None:
         "jq -r .x ${inp} > ${out}",
         "snakemake --cores ${inp}",
         "python3 s.py -c ${inp} -p ${inp} -r ${out}",
-        "cat > /tmp/x.sh <<NF\necho ${inp}\nNF\nsh /tmp/x.sh > ${out}",
+        "cat > /tmp/x.sh <<NF\necho hi\nNF\nsh /tmp/x.sh ${inp} > ${out}",
         "srun --mem=4G bwa mem ${inp} > ${out}",
         "mpirun -x OMP_NUM_THREADS=4 -np 4 prog ${inp}",
         "sed -e s/a/b/ ${inp} > ${out}",
@@ -265,7 +265,7 @@ _ = os
 
 async def test_a_value_may_not_name_an_environment_variable(env: Env) -> None:
     approved = manifest(
-        "t=${n}; [[ $t -gt 1 ]]; echo > ${out}",
+        "echo ${n} > ${out}",
         inputs=[{"id": "n", "kind": "string"}],
         secrets={"TOKEN": "x"},
     )
