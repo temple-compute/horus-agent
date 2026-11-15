@@ -8,7 +8,7 @@ The target, kind `agent`, works like the SSH target. Each channel primitive (`la
 
 - executors (shell, containers, Python environments);
 - Slurm with `inner: {kind: agent, ...}`;
-- the resource monitor;
+- the resource monitor, on open agents (see below);
 - transfers.
 
 ## Install and register
@@ -177,7 +177,6 @@ allowed_hosts = ["api.example.com", "bucket.s3.eu-north-1.amazonaws.com"]   # br
 uploads = false                 # only run metadata leaves the machine
 logs = "off"                    # task output stays on the machine
 downloads = true
-resource_usage = true           # CPU and RAM samples for the run's charts
 max_put_bytes = 4194304
 max_fetch_bytes = 53687091200
 max_unpack_bytes = 53687091200   # what one unpack may extract
@@ -200,7 +199,7 @@ read_roots = ["/data/sequencing"]   # extra dirs a path parameter may name
 | `work_dir` | the registered work dir |
 | `allowed_hosts` | the broker URL's host |
 | `uploads` / `logs` | `false` / `off` |
-| `downloads` / `resource_usage` | `true` / `true` |
+| `downloads` | `true` |
 
 The agent refuses to start if the policy file, `/etc/horus-agent/approved/` or a parent directory is not owned by root or can be written by group or others.
 
@@ -236,13 +235,17 @@ Residual risk: a value chosen at run time cannot break out of quotes or a heredo
 - For Slurm the agent writes the batch script from the approved Slurm options and runs `sbatch`, `squeue`, `sacct` and `scancel` itself.
 - File plumbing (hashing, packing and unpacking folders, moves, sizes) has native ops in the agent (`digest`, `pack`, `unpack`, `move`, `stat`) instead of shell commands; `AgentTarget` implements the runtime's file hooks with them: `path_digest`, `pack_folder`, `unpack_folder`, `move_file` and `file_size`. Archives are unpacked without absolute paths, `..`, links out or device files.
 - Job pids and Slurm job ids come from the agent's own records, never from files in the run's directory, and each job gets a job dir the agent creates.
-- With `uploads = false`, only metadata the agent or the orchestrator wrote (pid and exit code of a job, resource samples, the runtime's `.horus/*.json`) can be read back; no op may write data under those names. `digest` is answered only for files this run staged or its tasks produced (and for paths that do not exist), so it cannot be used to test a guess against other files; it still tells whether a file the run holds equals a given content, as the runtime needs for incremental runs. With `logs = "off"`, job logs stay on the machine whatever `uploads` says. A strict agent has no spill folder; an open agent hands back only the spill files it wrote itself.
+- With `uploads = false`, only metadata the agent or the orchestrator wrote (pid and exit code of a job, the runtime's `.horus/*.json`) can be read back; no op may write data under those names. `digest` is answered only for files this run staged or its tasks produced (and for paths that do not exist), so it cannot be used to test a guess against other files; it still tells whether a file the run holds equals a given content, as the runtime needs for incremental runs. With `logs = "off"`, job logs stay on the machine whatever `uploads` says. A strict agent has no spill folder; an open agent hands back only the spill files it wrote itself.
 - The agent's state (`<work_dir>/.horus-agent`: run records, audit log) is its own: mode 0711, run records 0700, the verified-copy store 0750 in the work dir's group, so task users can read the copies but cannot change or rename any of it. A job that was cancelled, killed or lost stops counting against `max_concurrent_runs` and its job dir can be removed.
 - After `revoke`, nothing new of the release starts, and within about 20 s the agent kills the running jobs (and cancels the Slurm jobs) of runs bound to it. Those runs can still be polled and cleaned up.
 - No raw commands: `exec` and `launch` are refused, and file reads and writes never follow a symlink in the file's own name. A refused op fails the task with `PolicyRefusedError`, an `OperationRefusedError` of the runtime. Shared Slurm allocations, containers and Python-function executors are not accepted in approved releases.
-- The agent samples each task's CPU and RAM and writes the files the resource monitor reads, so runs keep their charts.
+- A strict agent runs commands unmodified, so anything that rewrites a command, such as the resource monitor's wrapper, does not work on it: strict agents provide no resource charts. The older `resource_usage` key is still accepted and ignored.
 
 The orchestrator needs horus-agent 0.2 or newer to talk to a strict agent, and a horus-runtime that calls the target's native file hooks instead of shell commands for staging and hashing.
+
+### Resource profiling
+
+Open mode accepts any command, so the resource monitor's wrapper works there and the run's CPU and RAM charts are filled: set `mode = "open"` in `policy.toml`. In open mode the agent reads back the monitor's files (`resource-usage.csv`, `.horus_resource.txt`, `.horus_gpu.csv`, `.horus_host.txt`) from a task's own run folder even with `uploads = false`, as plain files of at most 4 MiB, never through a link. These are resource samples, not task output. The trade-off is that an open agent accepts any workflow the platform sends.
 
 ## Use it in a workflow
 
@@ -286,7 +289,7 @@ The broker HTTP API is described in `src/horus_agent/protocol.py`. Temple Comput
 - Output from `run_command(detach=False)` is buffered and capped at 4 MiB. Long-running commands go through `launch`, the default for this target.
 - The `python_function_external` executor is refused: it would load bytes written on the agent's machine as code in the orchestrator.
 - A strict agent runs only approved releases (see above).
-- Platforms: Linux is supported and tested. macOS is best effort and untested; known limits are no `setpriv` (use `run_as_via = "sudo"`), no `/proc` (no resource samples, and the pid-reuse check is skipped), and group inheritance of the work dir that follows BSD rules.
+- Platforms: Linux is supported and tested. macOS is best effort and untested; known limits are no `setpriv` (use `run_as_via = "sudo"`), no `/proc` (the pid-reuse check is skipped), and group inheritance of the work dir that follows BSD rules.
 - Without `run_as`, task commands run as the agent's Unix user and can read its config file. Set `run_as` on any machine others use.
 
 ## Development

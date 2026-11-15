@@ -22,14 +22,12 @@ import pwd
 import re
 import shlex
 import stat
-import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from horus_agent import native, seal
-from horus_agent.blobs import open_file
 from horus_agent.guard import (
     EXECUTION_ID,
     SAFE_PATH,
@@ -606,88 +604,3 @@ def parse_job_id(out: bytes) -> str:
     if not JOB_ID.fullmatch(raw):
         raise RuntimeError(f"sbatch returned an unexpected job id: {raw!r}")
     return raw
-
-
-# --- resource samples -------------------------------------------------------
-
-SAMPLES_FILE = "resource-usage.csv"
-RUSAGE_FILE = ".horus_resource.txt"
-SAMPLES_HEADER = (
-    "epoch,rss_kb,cpu_s,gpu_mem_mb,gpu_util_pct,io_read_b,io_write_b,"
-    "attribution"
-)
-SAMPLE_S = 1.0
-_TICKS = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
-_PAGE_KB = (
-    os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
-) // 1024
-
-
-def group_usage(pgid: int, proc: Path = Path("/proc")) -> tuple[int, float]:
-    """``(rss_kb, cpu_s)`` summed over process group *pgid*, from /proc."""
-    rss = 0
-    cpu = 0.0
-    for entry in proc.iterdir() if proc.is_dir() else ():
-        if not entry.name.isdigit():
-            continue
-        try:
-            raw = (entry / "stat").read_text()
-        except OSError:
-            continue
-        fields = raw[raw.rfind(")") + 2 :].split()
-        # fields[0] is state (stat field 3): pgrp is 5, utime 14, rss 24.
-        if int(fields[2]) != pgid:
-            continue
-        cpu += (int(fields[11]) + int(fields[12])) / _TICKS
-        rss += int(fields[21]) * _PAGE_KB
-    return rss, cpu
-
-
-async def sample(
-    pgid: int,
-    prepared: Prepared,
-    interval: float = SAMPLE_S,
-    proc: Path = Path("/proc"),
-) -> None:
-    """
-    Append the job's RSS and CPU time to ``resource-usage.csv`` in its side
-    artifacts dir until it exits, then write ``.horus_resource.txt`` (GNU
-    ``time -v`` lines) in its working dir: the files horus-resource-monitor
-    reads back, so tasks keep their CPU/RAM charts.
-    """
-    prepared.side_dir.mkdir(parents=True, exist_ok=True)
-    samples = prepared.side_dir / SAMPLES_FILE
-    if not samples.exists():
-        with open_file(samples, "w") as fh:
-            fh.write(SAMPLES_HEADER + "\n")
-    started = time.time()
-    peak, cpu = 0, 0.0
-    while not (prepared.job_dir / "exit_code").exists():
-        rss, used = group_usage(pgid, proc)
-        if not rss:
-            break  # the group is gone (killed, so no exit code comes)
-        peak, cpu = max(peak, rss), max(cpu, used)
-        with open_file(samples, "a") as fh:
-            fh.write(f"{time.time():.3f},{rss},{used:.2f},,,,,exact\n")
-        await asyncio.sleep(interval)
-    wall = max(time.time() - started, 1e-6)
-    minutes, seconds = divmod(wall, 60)
-    with open_file(prepared.cwd / RUSAGE_FILE, "w") as fh:
-        fh.write(
-            f"\tUser time (seconds): {cpu:.2f}\n"
-            "\tSystem time (seconds): 0.00\n"
-            f"\tPercent of CPU this job got: {cpu / wall * 100:.0f}%\n"
-            "\tElapsed (wall clock) time (h:mm:ss or m:ss): "
-            f"{int(minutes)}:{seconds:05.2f}\n"
-            f"\tMaximum resident set size (kbytes): {peak}\n"
-        )
-
-
-def start_sampler(pgid: int, prepared: Prepared) -> "asyncio.Task[None]":
-    """Run :func:`sample` in the background; errors are dropped."""
-
-    async def _quiet() -> None:
-        with contextlib.suppress(Exception):
-            await sample(pgid, prepared)
-
-    return asyncio.create_task(_quiet())

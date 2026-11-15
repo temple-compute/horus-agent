@@ -237,7 +237,6 @@ class OpRunner:
             }
         self.guard = guard
         self._spill = None if guard is None else guard.work_dir / SPILL_DIR
-        self._samplers: set[asyncio.Task[None]] = set()
 
     async def _shell(
         self, script: str, env: dict[str, str] | None, *, capture: bool
@@ -797,16 +796,6 @@ class OpRunner:
             cwd=str(prepared.cwd),
             env=prepared.env,
         )
-        if guard.policy.resource_usage:
-            guard.add_meta(op.run_id, prepared.side_dir / launch.SAMPLES_FILE)
-            guard.add_meta(op.run_id, prepared.cwd / launch.RUSAGE_FILE)
-            # A job that already exited still gets its monitor files.
-            job = guard.job(op.run_id, job_dir) or {}
-            task = launch.start_sampler(
-                job.get("pgid") or result["pid"], prepared
-            )
-            self._samplers.add(task)
-            task.add_done_callback(self._samplers.discard)
         return result
 
     async def _python_version(self) -> tuple[int, int] | None:

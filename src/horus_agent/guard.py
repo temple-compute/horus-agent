@@ -28,7 +28,6 @@ from urllib.parse import urlsplit
 
 import pydantic
 
-from horus_agent.blobs import open_file
 from horus_agent.manifest import (
     Manifest,
     ManifestError,
@@ -177,19 +176,27 @@ IDLE_RUN_S = 600.0
 """A run with no job yet counts as active this long after its last op."""
 RESERVED_NAMES = frozenset({"pid", "exit_code", "slurm_job_id", "env"})
 """Files the agent itself writes in a job dir; ops may not write them."""
-META_NAMES = frozenset(
-    {".horus_resource.txt", ".horus_gpu.csv", "resource-usage.csv"}
+MONITOR_FILES = frozenset(
+    {
+        ".horus_host.txt",
+        ".horus_resource.txt",
+        ".horus_gpu.csv",
+        "resource-usage.csv",
+    }
 )
-"""Names of files the agent writes for the resource monitor."""
+"""
+The files horus-resource-monitor's command wrapper writes in a task's
+working and side-artifacts dirs, by the names the monitor gives them. An
+open agent reads them back; a strict agent runs commands unmodified, so
+nothing writes them there.
+"""
+META_NAMES = MONITOR_FILES
 HORUS_OWN = frozenset({".horus", ".horus_job"}) | META_NAMES
 SIDE_NAMES = frozenset({"side-artifacts"})
 """Folders the agent makes in a working directory for a task's samples."""
 """The only hidden names the runtime and the agent write into a run."""
-HOST_FILE = ".horus_host.txt"
-"""The monitor's host snapshot: ``key=value`` lines a task's wrapper writes."""
-HOST_LINE = re.compile(r"[A-Za-z0-9_]{1,64}=[ -~]{0,512}")
-HOST_MAX_BYTES = 8 * 1024
-MONITOR_READS = frozenset({HOST_FILE, ".horus_resource.txt", ".horus_gpu.csv"})
+MONITOR_MAX_BYTES = 4 * 1024 * 1024
+MONITOR_READS = MONITOR_FILES
 """Files the resource monitor polls; their refusals are not warnings."""
 LOG_NAMES = frozenset({"stdout.log", "stderr.log"})
 META_MAX_BYTES = 64 * 1024
@@ -1040,37 +1047,34 @@ class Guard:
             return
         if str(path) in self.spilled:
             return
-        meta = (
-            str(path) in (record.get("meta") or ())
-            or (in_job and path.name in ("pid", "exit_code"))
-            or self.host_snapshot(path)
+        meta = str(path) in (record.get("meta") or ()) or (
+            in_job and path.name in ("pid", "exit_code")
         )
         with contextlib.suppress(FileNotFoundError):
             meta = meta and path.lstat().st_size <= META_MAX_BYTES
-        if not meta:
+        if not meta and not self.monitor_file(run_id, path):
             raise PolicyRefusedError(
                 f"Uploads are off on this agent; {path.name} stays here"
             )
 
-    def host_snapshot(self, path: Path) -> bool:
+    def monitor_file(self, run_id: str | None, path: Path) -> bool:
         """
-        Whether *path* is the host snapshot of a task (``.horus_host.txt``)
-        and passes as one: a plain file of ``key=value`` lines, small. With
-        resource usage on, it is read back like the agent's own samples.
+        Whether *path* (already resolved, so never a link) is one of the
+        :data:`MONITOR_FILES` of a task of *run_id*: open mode only, a plain
+        file inside the run's own folder, small. These are resource samples,
+        not task output, so they are read back with uploads off.
         """
-        if path.name != HOST_FILE or not self.policy.resource_usage:
+        if self.policy.strict or run_id is None:
+            return False
+        if path.name not in MONITOR_FILES:
+            return False
+        if run_id not in path.relative_to(self.work_dir).parts[:-1]:
             return False
         try:
-            if not stat.S_ISREG(path.lstat().st_mode):
-                return False
-            with open_file(path) as fh:
-                data = fh.read(HOST_MAX_BYTES + 1)
+            info = path.lstat()
         except OSError:
             return True  # nothing to leak; the read reports it missing
-        if len(data) > HOST_MAX_BYTES:
-            return False
-        lines = data.decode(errors="replace").splitlines()
-        return all(HOST_LINE.fullmatch(line) for line in lines)
+        return stat.S_ISREG(info.st_mode) and info.st_size <= MONITOR_MAX_BYTES
 
     def check_url(self, url: str, downloads: bool) -> None:
         """Require https and an allowed host; ``downloads``/``uploads`` on."""

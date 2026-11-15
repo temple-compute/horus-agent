@@ -724,56 +724,70 @@ def test_sbatch_values_cannot_break_lines(env: Env) -> None:
     assert launch.parse_job_id(b"42;cluster\n") == "42"
 
 
-# --- resource samples ------------------------------------------------------
+# --- the resource monitor's files ------------------------------------------
 
 
-async def test_sampler_writes_monitor_files(tmp_path: Path) -> None:
-    proc = tmp_path / "proc"
-    for pid, pgid, ut, rss in (
-        (10, 7, 150, 100),
-        (11, 7, 50, 50),
-        (12, 9, 999, 9),
-    ):
-        (proc / str(pid)).mkdir(parents=True)
-        fields = ["S", "1", str(pgid)] + ["0"] * 8 + [str(ut), "0"] + ["0"] * 8
-        fields += [str(rss)]
-        (proc / str(pid) / "stat").write_text(
-            f"{pid} (sh) {' '.join(fields)}\n"
-        )
-    (proc / "self").mkdir()
-    rss, cpu = launch.group_usage(7, proc)
-    assert rss == 150 * launch._PAGE_KB
-    assert cpu == pytest.approx(200 / launch._TICKS)
-    job = tmp_path / "job"
-    job.mkdir()
-    prepared = launch.Prepared("x", {}, tmp_path, job, tmp_path / "side", {})
-    task = asyncio.create_task(launch.sample(7, prepared, 0.01, proc))
-    await asyncio.sleep(0.05)
-    (job / "exit_code").write_text("0\n")
-    await task
-    rows = (tmp_path / "side" / launch.SAMPLES_FILE).read_text().splitlines()
-    assert rows[0] == launch.SAMPLES_HEADER
-    assert rows[1].endswith(",,,,,exact") and len(rows) > 1
-    rusage = (tmp_path / launch.RUSAGE_FILE).read_text()
-    assert f"Maximum resident set size (kbytes): {rss}" in rusage
+async def test_open_mode_reads_monitor_files_with_uploads_off(
+    env: Env,
+) -> None:
+    env.with_policy(mode="open", uploads=False)
+    side = env.run / "t" / "side-artifacts"
+    side.mkdir(parents=True)
+    for name in sorted(guard_mod.MONITOR_FILES):
+        where = side if name.endswith("usage.csv") else env.run / "t"
+        (where / name).write_text("k=v\n")
+        got = await env.call("get_file", path=str(where / name), release=None)
+        assert got == {"data": "az12Cg=="}
+    (env.run / "t" / "other.txt").write_text("data\n")
+    await refused(
+        env,
+        "get_file",
+        "Uploads are off",
+        path=str(env.run / "t" / "other.txt"),
+        release=None,
+    )
 
 
-async def test_real_job_gets_samples(env: Env) -> None:
-    job = env.run / "job"
-    args: dict[str, Any] = {
-        "task_id": "say",
-        "job_dir": str(job),
-        "cwd": str(env.run),
-        "bindings": {
-            "msg": {"value": "x"},
-            "out": {"path": str(env.run / "o")},
-        },
-        "env": {"TOKEN": "t"},
-    }
-    await env.call("task_launch", release="echo", task="say", **args)
-    for _ in range(100):
-        if (env.run / launch.RUSAGE_FILE).exists():
-            break
-        await asyncio.sleep(0.05)
-    assert (env.run / launch.RUSAGE_FILE).exists()
-    assert (env.run / "side-artifacts" / launch.SAMPLES_FILE).exists()
+async def test_open_mode_monitor_reads_stay_in_the_run(env: Env) -> None:
+    env.with_policy(mode="open", uploads=False)
+    name = ".horus_resource.txt"
+    elsewhere = env.work / "other-run"
+    elsewhere.mkdir()
+    (elsewhere / name).write_text("x\n")
+    await refused(
+        env,
+        "get_file",
+        "Uploads are off",
+        path=str(elsewhere / name),
+        release=None,
+    )
+    secret = env.run / "secret.txt"
+    secret.write_text("s\n")
+    (env.run / name).symlink_to(secret)
+    await refused(
+        env,
+        "get_file",
+        "Uploads are off",
+        path=str(env.run / name),
+        release=None,
+    )
+    (env.run / "gpu").mkdir()
+    (env.run / "gpu" / ".horus_gpu.csv").symlink_to("/etc/hostname")
+    await refused(
+        env,
+        "get_file",
+        "outside",
+        path=str(env.run / "gpu" / ".horus_gpu.csv"),
+        release=None,
+    )
+    big = env.run / "resource-usage.csv"
+    big.write_bytes(b"x" * (guard_mod.MONITOR_MAX_BYTES + 1))
+    await refused(
+        env, "get_file", "Uploads are off", path=str(big), release=None
+    )
+
+
+async def test_strict_mode_does_not_read_monitor_files(env: Env) -> None:
+    name = ".horus_resource.txt"
+    (env.run / name).write_text("x\n")
+    await refused(env, "get_file", "", path=str(env.run / name))
