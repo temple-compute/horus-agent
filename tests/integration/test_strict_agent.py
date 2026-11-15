@@ -47,11 +47,11 @@ async def _serving(
     broker: FakeBroker,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    wf: dict[str, Any],
-    files: dict[str, bytes],
-    names: tuple[str, ...] = (),
+    release: tuple[dict[str, Any], dict[str, bytes], tuple[str, ...]],
 ) -> AsyncGenerator[Path]:
-    """A strict agent with the approved release of *wf*; its run dir."""
+    """A strict agent with an approved release, given as the workflow, its
+    bundled files and extra layout names; yields the run dir."""
+    wf, files, names = release
     monkeypatch.setattr(broker_mod, "_INFOS", {})
     manifest = build_manifest_from_workflow(wf, files)
     manifest = dataclasses.replace(manifest, layout=(*manifest.layout, *names))
@@ -103,7 +103,7 @@ async def strict_agent(
         ],
     }
     names = ("src", "src.tgz", "moved", "out", "dest", "copy")
-    async with _serving(broker, tmp_path, monkeypatch, wf, {}, names) as run:
+    async with _serving(broker, tmp_path, monkeypatch, (wf, {}, names)) as run:
         yield run
 
 
@@ -242,14 +242,15 @@ async def staging_agent(
         "data/cfg/a.txt": b"A\n",
         "data/cfg/sub/b.txt": b"B\n",
     }
-    async with _serving(broker, tmp_path, monkeypatch, wf, files) as run:
+    async with _serving(broker, tmp_path, monkeypatch, (wf, files, ())) as run:
         yield run
 
 
 async def test_a_runtime_staging_sequence_passes_the_strict_agent(
     staging_agent: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Script in a sub-folder, a folder constant, a data input and an output: staged as the runtime does, then run."""
+    """A script from a sub-folder, a folder constant, a data input and an
+    output: staged as the runtime does, then run."""
     wd = staging_agent
     target = AgentTarget(agent=AGENT_NAME, working_directory=str(wd))
     task = HorusTask(

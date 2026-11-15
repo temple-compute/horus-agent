@@ -19,6 +19,7 @@ import pytest
 from horus_agent import launch as launch_mod
 from horus_agent import native, policy
 from horus_agent.manifest import Manifest, file_digest
+from horus_agent.template import unsafe_placeholders
 from tests.unit.test_guard import Env, env, refused
 from tests.unit.test_policy_hardening import manifest, wait_exit
 
@@ -286,7 +287,7 @@ async def test_a_large_folder_package_arrives_by_fetch(
     data = pkg.read_bytes()
     pkg.unlink()
 
-    async def download(url: str, path: Path, limit: int | None) -> None:
+    async def download(_url: str, path: Path, _limit: int | None) -> None:
         path.write_bytes(data)
 
     monkeypatch.setattr("horus_agent.ops.blobs.download_to", download)
@@ -313,3 +314,62 @@ async def test_a_large_folder_package_arrives_by_fetch(
         path=str(env.run / "cfg.horuspkg"),
         data=b64(b"x"),
     )
+
+
+# --- M-B: the checker reads streams, applets and delayed runners -------------
+
+RUNS_IT = [
+    'source /dev/stdin <<< "$(cat ${x})"',
+    "bash /dev/stdin < ${x}",
+    "bash /dev/fd/0 < ${x}",
+    "cat ${x} | bash /dev/stdin",
+    ". /dev/fd/3 3< ${x}",
+    "bash <(cat ${x})",
+    "source <(cat ${x})",
+    "python3 /proc/self/fd/0 < ${x}",
+    "busybox sh ${x}",
+    "busybox ash ${x}",
+    'script -c "bash ${x}" /dev/null',
+    "tee y < ${x}; bash y",
+    "cat ${x} | tee y; bash y",
+    "dd if=${x} of=y; bash y",
+    'at now <<< "bash ${x}"',
+    'batch <<< "bash ${x}"',
+    "at -f ${x} now",
+    "nohup bash ${x}",
+    "setsid bash ${x}",
+    "stdbuf -oL bash ${x}",
+    "timeout 5 bash ${x}",
+    "ionice -c3 bash ${x}",
+    "timeout 5 nohup setsid ionice -c3 stdbuf -oL bash ${x}",
+    "pipenv run ${x}",
+    "hatch run ${x}",
+    "pdm run ${x}",
+    "rye run ${x}",
+    "accelerate launch ${x}",
+    "podman exec c ${x}",
+    "docker exec c ${x}",
+    "conda activate ${x}",
+    "mytool run ${x}",
+    "mytool --command ${x}",
+]
+
+
+@pytest.mark.parametrize("command", RUNS_IT)
+def test_the_checker_flags_what_runs_a_placeholder(command: str) -> None:
+    assert unsafe_placeholders(command, {"x"}), command
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "cat ${x} | tee out.txt > /dev/null",
+        "tee log.txt < ${x} > /dev/null",
+        "busybox cat ${x}",
+        "timeout 5 samtools sort ${x}",
+        "nice -n 5 gzip -c ${x} > o.gz",
+        "mytool --in ${x} --out o",
+    ],
+)
+def test_the_checker_still_passes_data_commands(command: str) -> None:
+    assert not unsafe_placeholders(command, {"x"}), command

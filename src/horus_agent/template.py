@@ -85,6 +85,9 @@ _PROGRAMS: dict[str, tuple[str, str, str, str, str]] = {
         "",
         "first",
     ),
+    **dict.fromkeys(
+        ("at", "batch"), ("-q -t", "-m -M -v -l -d -r -b", "-f", "", "data")
+    ),
     "torchrun": (
         "--nproc_per_node --nproc-per-node --nnodes --node_rank --node-rank "
         "--master_addr --master-addr --master_port --master-port "
@@ -278,10 +281,24 @@ _DYNAMIC_ARG = re.compile(
 _AWK_RUNS = re.compile(
     r"system[ \t]*\(|\|[ \t]*getline|\|&|print[^;\n]*\|[ \t]*\""
 )
+_DEVICE_SCRIPT = re.compile(
+    rf"(?<![\w./-])(?:{_INTERPRETERS}|at|batch)(?:[ \t]+-[^ \t;&|]*)*[ \t]+"
+    r"[\"']?(?:/dev/stdin|/dev/fd/|/proc/(?:self|[0-9]+)/fd/|<\(|>\()"
+)
 _PYTHON = re.compile(r"python[0-9.]*|pypy[0-9.]*")
 _VERSIONED = re.compile(r"[-_.]?[0-9][0-9._-]*$")
 _STDIN_CODE = frozenset(
-    {"R", "sqlite3", "psql", "duckdb", "octave", "ipython", "groovy"}
+    {
+        "R",
+        "sqlite3",
+        "psql",
+        "duckdb",
+        "octave",
+        "ipython",
+        "groovy",
+        "at",
+        "batch",
+    }
 )
 """Programs that run what they read from stdin as code (a script or SQL)."""
 _SLURM_MPI = (
@@ -293,6 +310,15 @@ _SLURM_MPI = (
 _WRAPPERS: dict[str, tuple[str, str, str, int, str]] = {
     # name: (options taking a value, flags, options running code,
     #        positionals before the command, subcommand it must use)
+    "busybox": ("", "", "", 0, ""),
+    "script": (
+        "-I -O -B -E -T -m --log-in --log-out --log-io --echo --log-timing "
+        "--logging-format --timing",
+        "-a -e -f -q -r --append --return --flush --quiet --force",
+        "-c --command",
+        0,
+        "",
+    ),
     "exec": ("-a", "-c -l", "", 0, ""),
     "command": ("", "-p", "", 0, ""),
     "builtin": ("", "", "", 0, ""),
@@ -417,6 +443,8 @@ _WRAPPERS: dict[str, tuple[str, str, str, int, str]] = {
         "run",
     ),
     "poetry": ("", "", "", 0, "run"),
+    **dict.fromkeys(("pipenv", "hatch", "pdm", "rye"), ("", "", "", 0, "run")),
+    "accelerate": ("--config_file --num_processes", "", "", 0, "launch"),
     **dict.fromkeys(
         ("apptainer", "singularity"),
         (
@@ -426,7 +454,7 @@ _WRAPPERS: dict[str, tuple[str, str, str, int, str]] = {
             "--writable-tmpfs --no-home -e",
             "",
             1,
-            "exec",
+            "exec|run",
         ),
     ),
     **dict.fromkeys(
@@ -437,7 +465,7 @@ _WRAPPERS: dict[str, tuple[str, str, str, int, str]] = {
             "--rm -i -t -it -d --init",
             "",
             1,
-            "run",
+            "run|exec",
         ),
     ),
 }
@@ -466,6 +494,18 @@ _DATA_TOOLS = frozenset(
 )
 """Programs that treat their arguments as data (files, values), never as
 code to run: a placeholder as their first argument is a path or a value."""
+_RUN_WORDS = frozenset(
+    """
+    -- run exec execute launch activate start submit repro eval source call
+    shell script apply play invoke spawn serve -c --command --cmd --exec
+    --execute --eval --script --run --hook --init-file --rcfile --entrypoint
+    --exec-path -x --shell -e
+    """.split()
+)
+"""
+Words after which a program the agent has no entry for takes a command or a
+script (a subcommand that runs, or an option whose value runs).
+"""
 _AT_PROGRAM = frozenset({"alias"})
 """Commands that matter only as the program of a command."""
 _FUNCTION_DEF = re.compile(
@@ -564,6 +604,8 @@ def _whole_reason(skeleton: str) -> str | None:  # noqa: PLR0911
         return "in a template with $'...' quoting"
     if _DYNAMIC_ARG.search(skeleton.replace("\\\n", " ")):
         return "in a template that runs a script named by a variable"
+    if _DEVICE_SCRIPT.search(skeleton):
+        return "in a template where a shell reads its script from a stream"
     if _pipes_into_code(skeleton):
         return "in a template that pipes into a shell"
     if _runs_data_lines(skeleton):
@@ -669,7 +711,7 @@ def _command(words: list[str]) -> list[str] | str:
         name = _base(rest.pop(0))
         takes, flags, code, positional, sub = _WRAPPERS[name]
         if sub:
-            if not rest or rest[0] != sub:
+            if not rest or rest[0] not in sub.split("|"):
                 return [name, *rest]  # the tool itself, not a wrapper
             rest.pop(0)
         while rest and rest[0].startswith("-"):
@@ -690,6 +732,11 @@ def _command(words: list[str]) -> list[str] | str:
                 or key in flags.split()
                 or (key.startswith("--") and "=" in option)
                 or re.fullmatch(r"-\d+", option)  # nice -10
+                or (  # an attached value: stdbuf -oL, ionice -c3
+                    not option.startswith("--")
+                    and len(option) > 2
+                    and option[:2] in takes.split()
+                )
             ):
                 return (
                     f"after a wrapper option the agent cannot read: {option}"
@@ -817,7 +864,7 @@ def _unknown_reason(rest: list[str], word: str) -> str | None:
             return _program_reason(rest[k:], word)
     if word.startswith("-"):
         return None
-    if len(rest) == 1 or rest[-1] == "--":
+    if len(rest) == 1 or rest[-1] in _RUN_WORDS:
         return "after a program the agent does not know"
     return None
 
@@ -916,7 +963,7 @@ def _scan(  # noqa: PLR0912, PLR0915
     stack: list[tuple[str, list[str], bool]] = [("top", [], False)]
     word = ""
     heredocs: list[tuple[str, bool, bool, list[str], int]] = []
-    herestring = False
+    here = -1  # stack depth of an open here-string word, else -1
     skip = ""  # a redirection operator whose target is the next word
     targets: list[str] = []  # files the current command writes
     started = 0  # len(out) when the current command began
@@ -934,11 +981,12 @@ def _scan(  # noqa: PLR0912, PLR0915
     i = 0
     n = len(s)
 
-    def end_word() -> None:
-        nonlocal word, herestring, skip
+    def end_word() -> None:  # noqa: PLR0912
+        nonlocal word, here, skip
         if not word:
             return
-        herestring = False
+        if len(stack) <= here:
+            here = -1
         words = stack[-1][1]
         if len(words) >= MAX_COMMAND_WORDS:  # keeps the scan linear
             whole.append(
@@ -1016,6 +1064,19 @@ def _scan(  # noqa: PLR0912, PLR0915
                         targets.append(dest)  # whatever lands in the folder
                 elif _SENTINEL not in dest:
                     targets.append(dest)  # cp ${x} y.sh; bash y.sh
+        if (rest := _command(words)) and not isinstance(rest, str):
+            if _base(rest[0]) == "tee":  # fed by a pipe or a redirection
+                generated.extend(
+                    (w, 0, len(out))
+                    for w in rest[1:]
+                    if w[:1] != "-" and _SENTINEL not in w
+                )
+            if _base(rest[0]) == "dd":
+                targets.extend(
+                    w[3:]
+                    for w in rest[1:]
+                    if w.startswith("of=") and _SENTINEL not in w
+                )
         if targets and len(out) > started:
             generated.extend((t, started, len(out)) for t in targets)
         targets.clear()
@@ -1036,6 +1097,8 @@ def _scan(  # noqa: PLR0912, PLR0915
             word = ""  # a substitution starts its own command
 
     def quoted_reason(code: bool) -> str | None:
+        if here >= 0:
+            return "in a here-string"
         if code:
             return "inside text a command runs as code"
         parent = stack[-2]
@@ -1083,7 +1146,7 @@ def _scan(  # noqa: PLR0912, PLR0915
             continue
         # Unquoted: the top level, $(...), `...` or <(...).
         if c == _SENTINEL:
-            if herestring:
+            if here >= 0:
                 out.append(("in a here-string", False))
             elif code:
                 out.append(("in output a command runs as code", False))
@@ -1153,7 +1216,7 @@ def _scan(  # noqa: PLR0912, PLR0915
             continue
         if s.startswith("<<<", i):
             end_word()
-            herestring = True
+            here = len(stack)
             i += 3
             continue
         if heredoc := _HEREDOC.match(s, i):
@@ -1212,7 +1275,8 @@ def _scan(  # noqa: PLR0912, PLR0915
             if _in_test(words):
                 words.append(c)  # [[ ... && ... ]] is still one test
             else:
-                herestring = False
+                if len(stack) <= here:
+                    here = -1
                 new_command()
         else:
             word += c
