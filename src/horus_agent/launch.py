@@ -35,7 +35,6 @@ from horus_agent.manifest import (
     RESERVED_ENV,
     VALUE_KINDS,
     Manifest,
-    task_runs_python_code,
 )
 from horus_agent.protocol import PolicyRefusedError, TaskLaunchArgs
 from horus_agent.template import placeholders, render
@@ -262,21 +261,21 @@ SAFE_PATH_PYTHON = (3, 11)
 """First Python that honours ``PYTHONSAFEPATH``."""
 
 
-async def _check_python(  # noqa: PLR0913, PLR0917
+async def _check_python(
     guard: Guard,
     manifest: Manifest,
-    task: dict[str, Any],
     cwd: Path,
     run_id: str | None,
     probe: PythonVersion | None,
 ) -> None:
     """
-    A task running ``python -c``/``-m`` on a Python before 3.11 imports
-    from its working directory, whatever ``PYTHONSAFEPATH`` says: it starts
-    only when that directory holds no code at all, even what the policy's
-    ``allow_code_suffixes`` lets in.
+    With the policy letting code suffixes into runs, a working directory
+    that holds such code, and a job Python older than 3.11 (which imports
+    from the working directory whatever ``PYTHONSAFEPATH`` says), no task
+    starts: whether a command runs Python (a heredoc, ``bash -c``, a
+    script's shebang, a wrapper) is not decided by reading it.
     """
-    if not (task_runs_python_code(task) and guard.policy.allow_code_suffixes):
+    if not guard.policy.allow_code_suffixes:
         return
     root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
     if (
@@ -290,9 +289,9 @@ async def _check_python(  # noqa: PLR0913, PLR0917
     version = await probe()
     if version is None or version < SAFE_PATH_PYTHON:
         raise PolicyRefusedError(
-            "This task runs python -c or -m, the job's Python is older "
-            "than 3.11 and the working directory holds code (see "
-            "allow_code_suffixes); use Python 3.11 or newer"
+            "The job's Python is older than 3.11 and the working directory "
+            "holds code (see allow_code_suffixes), so no task starts "
+            "here; use Python 3.11 or newer"
         )
 
 
@@ -330,9 +329,7 @@ async def prepare(
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
     job_dir = guard.confine_bound(run_id, args.job_dir)
     cwd = _working_dir(guard, run_id, args.cwd, admitted.manifest)
-    await _check_python(
-        guard, admitted.manifest, task, cwd, run_id, python_version
-    )
+    await _check_python(guard, admitted.manifest, cwd, run_id, python_version)
     store = guard.const_store
     script = None
     if task["runtime"]["kind"] == "python_script":

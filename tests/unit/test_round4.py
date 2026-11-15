@@ -182,8 +182,9 @@ def test_python_code_is_recorded_per_task() -> None:
         "python3 -mjson.tool",
     ):
         assert task_runs_python_code(manifest(command).tasks["t"]), command
-    for command in ("echo python -c", "python3 script.py", "ls"):
-        assert not task_runs_python_code(manifest(command).tasks["t"]), command
+    for command in ("python3 script.py", "bash -c 'python3 -c x'"):
+        assert task_runs_python_code(manifest(command).tasks["t"]), command
+    assert not task_runs_python_code(manifest("ls").tasks["t"])
     scripted = build_manifest_from_workflow(
         {
             "name": "w",

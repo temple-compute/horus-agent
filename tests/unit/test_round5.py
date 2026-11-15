@@ -8,16 +8,19 @@
 
 import base64
 import io
+import os
+import shutil
+import sys
 import tarfile
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from horus_agent import policy
+from horus_agent import launch, policy
 from horus_agent.manifest import Manifest
 from tests.unit.test_guard import Env, env, refused
-from tests.unit.test_policy_hardening import manifest
+from tests.unit.test_policy_hardening import manifest, wait_exit
 
 __all__ = ["env"]
 
@@ -155,3 +158,122 @@ async def test_the_manifest_lists_each_shipped_path(env: Env) -> None:  # noqa: 
     assert ("helper.sh", next(iter(approved.digests))) in approved.consts
     again = Manifest.from_json(approved.to_json())
     assert again.consts == approved.consts
+
+
+# --- M3: an old Python starts no task beside code ---------------------------
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "python3 -c 'import json'",
+        "python3 -m json.tool",
+        "python3 <<'EOF'\nimport json\nEOF\n",
+        "python3 - <<'EOF'\nimport json\nEOF\n",
+        "bash -c 'python3 -c \"import json\"'",
+        "echo hi",
+    ],
+)
+@pytest.mark.parametrize(
+    ("version", "ok"), [((3, 10), False), ((3, 12), True)]
+)
+async def test_an_old_python_starts_no_task_beside_code(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    version: tuple[int, int],
+    ok: bool,
+) -> None:
+    env.with_policy(allow_code_suffixes=(".py",))
+
+    async def probe() -> tuple[int, int]:
+        return version
+
+    monkeypatch.setattr(env.runner, "_python_version", probe)
+    approved = manifest(command, inputs=[], outputs=[])
+    policy.approve(approved, "root")
+    (env.run / "json").mkdir()
+    (env.run / "json" / "__init__.py").write_text("")
+    call = env.call(
+        "task_launch",
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(env.run / "j"),
+        cwd=str(env.run),
+        bindings={},
+        env={},
+    )
+    if ok:
+        await call
+        await wait_exit(env.run / "j")
+    else:
+        with pytest.raises(RuntimeError, match=r"older than 3\.11"):
+            await call
+
+
+def _real_python(version: str) -> str | None:
+    found = (
+        os.environ.get("HORUS_TEST_PYTHON310")
+        if version == "3.10"
+        else (sys.executable)
+    )
+    return found if found and Path(found).exists() else None
+
+
+@pytest.mark.parametrize(
+    ("version", "shadowed"), [("3.10", True), ("3.13", False)]
+)
+async def test_real_interpreters_on_a_job_env(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+    shadowed: bool,
+) -> None:
+    """Python 3.10 (``HORUS_TEST_PYTHON310``) imports the shadow module in
+    the job's cwd despite ``PYTHONSAFEPATH``; the launch is refused first."""
+    python = _real_python(version)
+    if python is None:
+        pytest.skip(f"no Python {version}")
+    shadow = env.run / "json"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("open('PWNED', 'w')\n")
+    probe_env = {"PATH": "/usr/bin:/bin", **launch.job_env(env.run)}
+    import subprocess
+
+    out = subprocess.run(
+        [python, "-c", "import sys, json; print(*sys.version_info[:2])"],
+        cwd=env.run,
+        env=probe_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (env.run / "PWNED").exists() is shadowed
+    (env.run / "PWNED").unlink(missing_ok=True)
+    shutil.rmtree(shadow / "__pycache__", ignore_errors=True)
+    env.with_policy(allow_code_suffixes=(".py",))
+    major, minor = out.stdout.split() if out.stdout else ("3", "10")
+
+    async def probe() -> tuple[int, int]:
+        return int(major), int(minor)
+
+    monkeypatch.setattr(env.runner, "_python_version", probe)
+    approved = manifest("python3 -c 'import json'", inputs=[], outputs=[])
+    policy.approve(approved, "root")
+    call = env.call(
+        "task_launch",
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(env.run / "j"),
+        cwd=str(env.run),
+        bindings={},
+        env={},
+    )
+    if shadowed:
+        with pytest.raises(RuntimeError, match=r"older than 3\.11"):
+            await call
+    else:
+        await call
+        await wait_exit(env.run / "j")

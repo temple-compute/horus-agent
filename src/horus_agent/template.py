@@ -493,20 +493,11 @@ def _whole_reason(skeleton: str) -> str | None:
 
 def uses_python_code(text: str) -> bool:
     """
-    Whether a command in *text* runs Python with ``-c`` or ``-m``, which
-    put the working directory on the module path before Python 3.11.
+    Whether *text* may run Python: it names an interpreter anywhere (a
+    ``-c``/``-m`` form, a heredoc, ``bash -c``, a script path), the one
+    shape-free test that cannot miss a spelling.
     """
-    for part in re.split(r"[;&|()\n`]+", text):
-        rest = _command(part.split())
-        if isinstance(rest, str) or not rest:
-            continue
-        if _PYTHON.fullmatch(_base(rest[0])) and any(
-            w in ("-c", "-m") or (w[:2] in ("-c", "-m") and w[0] == "-")
-            for w in rest[1:]
-            if w.startswith("-") and not w.startswith("--")
-        ):
-            return True
-    return False
+    return "python" in text.lower()
 
 
 def _strip_redirects(words: list[str]) -> list[str]:

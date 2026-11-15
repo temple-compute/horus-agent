@@ -309,7 +309,7 @@ def build_manifest_from_workflow(
 
 
 def task_runs_python_code(task: Mapping[str, Any]) -> bool:
-    """Whether a manifest task's command runs ``python -c`` or ``-m``."""
+    """Whether a manifest task's command may run Python (names it)."""
     runtime = task["runtime"]
     return runtime["kind"] == "command" and uses_python_code(
         str(runtime["command"])
