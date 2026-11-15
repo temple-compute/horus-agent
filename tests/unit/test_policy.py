@@ -218,19 +218,31 @@ def test_cli_approve_by_release_id(
 
     class Response:
         status_code = 200
-        content = (DATA / "slurm.zip").read_bytes()
+        body = (DATA / "slurm.zip").read_bytes()
 
-    def fake_get(url: str, **kwargs: object) -> Response:
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def iter_bytes(self) -> list[bytes]:
+            return [self.body[:100], self.body[100:]]
+
+    def fake_stream(_method: str, url: str, **kwargs: object) -> Response:
         seen["url"] = url
         seen["headers"] = kwargs["headers"]
         return Response()
 
-    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr("httpx.stream", fake_stream)
     assert cli.main(["approve", "rel-1", "--yes"]) == 0
     assert seen["url"] == f"{URL}/agents/me/releases/rel-1/archive"
     assert seen["headers"] == {"Authorization": "Bearer tok"}
     Response.status_code = 404
     assert cli.main(["approve", "rel-2", "--yes"]) == 1
+    Response.status_code = 200
+    monkeypatch.setattr(cli, "MAX_DOWNLOAD_BYTES", 150)
+    assert cli.main(["approve", "rel-3", "--yes"]) == 1  # over the cap
 
 
 def test_cli_policy_check(

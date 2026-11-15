@@ -217,10 +217,17 @@ def _service_config() -> Path:
     return path
 
 
+MAX_DOWNLOAD_BYTES = 512 * 1024**2
+"""Largest release archive ``approve`` reads, downloaded or from a file."""
+MAX_WARNING_LINES = 40
+
+
 def _archive(source: str) -> bytes:
     """A release archive: a local file, else downloaded by release id."""
     path = Path(source)
     if path.is_file():
+        if path.stat().st_size > MAX_DOWNLOAD_BYTES:
+            raise ValueError(f"{source} is over {MAX_DOWNLOAD_BYTES} bytes")
         return path.read_bytes()
     where = _service_config()
     try:
@@ -231,18 +238,27 @@ def _archive(source: str) -> bytes:
             f"with; set {config.CONFIG_ENV} to the agent's agent.json, or "
             "approve an exported archive file"
         ) from None
-    response = httpx.get(
+    with httpx.stream(
+        "GET",
         f"{registered.url.rstrip('/')}/agents/me/releases/"
         f"{quote(source, safe='')}/archive",
         headers={"Authorization": f"Bearer {registered.token}"},
         timeout=120.0,
         verify=broker_tls(registered.ca_bundle),
-    )
-    if response.status_code >= 400:
-        raise ValueError(
-            f"Cannot download release {source}: HTTP {response.status_code}"
-        )
-    return response.content
+    ) as response:
+        if response.status_code >= 400:
+            raise ValueError(
+                f"Cannot download release {source}: HTTP "
+                f"{response.status_code}"
+            )
+        body = bytearray()
+        for chunk in response.iter_bytes():
+            body += chunk
+            if len(body) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    f"Release {source} is over {MAX_DOWNLOAD_BYTES} bytes"
+                )
+    return bytes(body)
 
 
 def _safe(value: object) -> str:
@@ -260,7 +276,16 @@ def _show(manifest: Manifest) -> str:
     lines = [
         f"Release: {_safe(manifest.about.get('name'))} "
         f"(hash {manifest.release_hash})",
+        f"{len(manifest.tasks)} agent tasks, "
+        f"{len(manifest.warnings)} warnings",
     ]
+    shown = manifest.warnings[:MAX_WARNING_LINES]
+    lines += [f"Warning: {_safe(w)}" for w in shown]
+    if len(manifest.warnings) > len(shown):
+        lines.append(
+            f"... and {len(manifest.warnings) - len(shown)} more warnings "
+            "(each task below names its run-time inputs)"
+        )
     for task_id, task in sorted(manifest.tasks.items()):
         runtime = task["runtime"]
         chain = " > ".join(task["target"]["chain"])
@@ -287,7 +312,6 @@ def _show(manifest: Manifest) -> str:
         "\nNames cloud files may take at the top of a run: "
         + _safe(", ".join(manifest.layout) or "(none)")
     )
-    lines += [f"\nWarning: {_safe(w)}" for w in manifest.warnings]
     return "\n".join(lines) + "\n"
 
 

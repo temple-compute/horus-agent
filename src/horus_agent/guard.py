@@ -615,6 +615,43 @@ class Guard:
             record["stopped"] = True
             self._save(run_id, record)
 
+    def _top(self, run_id: str | None, path: Path) -> tuple[Path, str] | None:
+        """The run root holding *path* and the first name below it."""
+        for root in self.roots(run_id):
+            if path.is_relative_to(root) and path != root:
+                return root, path.relative_to(root).parts[0]
+        return None
+
+    def note_made(self, run_id: str | None, path: Path) -> None:
+        """Remember that the agent staged or produced something at *path*."""
+        record = self.run_record(run_id)
+        found = self._top(run_id, path)
+        if run_id is None or record is None or found is None:
+            return
+        entry = str(found[0] / found[1])
+        if entry not in record.setdefault("made", []):
+            record["made"].append(entry)
+            self._save(run_id, record)
+
+    def check_digest(self, run_id: str | None, path: Path) -> None:
+        """
+        With ``uploads = false`` a digest (an equality test for a guessed
+        file) is answered only for what this run staged or produced.
+        """
+        if (
+            self.policy.uploads
+            or not self.policy.strict
+            or not os.path.lexists(path)  # nothing there to confirm
+        ):
+            return
+        found = self._top(run_id, path)
+        made = (self.run_record(run_id) or {}).get("made") or ()
+        if found is None or str(found[0] / found[1]) not in made:
+            raise PolicyRefusedError(
+                f"Uploads are off on this agent; {path.name} was not staged "
+                "or produced by this run, so its digest stays here"
+            )
+
     def add_meta(self, run_id: str | None, path: Path) -> None:
         """Let *path* (run metadata) be read back when uploads are off."""
         record = self.run_record(run_id)
@@ -646,6 +683,7 @@ class Guard:
             )
             self.check_name(path, code_ok=approved)
             self.check_layout(run_id, path, manifest)
+            self.note_made(run_id, path)
             if approved and code_suffix(path.name) is not None:
                 self.add_code_ok(run_id, path)
         if path in self.roots(run_id):
@@ -745,7 +783,11 @@ def job_running(job_dir: Path, info: dict[str, Any]) -> bool:
         return False
     pgid = info.get("pgid")
     if not pgid:
-        return "slurm_job_id" in info
+        # Slurm, or a job whose start is still being recorded.
+        started = info.get("started")
+        return "slurm_job_id" in info or (
+            started is not None and time.time() - started < IDLE_RUN_S
+        )
     try:
         os.killpg(pgid, 0)
     except ProcessLookupError:

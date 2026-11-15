@@ -6,6 +6,7 @@
 #
 """Regression tests for the fourth review round of the policy work."""
 
+import asyncio
 import base64
 import subprocess
 from pathlib import Path
@@ -14,15 +15,18 @@ from typing import Any
 import pytest
 
 from horus_agent import cli, launch, policy
+from horus_agent import guard as guard_mod
 from horus_agent.manifest import (
     build_manifest_from_workflow,
     task_runs_python_code,
 )
+from horus_agent.ops import OpRunner
 from horus_agent.policy import PolicyError
-from tests.unit.test_guard import Env, env, refused
+from horus_agent.protocol import PolicyRefusedError
+from tests.unit.test_guard import RUN1, Env, env, fake_slurm, refused
 from tests.unit.test_policy_hardening import launch_t, manifest, wait_exit
 
-__all__ = ["env"]
+__all__ = ["env", "fake_slurm"]
 
 DATA_B64 = base64.b64encode(b"x").decode()
 
@@ -239,7 +243,7 @@ def test_the_job_env_keeps_pythonsafepath() -> None:
     assert launch.job_env(Path("/h"))["PYTHONSAFEPATH"] == "1"
 
 
-# --- approved scripts and constants still stage ------------------------------
+# --- approved scripts and constants still stage -----------------------------
 
 
 def _script_release() -> Any:
@@ -468,3 +472,172 @@ def test_the_layout_is_stored_with_the_approval(
     from horus_agent.manifest import Manifest
 
     assert Manifest.from_json(path.read_text()).layout == approved.layout
+
+
+# --- minors -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", [".horusrc", ".horus_x", ".horus-agent2"])
+async def test_only_the_runtimes_own_hidden_names_pass(
+    env: Env, name: str
+) -> None:
+    await refused(env, "put_file", "", path=str(env.run / name), data=DATA_B64)
+    await env.call("put_file", path=str(env.run / "o"), data=DATA_B64)
+
+
+def test_the_approve_screen_leads_with_the_warnings() -> None:
+    approved = manifest("cat ${inp}", inputs=INPUTS_FOR_SHOW)
+    shown = cli._show(approved)
+    assert shown.index("Warning:") < shown.index("Task t")
+    assert "agent tasks," in shown.splitlines()[1]
+
+
+INPUTS_FOR_SHOW = [{"id": "inp", "kind": "file"}]
+
+
+def test_approve_reads_a_bounded_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    big = tmp_path / "r.zip"
+    big.write_bytes(b"x" * 10)
+    monkeypatch.setattr(cli, "MAX_DOWNLOAD_BYTES", 5)
+    with pytest.raises(ValueError, match="over 5 bytes"):
+        cli._archive(str(big))
+
+
+async def test_a_job_dir_is_recorded_before_the_launch_awaits(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    approved = manifest("true", inputs=[], outputs=[])
+    policy.approve(approved, "root")
+    seen: dict[str, Any] = {}
+    job = env.run / "j"
+
+    async def spy(*_a: Any, **_k: Any) -> dict[str, int]:
+        seen["recorded"] = env.guard.job(RUN1, job) is not None
+        try:
+            env.guard.check_writable(
+                RUN1, job / "home" / "R" / "lib" / "x", "put_file"
+            )
+        except PolicyRefusedError as exc:
+            seen["refused"] = str(exc)
+        return {"pid": 1}
+
+    monkeypatch.setattr(env.runner, "_launch", spy)
+    await env.call(
+        "task_launch",
+        release=approved.release_hash,
+        task="t",
+        task_id="t",
+        job_dir=str(job),
+        cwd=str(env.run),
+        bindings={},
+    )
+    assert seen["recorded"] and "holds a job" in seen["refused"]
+    assert (job / "home").stat().st_mode & 0o777 == 0o700
+
+
+async def test_digest_is_answered_for_what_the_run_staged(env: Env) -> None:
+    (env.run / "results").mkdir()
+    planted = env.run / "d"
+    planted.write_text("secret")
+    await refused(env, "digest", "was not staged", path=str(planted))
+    with pytest.raises(RuntimeError, match="FileNotFoundError"):
+        await env.call("digest", path=str(env.run / "gone"))
+    await env.call("put_file", path=str(env.run / "f"), data=DATA_B64)
+    assert await env.call("digest", path=str(env.run / "f"))
+    env.with_policy(uploads=True)
+    assert await env.call("digest", path=str(planted))
+
+
+# --- cancel_run kills only a group the recorded pid leads -------------------
+
+
+async def test_cancel_run_spares_a_group_the_pid_no_longer_leads(
+    env: Env,
+) -> None:
+    import os
+    import signal
+    import subprocess
+
+    mine = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    other = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        await env.call("mkdir", path=str(env.run / "o"))
+        # a recorded pid that left the recorded group (pid reuse)
+        env.guard.add_job(RUN1, env.run / "j1", pid=mine.pid, pgid=other.pid)
+        await env.call("cancel_run", release="basic")
+        assert other.poll() is None and mine.poll() is None
+        env.guard.add_job(RUN1, env.run / "j2", pid=mine.pid, pgid=mine.pid)
+        assert await env.call("cancel_run", release="basic") == 1
+        mine.wait(timeout=5)
+        assert other.poll() is None
+    finally:
+        for proc in (mine, other):
+            with __import__("contextlib").suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+
+
+# --- the typed Slurm ops ----------------------------------------------------
+
+
+def _slurm_args(env: Env, job: str) -> dict[str, Any]:
+    return {
+        "task_id": "big",
+        "job_dir": str(env.run / ".horus_job" / job),
+        "cwd": str(env.run),
+        "bindings": {
+            "data": {"path": str(env.run / "data")},
+            "model": {"path": str(env.run / "m.bin")},
+        },
+    }
+
+
+@pytest.mark.usefixtures("fake_slurm")
+async def test_cancel_run_cancels_the_slurm_jobs_of_the_run(
+    env: Env, fake_slurm: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_SLURM_PENDING_S", "30")
+    env.runner = OpRunner(
+        job_env=("FAKE_SLURM_STATE", "FAKE_SLURM_PENDING_S"), guard=env.guard
+    )
+    result = await env.call(
+        "slurm_submit", release="slurm", task="big", **_slurm_args(env, "s1")
+    )
+    record = env.guard.job(RUN1, env.run / ".horus_job" / "s1")
+    assert record is not None and guard_mod.job_running(
+        env.run / ".horus_job" / "s1", record
+    )
+    await env.call("cancel_run", release="slurm")
+    assert result["job_id"] in (fake_slurm / "scancel.log").read_text()
+    record = env.guard.job(RUN1, env.run / ".horus_job" / "s1")
+    assert record is not None
+    assert not guard_mod.job_running(env.run / ".horus_job" / "s1", record)
+
+
+@pytest.mark.usefixtures("fake_slurm")
+async def test_a_slurm_job_that_left_the_queue_holds_no_run_open(
+    env: Env,
+) -> None:
+    await env.call(
+        "slurm_submit", release="slurm", task="big", **_slurm_args(env, "s2")
+    )
+    for _ in range(100):
+        status = await env.call(
+            "slurm_status",
+            release="slurm",
+            job_dir=str(env.run / ".horus_job" / "s2"),
+        )
+        if status["final"] is not None:
+            break
+        await asyncio.sleep(0.05)
+    assert status["final"]["state"] in ("COMPLETED", "FAILED")
+    record = env.guard.job(RUN1, env.run / ".horus_job" / "s2")
+    assert record is not None
+    assert not env.guard._active(RUN1, env.guard.run_record(RUN1) or {})
+    assert not guard_mod.job_running(env.run / ".horus_job" / "s2", record)
+    await env.call(
+        "remove", release="slurm", path=str(env.run / ".horus_job" / "s2")
+    )  # a finished job's dir may go
+    assert not (env.run / ".horus_job" / "s2").exists()

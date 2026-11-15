@@ -362,6 +362,10 @@ async def prepare(
     side = cwd / "side-artifacts"
     if SIDE_ENV in args.env:
         side = guard.confine_bound(run_id, args.env[SIDE_ENV])
+    guard.note_made(run_id, cwd)
+    for name, binding in args.bindings.items():
+        if binding.path is not None and (task["inputs"].get(name) is None):
+            guard.note_made(run_id, Path(str(values[name])))  # an output
     command = render(template, values)
     env = {**args.env, **job_env(job_home(guard, job_dir))}
     return Prepared(command, env, cwd, job_dir, side, task)

@@ -17,6 +17,7 @@ import shlex
 import shutil
 import signal
 import tempfile
+import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -381,6 +382,8 @@ class OpRunner:
                 guard.check_readable(op.run_id, paths["path"])
             case "get_file" | "read_range":
                 guard.check_readable(op.run_id, paths["path"])
+            case "digest":
+                guard.check_digest(op.run_id, paths["path"])
             case "put_file":
                 data = b64d(args["data"])
                 if len(data) > policy.max_put_bytes:
@@ -678,8 +681,10 @@ class OpRunner:
         log = horus_logger.log
         log.info(f"[run {(op.run_id or '-')[:8]}] {op.method} {args.task_id}")
         job_dir.mkdir(parents=True)
+        # Recorded before the next await: from now on no op may write in it.
+        guard.add_job(op.run_id, job_dir, started=time.time())
         if Path(prepared.env["HOME"]).parent == job_dir:
-            (job_dir / launch.HOME_SUBDIR).mkdir()
+            (job_dir / launch.HOME_SUBDIR).mkdir(mode=0o700)
         if slurm:
             return await self._sbatch(op.run_id, prepared)
         result = await self._launch(
@@ -737,10 +742,9 @@ class OpRunner:
                 if (Path(job_dir) / "exit_code").exists():
                     continue
                 pid, pgid = job.get("pid"), job.get("pgid")
-                with contextlib.suppress(ProcessLookupError):
-                    # Only a group the recorded job still leads.
-                    if pid and pgid and os.getpgid(pid) == pgid:
-                        stopped += await self._signal(pgid, signal.SIGKILL)
+                # Only a group the recorded job still leads.
+                if _leads(pid, pgid):
+                    stopped += await self._signal(pgid, signal.SIGKILL)
                 if slurm_id := job.get("slurm_job_id"):
                     with contextlib.suppress(RuntimeError):
                         await self._slurm_cancel(slurm_id)
@@ -875,7 +879,11 @@ class OpRunner:
         record = None if guard is None else guard.run_record(run_id)
         for job_dir, info in ((record or {}).get("jobs") or {}).items():
             # Also the jobs launched before this agent restarted.
-            if info.get("pgid") and guard_mod.job_running(Path(job_dir), info):
+            if (
+                info.get("pgid")
+                and guard_mod.job_running(Path(job_dir), info)
+                and _leads(info.get("pid"), info["pgid"])
+            ):
                 jobs.setdefault(job_dir, info["pgid"])
         for job_dir, info in ((record or {}).get("jobs") or {}).items():
             if info.get("slurm_job_id") and guard_mod.job_running(
@@ -898,6 +906,16 @@ class OpRunner:
             if guard is not None:
                 guard.end_job(run_id, Path(job_dir))
         return killed
+
+
+def _leads(pid: int | None, pgid: int | None) -> bool:
+    """Whether process *pid* is still in group *pgid* (its recorded one)."""
+    if not pid or not pgid:
+        return False
+    try:
+        return os.getpgid(pid) == pgid
+    except ProcessLookupError:
+        return False
 
 
 FINAL_STATES = frozenset(

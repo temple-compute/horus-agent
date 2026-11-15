@@ -95,6 +95,7 @@ TEST_NAMES = (
     "good.tgz",
     "bad.tgz",
     "dest",
+    "src",
     "moved",
     "json",
     "json.py",
@@ -421,6 +422,8 @@ async def test_native_file_ops(env: Env) -> None:
     (src / "a").write_text("a")
     (src / "sub" / "b").write_text("b")
     expected = digest(src)
+    await refused(env, "digest", "was not staged", path=str(src))
+    await env.call("mkdir", path=str(src))
     assert await env.call("digest", path=str(src)) == expected
     assert (await env.call("digest", path=str(src), mode="fast")).startswith(
         "fast:"
