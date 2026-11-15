@@ -131,7 +131,7 @@ def _working_dir(
     root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
     allow = guard.policy.allow_code_suffixes
     if found := held_code(
-        cwd, root, allow, guard.code_ok(run_id), manifest.digests
+        cwd, root, allow, guard.code_ok(run_id), _ships(guard, manifest)
     ):
         raise PolicyRefusedError(
             f"{found[0]} holds settings or code a tool would read on its "
@@ -163,14 +163,14 @@ def held_code(
     root: Path,
     allow: tuple[str, ...],
     approved: set[str] = frozenset(),  # type: ignore[assignment]
-    digests: frozenset[str] = frozenset(),
+    ships: Callable[[Path, str], bool] = lambda _p, _d: False,
 ) -> tuple[Path, str] | None:
     """
     The first entry the agent's own user wrote (an op, not a job) that a
     tool or an interpreter would load on its own, and why: anywhere below
     *cwd*, and directly in each folder from *cwd* up to *root*. Code the
     release approves passes: paths in *approved*, and files whose content
-    hashes to one of its *digests*.
+    is the content its manifest ships at that path (*ships*).
     """
     mine = os.geteuid()
     seen = 0
@@ -191,20 +191,26 @@ def held_code(
                 if info.st_uid != mine:
                     continue
                 if why := name_problem(entry.name, allow):
-                    if _approved(Path(entry.path), approved, digests):
+                    if _approved(Path(entry.path), approved, ships):
                         continue
                     return Path(entry.path), why
     return None
 
 
-def _approved(path: Path, approved: set[str], digests: frozenset[str]) -> bool:
-    """Whether *path* is code the release approves, by place or content."""
+def _approved(
+    path: Path, approved: set[str], ships: Callable[[Path, str], bool]
+) -> bool:
+    """Whether *path* is code the release approves, by place and content."""
     if any(str(p) in approved for p in (path, *path.parents)):
         return True
     try:
-        return path.is_file() and native.digest(path) in digests
+        return path.is_file() and ships(path, native.digest(path))
     except OSError:
         return False
+
+
+def _ships(guard: Guard, manifest: Manifest) -> Callable[[Path, str], bool]:
+    return lambda path, content: guard.shipped(path, content, manifest)
 
 
 async def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
@@ -274,7 +280,9 @@ async def _check_python(  # noqa: PLR0913, PLR0917
         return
     root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
     if (
-        held_code(cwd, root, (), guard.code_ok(run_id), manifest.digests)
+        held_code(
+            cwd, root, (), guard.code_ok(run_id), _ships(guard, manifest)
+        )
         is None
         or probe is None
     ):

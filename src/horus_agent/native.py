@@ -138,6 +138,7 @@ def unpack(  # noqa: PLR0913, PLR0917
     sha: str | None = None,
     strip_exec: bool = False,
     trust: Callable[[Path], bool] | None = None,
+    check_tree: Callable[[Path], None] | None = None,
 ) -> bool:
     """
     Extract the tarball *pkg* into folder *dest*, refusing absolute paths,
@@ -181,6 +182,8 @@ def unpack(  # noqa: PLR0913, PLR0917
                     )
             tar.extractall(tmp, members=members, filter="data")
         trusted = _vet_tree(tmp, refuse, strip_exec, trust)
+        if check_tree is not None:
+            check_tree(tmp)
         if dest.exists() or dest.is_symlink():
             dest.rename(old)
         tmp.rename(dest)

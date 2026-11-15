@@ -18,7 +18,7 @@ import pwd
 import stat
 import time
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -361,7 +361,7 @@ def approve(
     about = dict(manifest.about)
     about["approved_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     about["approved_by"] = by
-    stored = Manifest(manifest.body, about, manifest.warnings, manifest.layout)
+    stored = replace(manifest, about=about)
     path = directory / f"{manifest.release_hash}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(stored.to_json())

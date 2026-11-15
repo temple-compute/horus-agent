@@ -134,6 +134,12 @@ class Manifest:
     and script path, and each task id. Not part of the hash; stored with
     the approval and shown on the approve screen.
     """
+    consts: tuple[tuple[str, str], ...] = ()
+    """
+    ``(path, digest)`` of every constant file, folder (and each file in it)
+    and script the release ships. Code and shipped names are staged only at
+    their own path with their own content. Not part of the hash.
+    """
 
     @property
     def release_hash(self) -> str:
@@ -168,6 +174,7 @@ class Manifest:
             {
                 "about": self.about,
                 "body": self.body,
+                "consts": [list(c) for c in self.consts],
                 "layout": list(self.layout),
                 "release_hash": self.release_hash,
                 "warnings": list(self.warnings),
@@ -191,6 +198,7 @@ class Manifest:
             about=raw.get("about") or {},
             warnings=tuple(raw.get("warnings") or ()),
             layout=tuple(raw.get("layout") or ()),
+            consts=tuple((str(p), str(d)) for p, d in raw.get("consts") or ()),
         )
         if raw.get("release_hash") != manifest.release_hash:
             raise ManifestError("Stored hash does not match the manifest")
@@ -296,6 +304,7 @@ def build_manifest_from_workflow(
         about=info,
         warnings=tuple(builder.warnings),
         layout=tuple(sorted(builder.layout)),
+        consts=tuple(sorted(builder.consts)),
     )
 
 
@@ -374,6 +383,7 @@ class _Builder:
         self.used: dict[str, dict[str, Any]] = {}
         self.warnings: list[str] = []
         self.layout: set[str] = set()
+        self.consts: set[tuple[str, str]] = set()
 
     def _declare(self, raw: Any) -> None:
         """Note the names a declared path puts at the top of a folder."""
@@ -559,6 +569,7 @@ class _Builder:
         if path in self.files:
             digest = file_digest(self.files[path])
             self.used[digest] = {"size": len(self.files[path]), "member": path}
+            self.consts.add((path, digest))
             return digest
         prefix = path.rstrip("/") + "/"
         members = {
@@ -566,7 +577,12 @@ class _Builder:
             for name, data in self.files.items()
             if name.startswith(prefix)
         }
-        return tree_digest(members) if members else None
+        if not members:
+            return None
+        whole = tree_digest(members)
+        self.consts.add((path.rstrip("/"), whole))
+        self.consts.update((prefix + n, d) for n, d in members.items())
+        return whole
 
     def _runtime(
         self, where: str, runtime: dict[str, Any], inputs: dict[str, Any]

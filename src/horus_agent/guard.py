@@ -580,15 +580,74 @@ class Guard:
             name, self.policy.allow_code_suffixes, code_ok=trusted
         )
 
-    def trusts_tree(self, manifest: Manifest | None) -> Callable[[Path], bool]:
-        """Whether a folder is a constant folder *manifest* approves."""
+    def shipped(
+        self, path: Path, content: str, manifest: Manifest | None
+    ) -> bool:
+        """Whether *path* is where *manifest* ships a file or folder of
+        digest *content*: its declared path, with exactly that content.
+        """
+        return manifest is not None and any(
+            d == content for d in self._exact(path, manifest)
+        )
+
+    def _exact(self, path: Path, manifest: Manifest) -> list[str]:
+        """Digests *manifest* ships at *path* (a declared path ends it)."""
+        rel = "/" + path.relative_to(self.work_dir).as_posix()
+        return [d for p, d in manifest.consts if rel.endswith("/" + p)]
+
+    def holds_shipped(self, path: Path, manifest: Manifest | None) -> bool:
+        """Whether *path* is, or is inside, a path the release ships."""
+        if manifest is None:
+            return False
+        rel = "/" + path.relative_to(self.work_dir).as_posix() + "/"
+        return any(f"/{p}/" in rel for p, _d in manifest.consts)
+
+    def trusts_tree(
+        self, manifest: Manifest | None, dest: Path
+    ) -> Callable[[Path], bool]:
+        """Whether a folder is the constant folder *manifest* ships at
+        *dest*.
+        """
 
         def trusted(tree: Path) -> bool:
-            return manifest is not None and (
-                digest(tree, "deep") in manifest.digests
+            return manifest is not None and self.shipped(
+                dest, digest(tree, "deep"), manifest
             )
 
         return trusted
+
+    def tree_check(
+        self, manifest: Manifest | None, dest: Path
+    ) -> Callable[[Path], None] | None:
+        """
+        For an unpack into *dest*: a check of the unpacked tree that keeps
+        any name the release ships (an exact path under *dest*) to its
+        shipped content, or ``None`` when nothing shipped can be touched.
+        """
+        if manifest is None or not self.policy.strict:
+            return None
+
+        def check(tree: Path) -> None:
+            if self.shipped(dest, digest(tree, "deep"), manifest):
+                return
+            for root, dirs, names in os.walk(tree):
+                for name in dirs + names:
+                    where = dest / Path(root, name).relative_to(tree)
+                    if not self.holds_shipped(where, manifest):
+                        continue
+                    file = Path(root, name)
+                    now = (
+                        digest(file, "deep")
+                        if file.is_dir()
+                        else file_digest(file.read_bytes())
+                    )
+                    if not self.shipped(where, now, manifest):
+                        raise PolicyRefusedError(
+                            f"{name!r} is a name the release ships; only "
+                            "its approved content can be staged there"
+                        )
+
+        return check
 
     def code_ok(self, run_id: str | None) -> set[str]:
         """Paths holding code the release approves, by content."""
@@ -676,12 +735,19 @@ class Guard:
         if path.name in RESERVED_NAMES or path.name.endswith(".horus-sha256"):
             raise PolicyRefusedError(f"{how} may not write {path.name}")
         if how != "remove":
-            approved = (
-                data is not None
-                and manifest is not None
-                and file_digest(data) in manifest.digests
+            approved = data is not None and self.shipped(
+                path, file_digest(data), manifest
             )
             self.check_name(path, code_ok=approved)
+            if (
+                not approved
+                and how not in ("mkdir", "unpack")
+                and self.holds_shipped(path, manifest)
+            ):
+                raise PolicyRefusedError(
+                    f"{how} refused: {path.name!r} is a name the release "
+                    "ships; only its approved content can be staged there"
+                )
             self.check_layout(run_id, path, manifest)
             self.note_made(run_id, path)
             if approved and code_suffix(path.name) is not None:

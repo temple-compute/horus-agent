@@ -499,7 +499,15 @@ class OpRunner:
                     guard is not None and guard.policy.strict,
                     None
                     if guard is None or admitted is None
-                    else guard.trusts_tree(admitted.manifest),
+                    else guard.trusts_tree(
+                        admitted.manifest, Path(args["dest"])
+                    ),
+                    None
+                    if guard is None
+                    else guard.tree_check(
+                        None if admitted is None else admitted.manifest,
+                        Path(args["dest"]),
+                    ),
                 )
                 if guard is not None and needed_trust:
                     guard.add_code_ok(op.run_id, Path(args["dest"]))
