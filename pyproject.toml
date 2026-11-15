@@ -9,9 +9,10 @@ classifiers = [
 ]
 dependencies = [
   "certifi>=2024.2.2",
-  "horus-runtime>=0.8.4,<0.10",
+  "horus-runtime>=0.9.0,<0.11",
   "httpx>=0.28,<0.29",
   "pydantic>=2.0,<3",
+  "pyyaml>=6,<7",
 ]
 dynamic = ["version"]
 
@@ -36,6 +37,7 @@ dev = [
   "pytest-cov~=7.0",
   "ruff~=0.15",
   "horus-slurm==0.6.2",
+  "types-pyyaml~=6.0",
 ]
 
 [build-system]
@@ -127,3 +129,4 @@ indent-style = "space"
 
 [tool.uv-dynamic-versioning]
 fallback-version = "0.0.1"
+

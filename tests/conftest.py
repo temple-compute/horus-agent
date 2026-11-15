@@ -17,6 +17,7 @@ import pytest
 from horus_runtime.context import HorusContext, _runtime_ctx
 from horus_runtime.registry.auto_registry import AutoRegistry
 
+from horus_agent import config
 from horus_agent.config import AgentConfig
 from horus_agent.daemon import Agent
 from horus_agent.target import (
@@ -49,6 +50,21 @@ def process_state() -> Generator[None]:
         os.environ.clear()
         os.environ.update(environ)
         os.umask(umask)
+
+
+@pytest.fixture(autouse=True)
+def policy_dir(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """
+    A private stand-in for ``/etc/horus-agent``, owned by this user, which
+    the policy checks trust like root.
+    """
+    path = tmp_path_factory.mktemp("etc") / "horus-agent"
+    path.mkdir(mode=0o755)
+    monkeypatch.setattr(config, "POLICY_PATH", path / "policy.toml")
+    monkeypatch.setattr(config, "POLICY_OWNERS", frozenset({0, os.getuid()}))
+    return path
 
 
 @pytest.fixture

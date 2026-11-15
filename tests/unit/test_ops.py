@@ -22,6 +22,7 @@ import pytest
 from horus_agent import ops
 from horus_agent.ops import OpRunner
 from horus_agent.protocol import Op
+from tests.fake_broker import FakeBroker
 
 
 async def run(runner: OpRunner, method: str, **args: Any) -> Any:
@@ -321,3 +322,34 @@ async def test_signal_never_reaches_the_agent(tmp_path: Path) -> None:
         await run(
             OpRunner(), "signal", pid=os.getpid(), job_dir=str(job), sig=15
         )
+
+
+async def test_file_ops_never_follow_a_symlink(
+    broker: FakeBroker, tmp_path: Path
+) -> None:
+    """
+    A task can swap a file for a symlink after the path check: reads and
+    writes refuse the link instead of reaching what it points to.
+    """
+    secret = tmp_path / "secret"
+    secret.write_bytes(b"agent token")
+    link = tmp_path / "link"
+    link.symlink_to(secret)
+    broker.blobs["b"] = b"payload"
+    runner = OpRunner()
+    calls: list[tuple[str, dict[str, Any]]] = [
+        ("get_file", {"path": str(link)}),
+        ("read_range", {"path": str(link), "offset": 0, "length": 4}),
+        ("put_file", {"path": str(link), "data": "eA=="}),
+        ("upload", {"url": f"{broker.url}/blobs/u", "path": str(link)}),
+        ("fetch", {"url": f"{broker.url}/blobs/b", "path": str(link)}),
+    ]
+    for method, args in calls:
+        with pytest.raises(RuntimeError, match="symlink"):
+            await run(runner, method, **args)
+    assert secret.read_bytes() == b"agent token"
+    assert "u" not in broker.blobs
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(RuntimeError, match="Not a regular file"):
+        await run(runner, "get_file", path=str(fifo))

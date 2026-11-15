@@ -28,9 +28,11 @@ import pydantic
 from horus_runtime.logging import horus_logger
 
 from horus_agent.config import AgentConfig, JobsPolicy
+from horus_agent.guard import Guard
 from horus_agent.logs import describe_args, describe_result, summarize
 from horus_agent.ops import OpRunner
-from horus_agent.protocol import POLL_WAIT_S, Op, OpResult
+from horus_agent.policy import Approvals, Policy
+from horus_agent.protocol import POLL_WAIT_S, PROTOCOL, Op, OpResult
 
 BACKOFF_MAX_S = 60.0
 MAX_HOLDING = 1000
@@ -42,6 +44,8 @@ CONTROL_METHODS = frozenset(
 )
 """Quick ops that never wait behind :data:`MAX_RUNNING` long ones."""
 MAX_BATCH_BYTES = 8 * 1024 * 1024
+REVOKE_CHECK_S = 10.0
+"""How often running jobs of revoked releases are looked for."""
 DRAIN_TIMEOUT_S = 30.0
 """How long a stopping agent keeps trying to deliver its last results."""
 
@@ -101,15 +105,20 @@ class Agent:
     """One running agent process."""
 
     def __init__(
-        self, config: AgentConfig, jobs: JobsPolicy | None = None
+        self, config: AgentConfig, policy: Policy | None = None
     ) -> None:
         """
-        Serve as the agent registered in *config*, running tasks as *jobs*
-        says.
+        Serve as the agent registered in *config*, checking every op against
+        *policy* (none: ops are not checked, for embedding and tests).
         """
         self.config = config
-        jobs = jobs or JobsPolicy()
-        self.runner = OpRunner(jobs.run_as, jobs.run_as_via, config.job_env)
+        self.policy = policy
+        self.approvals = Approvals()
+        guard = None if policy is None else Guard(policy, self.approvals)
+        jobs = policy.jobs if policy else JobsPolicy()
+        self.runner = OpRunner(
+            jobs.run_as, jobs.run_as_via, config.job_env, guard
+        )
         self._slots = asyncio.Semaphore(MAX_RUNNING)
         self.session = uuid4().hex
         """
@@ -122,6 +131,17 @@ class Agent:
         an op handed out but missing here never reached this agent (the
         poll response was lost), so the broker reports it lost.
         """
+
+    async def _stop_revoked(self, stop: asyncio.Event) -> None:
+        """Kill the jobs of revoked releases soon after each revoke."""
+        while not stop.is_set():
+            try:
+                await self.runner.stop_revoked()
+            except Exception as exc:
+                horus_logger.log.warning(
+                    f"Stopping revoked runs failed: {exc}"
+                )
+            await _pause(stop, REVOKE_CHECK_S)
 
     async def serve(self, stop: asyncio.Event) -> None:
         """
@@ -149,9 +169,13 @@ class Agent:
             timeout=httpx.Timeout(30.0, read=POLL_WAIT_S + 30.0),
         ) as http:
             sender = asyncio.create_task(self._send_results(http, results))
+            reaper = asyncio.create_task(self._stop_revoked(stop))
             try:
                 await self._poll_loop(http, stop, results, running)
             finally:
+                reaper.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await reaper
                 log.debug(
                     f"Stopping: {len(running)} ops still running, "
                     f"{results.qsize()} results to deliver"
@@ -165,7 +189,7 @@ class Agent:
                 with contextlib.suppress(asyncio.CancelledError):
                     await sender
 
-    async def _poll_loop(
+    async def _poll_loop(  # noqa: PLR0912, PLR0915
         self,
         http: httpx.AsyncClient,
         stop: asyncio.Event,
@@ -190,6 +214,10 @@ class Agent:
                 await _pause(stop, 0.5)
                 continue
             body["holding"] = sorted(self.holding)
+            if self.policy is not None:
+                body["protocol"] = PROTOCOL
+                body["policy"] = self.policy.summary()
+                body["approved"] = sorted(self.approvals.hashes())
             log.debug(
                 f"Poll: waiting up to {POLL_WAIT_S}s for ops, holding "
                 f"{len(self.holding)}"
