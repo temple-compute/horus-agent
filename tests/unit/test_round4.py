@@ -214,10 +214,10 @@ def test_approve_refuses_python_dash_m_on_an_old_python(
     def old(*_a: Any, **_k: Any) -> Any:
         return subprocess.CompletedProcess([], 0, stdout="3 10\n")
 
-    monkeypatch.setattr(cli.subprocess, "run", old)
+    monkeypatch.setattr(subprocess, "run", old)
     assert "older than 3.11" in str(cli._python_problem(approved))
     monkeypatch.setattr(
-        cli.subprocess,
+        subprocess,
         "run",
         lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout="3 12\n"),
     )
