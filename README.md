@@ -81,7 +81,7 @@ chmod 644 /etc/horus-agent/policy.toml
 
 The same file holds the rest of the machine's policy; see [Policy and approved releases](#policy-and-approved-releases).
 
-With `run_as` set, files are shared with that group (umask 007), never with other users. The token stays in `/var/lib/horus-agent`, which the task user cannot open. The sticky bit (`3770`) keeps the task user from renaming or replacing the agent's own folders in the work dir; a strict agent refuses to start on a group-writable work dir without it. Approved jobs get the task user's own home directory as `HOME` (`pw_dir`, outside the work dir), or `[jobs] home` when set, so conda environments, R libraries and caches installed there keep working.
+With `run_as` set, files are shared with that group (umask 007), never with other users. The token stays in `/var/lib/horus-agent`, which the task user cannot open. `horus-agent register` creates the work dir with this layout (mode `3770`, plus the task user's group when run as root) and adds the sticky bit to a plain `0770` one; `horus-agent run` prints the `chgrp`/`chmod` command when the layout is wrong. The sticky bit (`3770`) keeps the task user from renaming or replacing the agent's own folders in the work dir; a strict agent refuses to start on a group-writable work dir without it. Approved jobs get the task user's own home directory as `HOME` (`pw_dir`, outside the work dir), or `[jobs] home` when set, so conda environments, R libraries and caches installed there keep working.
 
 The agent switches user with `/usr/bin/sudo` or `/usr/bin/setpriv`, by absolute path and with a fixed environment, and the task's environment is applied only after the switch:
 

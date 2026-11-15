@@ -12,11 +12,14 @@ import argparse
 import asyncio
 import dataclasses
 import getpass
+import grp
 import json
 import os
 import platform
+import pwd
 import signal
 import socket
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -45,15 +48,65 @@ TOKEN_ENV = "HORUS_AGENT_TOKEN"
 """Registration token, when not typed or piped in."""
 
 
-def _work_dir(value: str | None) -> Path:
+def _job_group(jobs: config.JobsPolicy) -> tuple[str, int] | None:
+    """Name and gid of the task user's group, None without ``run_as``."""
+    if not jobs.run_as:
+        return None
+    try:
+        gid = pwd.getpwnam(jobs.run_as).pw_gid
+        return grp.getgrgid(gid).gr_name, gid
+    except KeyError:
+        return None
+
+
+def layout_problem(path: Path, jobs: config.JobsPolicy) -> str | None:
+    """
+    The command that fixes the work dir's layout under ``run_as`` (group of
+    the task user, sticky bit), None when it is right or there is no
+    ``run_as``.
+    """
+    if (group := _job_group(jobs)) is None:
+        return None
+    info = path.stat()
+    fixes = []
+    if info.st_gid != group[1]:
+        fixes.append(f"chgrp {group[0]} {path}")
+    if not info.st_mode & stat.S_ISVTX:
+        fixes.append(f"chmod 3770 {path}")
+    if not fixes:
+        return None
+    return f"The work dir needs the run_as layout; run: {' && '.join(fixes)}"
+
+
+def _work_dir(
+    value: str | None, jobs: config.JobsPolicy, *, repair: bool = True
+) -> Path:
     """
     *value* as an absolute path, created if missing, with no access for
-    other users.
+    other users. With ``run_as`` a new dir gets mode 3770 and, as root, the
+    task user's group; a plain 0770 one gets the sticky bit. A stricter or
+    symlinked dir is left alone (``layout_problem`` names the fix).
     """
-    path = Path(value).expanduser() if value else config.default_work_dir()
-    path = path.resolve()
+    raw = Path(value).expanduser() if value else config.default_work_dir()
+    linked = raw.is_symlink()
+    if linked:
+        sys.stderr.write(f"{raw} is a symlink; its layout is not changed.\n")
+    path = raw.resolve()
+    fresh = not path.exists()
     path.mkdir(parents=True, exist_ok=True)
-    if (mode := path.stat().st_mode) & 0o007:
+    info = path.stat()
+    mode = info.st_mode
+    if linked:
+        return path
+    if repair and jobs.run_as and info.st_uid == os.geteuid():
+        if fresh and (group := _job_group(jobs)) and os.geteuid() == 0:
+            os.chown(path, -1, group[1])
+        if fresh or stat.S_IMODE(mode) == 0o770:
+            path.chmod(0o3770)
+            return path
+    if fresh:  # whatever the umask gave it
+        path.chmod(0o700)
+    elif mode & 0o007:
         path.chmod(mode & 0o7770)
     return path
 
@@ -82,7 +135,7 @@ def _register(args: argparse.Namespace) -> int:
         sys.stderr.write("No registration token given.\n")
         return 1
     ca_bundle = str(Path(args.ca_bundle).resolve()) if args.ca_bundle else ""
-    directory = _work_dir(args.work_dir)
+    directory = _work_dir(args.work_dir, config.load_jobs_policy())
     name: str | None = args.name
     body = {
         "token": token,
@@ -155,7 +208,12 @@ async def _run(work_dir: str | None) -> int:
         return 1
     try:
         check_broker_url(registered.url)
-        directory = _work_dir(work_dir or registered.work_dir or None)
+        jobs = config.load_jobs_policy()
+        directory = _work_dir(
+            work_dir or registered.work_dir or None, jobs, repair=False
+        )
+        if problem := layout_problem(directory, jobs):
+            raise ValueError(problem)
         if not os.access(directory, os.W_OK):
             raise ValueError(
                 f"The work dir {directory} is not writable (with the system "
@@ -449,6 +507,11 @@ def _policy_init(open_mode: bool, run_as: str) -> int:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     with os.fdopen(fd, "w") as fh:
         fh.write(policy.template(open_mode=open_mode, run_as=run_as))
+    if group := _job_group(config.JobsPolicy(run_as=run_as)):
+        sys.stdout.write(
+            f"The work dir needs group {group[0]} and mode 3770 "
+            "(horus-agent register sets them).\n"
+        )
     sys.stdout.write(
         f"Wrote {path}. Add the storage host to allowed_hosts, then "
         "restart the agent.\n"
