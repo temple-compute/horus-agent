@@ -348,3 +348,123 @@ async def test_an_approved_constant_folder_unpacks_with_its_code(
         },
     )
     await wait_exit(job)
+
+
+# --- M2: cloud files land only at declared names ----------------------------
+
+
+def _layout_release() -> Any:
+    return build_manifest_from_workflow(
+        {
+            "name": "w",
+            "artifacts": [
+                {"id": "ref", "kind": "file", "path": "refs/ref.fa"}
+            ],
+            "tasks": [
+                {
+                    "id": "align",
+                    "target": {"kind": "agent", "agent": "lab"},
+                    "executor": {"kind": "shell"},
+                    "runtime": {"kind": "command", "command": "ls ${reads}"},
+                    "inputs": [
+                        {"id": "reads", "kind": "file", "path": "inputs/r.fq"}
+                    ],
+                    "outputs": [
+                        {"id": "bam", "kind": "file", "path": "results/a.bam"}
+                    ],
+                }
+            ],
+        },
+        {},
+    )
+
+
+def test_the_layout_lists_what_the_release_declares() -> None:
+    assert set(_layout_release().layout) >= {
+        "align",
+        "inputs",
+        "r.fq",
+        "results",
+        "a.bam",
+        "refs",
+        "ref.fa",
+    }
+
+
+async def test_only_declared_names_can_be_staged(env: Env) -> None:
+    approved = _layout_release()
+    policy.approve(approved, "root")
+    release = approved.release_hash
+    ok = base64.b64encode(b"x").decode()
+    await env.call(
+        "put_file",
+        release=release,
+        path=str(env.run / "inputs" / "r.fq"),
+        data=ok,
+    )
+    await env.call(
+        "put_file",
+        release=release,
+        path=str(env.run / "align" / "results" / "a.bam"),
+        data=ok,
+    )
+    for path in (
+        env.run / "Rakefile",
+        env.run / "lib" / "x.txt",
+        env.run / "align" / "Taskfile.yml",
+        env.run / "align" / "data" / "x",
+    ):
+        message = await refused(
+            env,
+            "put_file",
+            "not an input, output",
+            release=release,
+            path=str(path),
+            data=ok,
+        )
+        assert path.parts[-1] in message or path.parts[-2] in message
+    await refused(
+        env, "mkdir", "not an input", release=release, path=str(env.run / "z")
+    )
+    await refused(
+        env,
+        "move",
+        "not an input",
+        release=release,
+        src=str(env.run / "inputs" / "r.fq"),
+        dst=str(env.run / "Justfile"),
+    )
+
+
+async def test_a_launch_refuses_an_undeclared_name_in_the_cwd(
+    env: Env,
+) -> None:
+    approved = _layout_release()
+    policy.approve(approved, "root")
+    cwd = env.run / "align"
+    cwd.mkdir()
+    (cwd / "Taskfile.yml").write_text("x")
+    await refused(
+        env,
+        "task_launch",
+        "Taskfile.yml",
+        release=approved.release_hash,
+        task="align",
+        task_id="align",
+        job_dir=str(cwd / ".horus_job" / "j"),
+        cwd=str(cwd),
+        bindings={
+            "reads": {"path": str(env.run / "inputs" / "r.fq")},
+        },
+        env={},
+    )
+
+
+def test_the_layout_is_stored_with_the_approval(
+    env: Env,  # noqa: ARG001
+) -> None:
+    approved = _layout_release()
+    path = policy.approve(approved, "root")
+    from horus_agent.manifest import Manifest
+
+    assert Manifest.from_json(path.read_text()).layout == approved.layout

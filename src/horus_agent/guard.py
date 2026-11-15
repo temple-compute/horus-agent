@@ -115,6 +115,8 @@ META_NAMES = frozenset(
 )
 """Names of files the agent writes for the resource monitor."""
 HORUS_OWN = frozenset({".horus", ".horus_job"}) | META_NAMES
+SIDE_NAMES = frozenset({"side-artifacts"})
+"""Folders the agent makes in a working directory for a task's samples."""
 """The only hidden names the runtime and the agent write into a run."""
 LOG_NAMES = frozenset({"stdout.log", "stderr.log"})
 META_MAX_BYTES = 64 * 1024
@@ -285,7 +287,9 @@ class Guard:
             if isinstance(value := getattr(args, name), str)
         }
         for name in WRITES.get(op.method, ()):
-            self.check_writable(op.run_id, paths[name], op.method)
+            self.check_writable(
+                op.run_id, paths[name], op.method, manifest=manifest
+            )
         return Admitted(args, manifest, task, paths)
 
     def _bound_control(self, op: Op) -> bool:
@@ -464,6 +468,62 @@ class Guard:
         self.check_name(path, code_ok=code_ok)
         return path
 
+    @staticmethod
+    def layout_allows(name: str, allowed: frozenset[str]) -> bool:
+        """Whether *name* may sit at the top of a run or working directory."""
+        return (
+            name in allowed
+            or name.split("[", maxsplit=1)[0] in allowed
+            or name.endswith(".horus-sha256")  # the agent's unpack markers
+            or ".horus-tmp" in name  # an unpack in progress
+            or ".horus-old" in name
+        )
+
+    def layout_names(self, manifest: Manifest | None) -> frozenset[str]:
+        """Names a run's folder or a task's working directory may hold."""
+        return (
+            HORUS_OWN
+            | SIDE_NAMES
+            | frozenset(manifest.layout if manifest else ())
+        )
+
+    def check_layout(
+        self, run_id: str | None, path: Path, manifest: Manifest | None
+    ) -> None:
+        """
+        Cloud-staged files land only at names the approved release declares
+        (an input, an output, a script, a task) at the top of the run's
+        folder or of a task's working directory.
+        """
+        if not self.policy.strict or manifest is None:
+            return
+        allowed = self.layout_names(manifest)
+        for root in self.roots(run_id):
+            if not path.is_relative_to(root) or path == root:
+                continue
+            rel = path.relative_to(root).parts
+            tops = [tuple(t.split("/")) for t in manifest.tasks]
+            tops += [tuple(t.split("[")[0].split("/")) for t in manifest.tasks]
+            depth = 0
+            while True:
+                if len(rel) <= depth:
+                    return
+                if (
+                    rel[depth] not in allowed
+                    and rel[depth].split("[")[0] not in allowed
+                ):
+                    raise PolicyRefusedError(
+                        f"{rel[depth]!r} is not an input, output, script or "
+                        "task of the approved release, so nothing may be "
+                        "staged there"
+                    )
+                inside = [
+                    t for t in tops if rel[: len(t)] == t and len(t) > depth
+                ]
+                if not inside:
+                    return
+                depth = max(len(t) for t in inside)
+
     def check_name(self, path: Path, *, code_ok: bool = False) -> None:
         """
         Refuse a path in the work dir naming a tool's config file or folder,
@@ -585,6 +645,7 @@ class Guard:
                 and file_digest(data) in manifest.digests
             )
             self.check_name(path, code_ok=approved)
+            self.check_layout(run_id, path, manifest)
             if approved and code_suffix(path.name) is not None:
                 self.add_code_ok(run_id, path)
         if path in self.roots(run_id):

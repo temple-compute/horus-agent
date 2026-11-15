@@ -137,6 +137,20 @@ def _working_dir(
             f"{found[0]} holds settings or code a tool would read on its "
             f"own; it was not made by an approved task: {found[1]}"
         )
+    if guard.policy.strict and not guard.policy.allow_same_user:
+        allowed = guard.layout_names(manifest)
+        mine = os.geteuid()
+        for folder in dict.fromkeys((cwd, root)):
+            with os.scandir(folder) as entries:
+                for entry in entries:
+                    if (
+                        not guard.layout_allows(entry.name, allowed)
+                        and entry.stat(follow_symlinks=False).st_uid == mine
+                    ):
+                        raise PolicyRefusedError(
+                            f"{entry.path} is not an input, output, script or "
+                            "task of the approved release, and an op wrote it"
+                        )
     return cwd
 
 

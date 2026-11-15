@@ -27,7 +27,14 @@ from horus_agent.manifest import (
 from horus_agent.native import digest
 from horus_agent.ops import OpRunner
 from horus_agent.protocol import PolicyRefusedError
-from tests.unit.test_guard import RUN1, RUN2, Env, env, refused
+from tests.unit.test_guard import (
+    RUN1,
+    RUN2,
+    Env,
+    env,
+    refused,
+    with_names,
+)
 
 __all__ = ["env"]  # the fixture
 
@@ -44,7 +51,9 @@ def manifest(command: str, **task: Any) -> Manifest:
     }
     spec.update(task)
     files = spec.pop("files", {})
-    return build_manifest_from_workflow({"name": "w", "tasks": [spec]}, files)
+    return with_names(
+        build_manifest_from_workflow({"name": "w", "tasks": [spec]}, files)
+    )
 
 
 async def wait_exit(job: Path) -> None:

@@ -67,6 +67,50 @@ def echo_manifest() -> Manifest:
     return build_manifest_from_workflow(wf, {})
 
 
+TEST_NAMES = (
+    "a",
+    "b",
+    "c",
+    "d",
+    "f",
+    "j",
+    "o",
+    "r",
+    "x",
+    "job",
+    "job2",
+    "s",
+    "p.tgz",
+    "r.tgz",
+    "m.tgz",
+    "src.tgz",
+    "tool.sh",
+    "data.py",
+    "results",
+    "scripts",
+    "in.json",
+    "pkgsrc",
+    "unpacked",
+    "tools",
+    "good.tgz",
+    "bad.tgz",
+    "dest",
+    "moved",
+    "json",
+    "json.py",
+    "$(touch PWNED)",
+    "payload.py",
+)
+"""Names the older tests stage at the top of a run."""
+
+
+def with_names(manifest: Manifest) -> Manifest:
+    """*manifest* whose layout also allows :data:`TEST_NAMES`."""
+    return dataclasses.replace(
+        manifest, layout=(*manifest.layout, *TEST_NAMES)
+    )
+
+
 @dataclass
 class Env:
     work: Path
@@ -117,11 +161,12 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     run = work / "proj" / RUN1
     run.mkdir(parents=True)
     hashes = []
-    for manifest in (
+    for built in (
         build_manifest((DATA / "basic.zip").read_bytes()),
         echo_manifest(),
         build_manifest((DATA / "slurm.zip").read_bytes()),
     ):
+        manifest = with_names(built)
         policy.approve(manifest, "root")
         hashes.append(manifest.release_hash)
     rules = Policy(work_dir=str(work), allowed_hosts=(HOST,))
@@ -525,7 +570,7 @@ async def test_task_launch_runs_the_agents_copy_of_inputs(env: Env) -> None:
 
 
 async def test_python_script_hash_is_checked(env: Env) -> None:
-    manifest = build_manifest((DATA / "script.zip").read_bytes())
+    manifest = with_names(build_manifest((DATA / "script.zip").read_bytes()))
     policy.approve(manifest, "root")
     (env.run / "s").mkdir()
     script = env.run / "s" / "qc.py"

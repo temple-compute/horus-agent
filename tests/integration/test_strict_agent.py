@@ -10,6 +10,7 @@ only: checked ops end to end, through the broker.
 """
 
 import asyncio
+import dataclasses
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -58,6 +59,18 @@ async def strict_agent(
         ],
     }
     manifest = build_manifest_from_workflow(wf, {})
+    manifest = dataclasses.replace(
+        manifest,
+        layout=(
+            *manifest.layout,
+            "src",
+            "src.tgz",
+            "moved",
+            "out",
+            "dest",
+            "copy",
+        ),
+    )
     policy.approve(manifest, "root")
     broker.release_hash = manifest.release_hash
     home = tmp_path / "agent-home"

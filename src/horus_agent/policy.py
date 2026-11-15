@@ -361,7 +361,7 @@ def approve(
     about = dict(manifest.about)
     about["approved_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     about["approved_by"] = by
-    stored = Manifest(manifest.body, about, manifest.warnings)
+    stored = Manifest(manifest.body, about, manifest.warnings, manifest.layout)
     path = directory / f"{manifest.release_hash}.json"
     tmp = path.with_suffix(".tmp")
     tmp.write_text(stored.to_json())

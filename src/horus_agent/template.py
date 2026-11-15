@@ -925,10 +925,8 @@ def _scan(  # noqa: PLR0912, PLR0915
                     out.append((None, False))  # a comment
                 i += 1
             continue
-        if (
-            (c in "$`"
-            and not _ASSIGN.match(word))
-            or (not word and c in "'\"" and s[i + 1 : i + 2] == "$")
+        if (c in "$`" and not _ASSIGN.match(word)) or (
+            not word and c in "'\"" and s[i + 1 : i + 2] == "$"
         ):
             if _command(words) == []:
                 whole.append(

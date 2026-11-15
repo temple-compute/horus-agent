@@ -413,7 +413,9 @@ class OpRunner:
                     and native.read_text(marker) == sha
                 )
                 if not admitted.unpacked:
-                    guard.check_writable(op.run_id, dest, "unpack")
+                    guard.check_writable(
+                        op.run_id, dest, "unpack", manifest=admitted.manifest
+                    )
             case "poll" | "signal" | "slurm_status" | "slurm_cancel":
                 if policy.strict and not guard.job(
                     op.run_id, paths["job_dir"]

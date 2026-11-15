@@ -127,6 +127,13 @@ class Manifest:
     about: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     """What an approver should read twice; not part of the hash."""
+    layout: tuple[str, ...] = ()
+    """
+    Names that may sit at the top of a run's folder or a task's working
+    directory: the first folder and the name of each declared input, output
+    and script path, and each task id. Not part of the hash; stored with
+    the approval and shown on the approve screen.
+    """
 
     @property
     def release_hash(self) -> str:
@@ -161,6 +168,7 @@ class Manifest:
             {
                 "about": self.about,
                 "body": self.body,
+                "layout": list(self.layout),
                 "release_hash": self.release_hash,
                 "warnings": list(self.warnings),
             },
@@ -182,6 +190,7 @@ class Manifest:
             body=raw["body"],
             about=raw.get("about") or {},
             warnings=tuple(raw.get("warnings") or ()),
+            layout=tuple(raw.get("layout") or ()),
         )
         if raw.get("release_hash") != manifest.release_hash:
             raise ManifestError("Stored hash does not match the manifest")
@@ -282,7 +291,12 @@ def build_manifest_from_workflow(
     _check_text(body)
     info = {"name": workflow.get("name")}
     info.update(about or {})
-    return Manifest(body=body, about=info, warnings=tuple(builder.warnings))
+    return Manifest(
+        body=body,
+        about=info,
+        warnings=tuple(builder.warnings),
+        layout=tuple(sorted(builder.layout)),
+    )
 
 
 def task_runs_python_code(task: Mapping[str, Any]) -> bool:
@@ -359,9 +373,19 @@ class _Builder:
         self.tasks: dict[str, dict[str, Any]] = {}
         self.used: dict[str, dict[str, Any]] = {}
         self.warnings: list[str] = []
+        self.layout: set[str] = set()
+
+    def _declare(self, raw: Any) -> None:
+        """Note the names a declared path puts at the top of a folder."""
+        if not isinstance(raw, str) or not raw:
+            return
+        path = _archive_path(raw)
+        self.layout.update({path.split("/", 1)[0], posixpath.basename(path)})
 
     def walk(self, workflow: dict[str, Any], prefix: str) -> None:
         roots = {a["id"]: a for a in _items(workflow.get("artifacts"))}
+        for artifact in roots.values():
+            self._declare(artifact.get("path"))
         named = workflow.get("targets") or {}
         if isinstance(named, list):
             named = {t.get("name") or t.get("id"): t for t in _items(named)}
@@ -375,6 +399,7 @@ class _Builder:
             if task.get("kind") == "subworkflow" or isinstance(sub, dict):
                 if not isinstance(sub, dict):
                     raise ManifestError(f"Subworkflow {task_id!r} has no body")
+                self.layout.add(f"{prefix}{task_id}".split("/", 1)[0])
                 self.walk(sub, f"{prefix}{task_id}/")
                 continue
             target, shared = task.get("target"), False
@@ -397,6 +422,13 @@ class _Builder:
     ) -> dict[str, Any]:
         task_id = str(task.get("id"))
         where = f"Task {task_id!r}"
+        self.layout.add(task_id.split("/", 1)[0])
+        for artifact in [
+            *_items(task.get("inputs")),
+            *_items(task.get("outputs")),
+        ]:
+            self._declare(artifact.get("path"))
+        self._declare((task.get("runtime") or {}).get("script"))
         kind = task.get("kind", "horus_task")
         if kind not in ("horus_task", "horus_map"):
             raise ManifestError(f"{where}: kind {kind!r} cannot run on agents")

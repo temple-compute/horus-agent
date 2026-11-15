@@ -283,6 +283,10 @@ def _show(manifest: Manifest) -> str:
             lines.append(row.rstrip())
         for name in sorted(task["env"]):
             lines.append(f"  env {_safe(name)}: {_safe(task['env'][name])}")
+    lines.append(
+        "\nNames cloud files may take at the top of a run: "
+        + _safe(", ".join(manifest.layout) or "(none)")
+    )
     lines += [f"\nWarning: {_safe(w)}" for w in manifest.warnings]
     return "\n".join(lines) + "\n"
 
