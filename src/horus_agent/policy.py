@@ -25,7 +25,7 @@ from urllib.parse import urlsplit
 
 from horus_agent import config
 from horus_agent.config import JobsPolicy
-from horus_agent.manifest import Manifest, ManifestError
+from horus_agent.manifest import Manifest, ManifestError, check_paths
 
 APPROVALS_TTL_S = 10.0
 """How long a listing of approved hashes is reused; bounds revoke latency."""
@@ -356,6 +356,7 @@ def approve(
     manifest: Manifest, by: str, directory: Path | None = None
 ) -> Path:
     """Store *manifest* as approved, world-readable, owner-writable."""
+    check_paths(manifest)
     directory = directory or approved_dir()
     directory.mkdir(mode=0o755, parents=True, exist_ok=True)
     about = dict(manifest.about)

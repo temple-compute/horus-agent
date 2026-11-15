@@ -21,6 +21,7 @@ import stat
 from pathlib import Path
 
 from horus_agent import native
+from horus_agent.manifest import bad_path
 from horus_agent.protocol import PolicyRefusedError
 
 DIR_MODE = 0o755
@@ -56,6 +57,8 @@ def seal(
     Raises:
         PolicyRefusedError: Something in the way cannot be removed.
     """
+    if not rel or any(bad_path(part) or "/" in part for part in rel):
+        raise PolicyRefusedError(f"{'/'.join(rel)!r} is not a plain path")
     fd = os.open(base, _DIR)
     try:
         for part in rel[:-1]:

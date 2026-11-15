@@ -28,7 +28,12 @@ from urllib.parse import urlsplit
 
 import pydantic
 
-from horus_agent.manifest import Manifest, file_digest
+from horus_agent.manifest import (
+    Manifest,
+    ManifestError,
+    check_paths,
+    file_digest,
+)
 from horus_agent.native import digest
 from horus_agent.policy import Approvals, Policy
 from horus_agent.protocol import ARGS, PROTOCOL, Args, Op, PolicyRefusedError
@@ -546,11 +551,21 @@ class Guard:
 
     def layout_names(self, manifest: Manifest | None) -> frozenset[str]:
         """Names a run's folder or a task's working directory may hold."""
+        if manifest is not None:
+            self.plain(manifest)
         return (
             HORUS_OWN
             | SIDE_NAMES
             | frozenset(manifest.layout if manifest else ())
         )
+
+    @staticmethod
+    def plain(manifest: Manifest) -> None:
+        """Refuse, at use time, a stored approval with an unsafe path."""
+        try:
+            check_paths(manifest)
+        except ManifestError as exc:
+            raise PolicyRefusedError(str(exc)) from exc
 
     def check_layout(
         self, run_id: str | None, path: Path, manifest: Manifest | None
@@ -693,6 +708,7 @@ class Guard:
         """
         found = self._declared.get(manifest.release_hash)
         if found is None:
+            self.plain(manifest)
             paths = {p for p, _d in manifest.consts}
             found = tuple(
                 (p, p.rsplit("/", 1)[-1], d)

@@ -202,6 +202,7 @@ class Manifest:
             layout=tuple(raw.get("layout") or ()),
             consts=tuple((str(p), str(d)) for p, d in raw.get("consts") or ()),
         )
+        check_paths(manifest)
         if raw.get("release_hash") != manifest.release_hash:
             raise ManifestError("Stored hash does not match the manifest")
         if manifest.body.get("schema") != SCHEMA:
@@ -345,6 +346,42 @@ def _check_text(value: Any, where: str = "") -> None:
                 )
 
 
+def bad_path(raw: str) -> str | None:
+    """
+    Why *raw* is not a plain relative path made of plain names (empty,
+    ``.``, ``..``, absolute, NUL, backslash, or a part that changes under
+    Unicode normalisation or ends in a dot or space), else ``None``.
+    """
+    if not raw or raw.startswith("/") or "\x00" in raw or "\\" in raw:
+        return "empty, absolute or holds NUL or backslash"
+    for part in raw.split("/"):
+        if (
+            part in ("", ".", "..")
+            or part != part.strip()
+            or part.endswith(".")
+            or unicodedata.normalize("NFKC", part) != part
+            or unicodedata.normalize("NFC", part) != part
+        ):
+            return f"part {part!r} is not a plain name"
+    return None
+
+
+def check_path(raw: Any, where: str) -> None:
+    """Refuse a declared path that is not a plain relative one."""
+    if isinstance(raw, str) and (why := bad_path(raw)):
+        raise ManifestError(f"{where}: path {raw!r} refused ({why})")
+
+
+def check_paths(manifest: "Manifest") -> None:
+    """Refuse a manifest that declares a path outside the plain shapes."""
+    for path, _digest in manifest.consts:
+        check_path(path, "Shipped file")
+    for name in manifest.layout:
+        check_path(name, "Layout name")
+    for task_id in manifest.tasks:
+        check_path(task_id.split("[", 1)[0], "Task id")
+
+
 def _archive_path(raw: str) -> str:
     """Where tc-os bundles the file of a declared input *raw* path."""
     if not raw.startswith("/"):
@@ -391,8 +428,9 @@ class _Builder:
 
     def _declare(self, raw: Any) -> None:
         """Note the names a declared path puts at the top of a folder."""
-        if not isinstance(raw, str) or not raw:
+        if not isinstance(raw, str):
             return
+        check_path(raw, "Declared path")
         path = _archive_path(raw)
         self.layout.update({path.split("/", 1)[0], posixpath.basename(path)})
 
@@ -409,6 +447,7 @@ class _Builder:
             fed[key] = str(edge.get("source") or "")
         for task in _items(workflow.get("tasks")):
             task_id = str(task.get("id"))
+            check_path(task_id, "Task id")
             sub = task.get("sub") or task.get("body")
             if task.get("kind") == "subworkflow" or isinstance(sub, dict):
                 if not isinstance(sub, dict):
@@ -436,6 +475,7 @@ class _Builder:
     ) -> dict[str, Any]:
         task_id = str(task.get("id"))
         where = f"Task {task_id!r}"
+        check_path(task_id, where)
         self.layout.add(task_id.split("/", 1)[0])
         for artifact in [
             *_items(task.get("inputs")),
@@ -549,6 +589,7 @@ class _Builder:
                 else _str(value)
             )
             return {"kind": kind, "role": "constant", "value": rendered}
+        check_path(artifact.get("path"), f"Input of task {task_id!r}")
         if kind not in VALUE_KINDS and isinstance(artifact.get("path"), str):
             digest = self._bundled(_archive_path(artifact["path"]))
             if digest is not None:
@@ -620,6 +661,7 @@ class _Builder:
                     f"{where}: script {script!r} must name one bundled input"
                 )
         else:
+            check_path(script, where)
             digest = self._bundled(_archive_path(script))
             if digest is None or digest.startswith("deep:"):
                 raise ManifestError(
