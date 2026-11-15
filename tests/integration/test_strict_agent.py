@@ -396,12 +396,10 @@ async def test_a_real_runtime_run_passes_the_strict_agent(
     # The monitor's read-backs: quiet, from the task's own working dir.
     (cwd,) = (real_agent / "crunch").iterdir()
     assert EXECUTION_ID.fullmatch(cwd.name)
-    await asyncio.sleep(1.5)  # the sampler writes its file as the job ends
     with running_task("crunch"):
-        host = await target.get_file(str(cwd / ".horus_host.txt"))
-        usage = await target.get_file(str(cwd / ".horus_resource.txt"))
-    assert host.startswith(b"hostname=lab")
-    assert b"Maximum resident set size" in usage
+        for name in (".horus_host.txt", ".horus_resource.txt"):
+            with pytest.raises(TaskExecutionError, match="Uploads are off"):
+                await target.get_file(str(cwd / name))
     await _refused_below_the_execution_dir(target, real_agent / "crunch", cwd)
 
 

@@ -322,3 +322,14 @@ def test_doctor_shows_the_resolved_policy_path(mac_etc: Path) -> None:
         ]
         is None
     )
+
+
+def test_resource_usage_is_accepted_and_ignored(
+    policy_dir: Path, tmp_path: Path
+) -> None:
+    write_policy(policy_dir, "resource_usage = false\n")
+    rules = policy.load_policy(str(tmp_path), URL)
+    assert rules.strict and "resource_usage" not in rules.describe()
+    write_policy(policy_dir, 'resource_usage = "yes"\n')
+    with pytest.raises(policy.PolicyError, match="bool"):
+        policy.load_policy(str(tmp_path), URL)

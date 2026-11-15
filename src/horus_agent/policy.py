@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from horus_runtime.logging import horus_logger
+
 from horus_agent import config
 from horus_agent.config import JobsPolicy
 from horus_agent.manifest import Manifest, ManifestError, check_paths
@@ -55,8 +57,6 @@ class Policy:
     """Whether files other than run metadata may leave the machine."""
     logs: str = "off"
     """``full`` or ``off``: whether task output is sent back."""
-    resource_usage: bool = True
-    """Whether resource samples are taken and may be read back."""
     allow_same_user: bool = False
     """Strict mode without ``[jobs] run_as``: tasks run as the agent."""
     max_put_bytes: int = 4 * 1024 * 1024
@@ -101,7 +101,6 @@ class Policy:
             "uploads": self.uploads,
             "downloads": self.downloads,
             "logs": self.logs,
-            "resource_usage": self.resource_usage,
         }
 
     def describe(self) -> dict[str, Any]:
@@ -116,7 +115,6 @@ _BOOLS = (
     "require_release",
     "downloads",
     "uploads",
-    "resource_usage",
     "allow_same_user",
 )
 _INTS = (
@@ -240,6 +238,12 @@ def _parse(  # noqa: PLR0912
     jobs = raw.pop("jobs", {})
     data = raw.pop("data", {})
     raw.pop("host_info", None)  # reserved
+    if "resource_usage" in raw:  # older files: accepted, no longer used
+        _typed(raw.pop("resource_usage"), bool, "resource_usage", src)
+        horus_logger.log.info(
+            f"{src}: resource_usage is ignored; strict agents run commands "
+            'unmodified (use mode = "open" for resource profiling)'
+        )
     values: dict[str, Any] = dict(defaults)
     for key in ("mode", "logs", "work_dir", "audit_log"):
         if key in raw:
