@@ -20,6 +20,78 @@ CONFIG_ENV = "HORUS_AGENT_CONFIG"
 POLICY_PATH = Path("/etc/horus-agent/policy.toml")
 """Settings only root may change; the agent never writes here."""
 POLICY_OWNERS = frozenset({0})
+_MAX_LINKS = 40
+
+
+def protected_real_path(path: Path) -> Path:
+    """
+    The real path of *path*, after checking that only root can change it.
+
+    *path* itself must not be a symlink. A symlink in the directories above
+    it (``/etc`` on macOS) is followed when its owner is in
+    :data:`POLICY_OWNERS`, since only that owner can retarget it. Every
+    component of the resolved path must be owned by root and not writable
+    by group or others (a sticky directory such as ``/tmp`` is fine above
+    *path*). Use the returned path, not *path*, to read or write.
+
+    Raises:
+        ValueError: Someone else could change *path*; the message names the
+            component and why.
+        OSError: *path* or a component does not exist.
+    """
+    cur = Path("/")
+    todo = [(name, False) for name in reversed(path.parts[1:])]
+    if todo:
+        todo[0] = (todo[0][0], True)
+    links = 0
+    while todo:
+        name, final = todo.pop()
+        if name == "..":
+            cur = cur.parent
+            continue
+        nxt = cur / name
+        info = nxt.lstat()
+        if not stat.S_ISLNK(info.st_mode):
+            cur = nxt
+            continue
+        if final:
+            raise ValueError(f"{nxt} must not be a symlink")
+        if info.st_uid not in POLICY_OWNERS:
+            raise ValueError(
+                f"{nxt} is a symlink that root does not own: replace it with "
+                "a directory or a root-owned symlink"
+            )
+        links += 1
+        if links > _MAX_LINKS:
+            raise ValueError(f"{path}: too many symlinks")
+        target = Path(os.readlink(nxt))
+        if target.is_absolute():
+            cur = Path("/")
+        todo.extend(
+            (n, False) for n in reversed(target.parts[target.is_absolute() :])
+        )
+    for part in (cur, *cur.parents):
+        info = part.lstat()
+        if info.st_uid not in POLICY_OWNERS:
+            raise ValueError(f"{part} must be owned by root")
+        if info.st_mode & 0o022 and not (
+            part != cur and info.st_mode & stat.S_ISVTX
+        ):
+            raise ValueError(f"{part} must not be writable by group or others")
+    return cur
+
+
+def read_protected(path: Path) -> str:
+    """
+    Text of the root-protected file *path*, read through the checked real
+    path without following a symlink at the end.
+
+    Raises:
+        ValueError: As :func:`protected_real_path`.
+    """
+    fd = os.open(protected_real_path(path), os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(fd) as fh:
+        return fh.read()
 
 
 @dataclass(frozen=True)
@@ -43,24 +115,19 @@ def load_jobs_policy(path: Path | None = None) -> JobsPolicy:
     when the file is missing.
 
     Raises:
-        ValueError: *path* or a directory above it is not owned by root or
-            is writable by group or others (a sticky directory such as
-            ``/tmp`` is fine), so the agent's user could change it.
+        ValueError: *path* or a directory above it is not owned by root,
+            is a symlink root does not own, or is writable by group or
+            others (a sticky directory such as ``/tmp`` is fine), so the
+            agent's user could change it.
     """
     path = path or POLICY_PATH
     if not path.exists():
         return JobsPolicy()
-    for item in (path, *path.parents):
-        info = item.stat()
-        writable = info.st_mode & 0o022 and not (
-            item != path and info.st_mode & stat.S_ISVTX
-        )
-        if info.st_uid not in POLICY_OWNERS or writable:
-            raise ValueError(
-                f"{path}: {item} must be owned by root and not writable by "
-                "group or others"
-            )
-    jobs = tomllib.loads(path.read_text()).get("jobs", {})
+    try:
+        text = read_protected(path)
+    except ValueError as exc:
+        raise ValueError(f"{path}: {exc}") from exc
+    jobs = tomllib.loads(text).get("jobs", {})
     return JobsPolicy(
         run_as=str(jobs.get("run_as", "")),
         run_as_via=str(jobs.get("run_as_via", "sudo")),

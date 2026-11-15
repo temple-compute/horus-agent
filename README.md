@@ -286,6 +286,7 @@ The broker HTTP API is described in `src/horus_agent/protocol.py`. Temple Comput
 - Output from `run_command(detach=False)` is buffered and capped at 4 MiB. Long-running commands go through `launch`, the default for this target.
 - The `python_function_external` executor is refused: it would load bytes written on the agent's machine as code in the orchestrator.
 - A strict agent runs only approved releases (see above).
+- Platforms: Linux is supported and tested. macOS is best effort and untested; known limits are no `setpriv` (use `run_as_via = "sudo"`), no `/proc` (no resource samples, and the pid-reuse check is skipped), and group inheritance of the work dir that follows BSD rules.
 - Without `run_as`, task commands run as the agent's Unix user and can read its config file. Set `run_as` on any machine others use.
 
 ## Development

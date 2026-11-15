@@ -252,3 +252,73 @@ def test_cli_policy_check(
     assert json.loads(capsys.readouterr().out)["mode"] == "strict"
     write_policy(policy_dir, "mode = 3\n")
     assert cli.main(["policy", "check"]) == 1
+
+
+@pytest.fixture
+def mac_etc(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``etc -> private/etc``, as on macOS, with the policy in it."""
+    root = tmp_path / "root"
+    real = root / "private" / "etc" / "horus-agent"
+    real.mkdir(parents=True, mode=0o755)
+    for part in (root, root / "private", root / "private" / "etc", real):
+        part.chmod(0o755)
+    (root / "etc").symlink_to("private/etc")
+    monkeypatch.setattr(
+        config, "POLICY_PATH", root / "etc/horus-agent/policy.toml"
+    )
+    monkeypatch.setattr(config, "POLICY_OWNERS", frozenset({0, os.getuid()}))
+    write_policy(real, 'mode = "open"\n')
+    return root
+
+
+def test_root_owned_symlink_in_parents_is_followed(
+    mac_etc: Path, tmp_path: Path
+) -> None:
+    rules = policy.load_policy(str(tmp_path), URL)
+    assert not rules.strict
+    assert config.load_jobs_policy() == config.JobsPolicy()
+    real = mac_etc / "private/etc/horus-agent/policy.toml"
+    assert config.protected_real_path(config.POLICY_PATH) == real
+
+
+def test_symlink_in_parents_of_someone_else_is_refused(
+    mac_etc: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert mac_etc.is_dir()
+    monkeypatch.setattr(config, "POLICY_OWNERS", frozenset({0}))
+    with pytest.raises(policy.PolicyError, match="etc is a symlink that root"):
+        policy.load_policy(str(tmp_path), URL)
+    with pytest.raises(ValueError, match="symlink that root"):
+        config.load_jobs_policy()
+
+
+def test_resolved_parent_writable_is_refused(
+    mac_etc: Path, tmp_path: Path
+) -> None:
+    (mac_etc / "private/etc").chmod(0o775)
+    with pytest.raises(policy.PolicyError, match="private/etc must not be w"):
+        policy.load_policy(str(tmp_path), URL)
+
+
+def test_final_symlink_is_refused_behind_a_parent_symlink(
+    mac_etc: Path, tmp_path: Path
+) -> None:
+    real = mac_etc / "private/etc/horus-agent"
+    (real / "policy.toml").rename(tmp_path / "p.toml")
+    (real / "policy.toml").symlink_to(tmp_path / "p.toml")
+    with pytest.raises(
+        policy.PolicyError, match=r"policy\.toml must not be a sym"
+    ):
+        policy.load_policy(str(tmp_path), URL)
+    with pytest.raises(ValueError, match="must not be a symlink"):
+        config.load_jobs_policy()
+
+
+def test_doctor_shows_the_resolved_policy_path(mac_etc: Path) -> None:
+    checks = dict(cli._doctor_checks())
+    assert (
+        checks[
+            f"policy file (at {mac_etc}/private/etc/horus-agent/policy.toml)"
+        ]
+        is None
+    )
