@@ -653,7 +653,13 @@ class OpRunner:
         with contextlib.suppress(ProcessLookupError):
             pgid = os.getpgid(pid)
         if self.guard is not None:
-            self.guard.add_job(run_id, Path(job_dir), pid=pid, pgid=pgid)
+            self.guard.add_job(
+                run_id,
+                Path(job_dir),
+                pid=pid,
+                pgid=pgid,
+                start=_proc_start(pid),
+            )
         if run_id is not None and pgid is not None:
             self._run_jobs.setdefault(run_id, {})[job_dir] = pgid
             log.debug(f"Job pid {pid} (group {pgid}) belongs to run {run_id}")
@@ -751,7 +757,7 @@ class OpRunner:
                     continue
                 pid, pgid = job.get("pid"), job.get("pgid")
                 # Only a group the recorded job still leads.
-                if _leads(pid, pgid):
+                if _leads(pid, pgid, job.get("start")):
                     stopped += await self._signal(pgid, signal.SIGKILL)
                 if slurm_id := job.get("slurm_job_id"):
                     with contextlib.suppress(RuntimeError):
@@ -890,7 +896,7 @@ class OpRunner:
             if (
                 info.get("pgid")
                 and guard_mod.job_running(Path(job_dir), info)
-                and _leads(info.get("pid"), info["pgid"])
+                and _leads(info.get("pid"), info["pgid"], info.get("start"))
             ):
                 jobs.setdefault(job_dir, info["pgid"])
         for job_dir, info in ((record or {}).get("jobs") or {}).items():
@@ -916,10 +922,27 @@ class OpRunner:
         return killed
 
 
-def _leads(pid: int | None, pgid: int | None) -> bool:
-    """Whether process *pid* is still in group *pgid* (its recorded one)."""
+def _proc_start(pid: int) -> str | None:
+    """Boot id and start time of process *pid*: who a pid was, for good."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return None
+    return f"{boot}:{raw[raw.rfind(')') + 2 :].split()[19]}"
+
+
+def _leads(
+    pid: int | None, pgid: int | None, start: str | None = None
+) -> bool:
+    """
+    Whether process *pid* is still the one recorded (same boot and start
+    time, where the system tells) and in its recorded group *pgid*.
+    """
     if not pid or not pgid:
         return False
+    if start is not None and _proc_start(pid) != start:
+        return False  # the pid was reused
     try:
         return os.getpgid(pid) == pgid
     except ProcessLookupError:

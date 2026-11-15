@@ -17,10 +17,10 @@ from typing import Any
 
 import pytest
 
-from horus_agent import launch, policy
+from horus_agent import launch, ops, policy
 from horus_agent.manifest import Manifest, ManifestError
 from horus_agent.template import unsafe_placeholders
-from tests.unit.test_guard import Env, env, refused
+from tests.unit.test_guard import RUN1, Env, env, refused
 from tests.unit.test_policy_hardening import manifest, wait_exit
 
 __all__ = ["env"]
@@ -369,3 +369,42 @@ def test_the_scan_stays_fast_and_refuses_what_it_cannot_bound(
     found = unsafe_placeholders(command, {"x"})
     assert time.monotonic() - started < 1.0
     assert found
+
+
+# --- minors: a recycled pid is not the job ----------------------------------
+
+
+async def test_cancel_run_spares_a_recycled_pid_that_leads_its_own_group(
+    env: Env,
+) -> None:
+    import contextlib
+    import os
+    import signal
+    import subprocess
+
+    stranger = subprocess.Popen(["sleep", "60"], start_new_session=True)
+    try:
+        await env.call("mkdir", path=str(env.run / "o"))
+        # recorded as another process with this pid, then reused
+        env.guard.add_job(
+            RUN1,
+            env.run / "j1",
+            pid=stranger.pid,
+            pgid=stranger.pid,
+            start="boot:1",
+        )
+        await env.call("cancel_run", release="basic")
+        assert stranger.poll() is None
+        env.guard.add_job(
+            RUN1,
+            env.run / "j2",
+            pid=stranger.pid,
+            pgid=stranger.pid,
+            start=ops._proc_start(stranger.pid),
+        )
+        assert await env.call("cancel_run", release="basic") == 1
+        stranger.wait(timeout=5)
+    finally:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(stranger.pid, signal.SIGKILL)
+        stranger.wait()
