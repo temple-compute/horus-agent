@@ -148,7 +148,8 @@ def unpack(  # noqa: PLR0913, PLR0917
     marker). With *sha* the caller already decided to extract (the
     package's digest when it checked it): the marker is not read again.
     With *trust*, a tree it approves may hold code names; returns whether
-    that was needed.
+    that was needed. With *strip_exec* (a strict agent) the package holds
+    regular files and folders only: a link or special file refuses it.
     macOS ``.DS_Store`` and ``._*`` files are left out.
     """
     marker = dest.parent / f".{dest.name}.horus-sha256"
@@ -168,6 +169,11 @@ def unpack(  # noqa: PLR0913, PLR0917
                 base = member.name.rstrip("/").rsplit("/", 1)[-1]
                 if base == ".DS_Store" or base.startswith("._"):
                     continue
+                if strip_exec and not (member.isfile() or member.isdir()):
+                    raise PolicyRefusedError(
+                        f"{member.name!r} is a link or special file; a "
+                        "package holds regular files and folders only"
+                    )
                 members.append(member)
                 total += member.size
                 if max_files is not None and len(members) > max_files:

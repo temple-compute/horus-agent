@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from horus_agent import native
+from horus_agent import native, seal
 from horus_agent.blobs import open_file
 from horus_agent.guard import SAFE_PATH, Admitted, Guard, name_problem
 from horus_agent.manifest import (
@@ -220,10 +220,46 @@ async def _verified(src: Path, store: Path, expected: str, name: str) -> Path:
         )
     except FileNotFoundError:
         raise PolicyRefusedError(f"{name!r} is missing") from None
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         raise PolicyRefusedError(
             f"{name!r} is not the approved file or folder: {exc}"
         ) from exc
+
+
+async def _seal(
+    guard: Guard,
+    run_id: str | None,
+    manifest: Manifest,
+    cwd: Path,
+) -> None:
+    """
+    Put the agent's verified copy of every shipped file or folder that sits
+    where a command could run it by its literal path (see
+    :mod:`horus_agent.seal`), and note each as sealed. A path that cannot
+    be sealed refuses the launch.
+    """
+    root = next(r for r in guard.roots(run_id) if cwd.is_relative_to(r))
+    found: dict[str, list[tuple[Path, tuple[str, ...]]]] = {}
+    for base, rel, content in guard.seal_plan(manifest, cwd, root):
+        if seal.occupied(base, rel):
+            found.setdefault(content, []).append((base, rel))
+    for content, places in found.items():
+        stored, problem = None, None
+        for base, rel in places:  # one place holding the real thing will do
+            try:
+                stored = await _verified(
+                    base.joinpath(*rel), guard.const_store, content, rel[-1]
+                )
+                break
+            except PolicyRefusedError as exc:
+                problem = problem or exc
+        if stored is None:
+            raise problem or PolicyRefusedError("nothing to seal")
+        for base, rel in places:
+            target = base.joinpath(*rel)
+            await asyncio.to_thread(seal.seal, base, rel, stored, guard.owners)
+            await asyncio.to_thread(seal.verify, target, content)
+            guard.add_sealed(run_id, target)
 
 
 def job_home(guard: Guard, job_dir: Path) -> Path:
@@ -329,6 +365,7 @@ async def prepare(
         raise PolicyRefusedError(f"Task {task_id!r} runs through {method}")
     job_dir = guard.confine_bound(run_id, args.job_dir)
     cwd = _working_dir(guard, run_id, args.cwd, admitted.manifest)
+    await _seal(guard, run_id, admitted.manifest, cwd)
     await _check_python(guard, admitted.manifest, cwd, run_id, python_version)
     store = guard.const_store
     script = None

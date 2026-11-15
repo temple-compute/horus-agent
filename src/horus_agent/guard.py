@@ -213,6 +213,8 @@ class Admitted:
     """``unpack``: the package's digest, taken once when it was checked."""
     unpacked: bool = False
     """``unpack``: the destination already holds this package."""
+    same: bool = False
+    """``put_file``: the file already holds exactly these bytes."""
 
 
 class Guard:
@@ -259,6 +261,7 @@ class Guard:
             folder.chmod(mode)
         self.spilled: set[str] = set()
         """Spill files this agent wrote, the only ones it hands back."""
+        self._declared: dict[str, tuple[tuple[str, str, str], ...]] = {}
 
     @property
     def owners(self) -> frozenset[int]:
@@ -344,6 +347,8 @@ class Guard:
             self.check_writable(
                 op.run_id, paths[name], op.method, manifest=manifest
             )
+            if not (op.method == "mkdir" and paths[name].is_dir()):
+                self.check_sealed(op.run_id, paths[name], op.method)
         return Admitted(args, manifest, task, paths)
 
     def _bound_control(self, op: Op) -> bool:
@@ -660,17 +665,99 @@ class Guard:
             d == content for d in self._exact(path, manifest)
         )
 
+    def declared(self, manifest: Manifest) -> tuple[tuple[str, str, str], ...]:
+        """
+        What *manifest* ships, as ``(declared path, name, digest)``: each
+        file or folder it bundles (not the files inside a folder), and the
+        name the runtime stages it under (the last part of its path).
+        """
+        found = self._declared.get(manifest.release_hash)
+        if found is None:
+            paths = {p for p, _d in manifest.consts}
+            found = tuple(
+                (p, p.rsplit("/", 1)[-1], d)
+                for p, d in manifest.consts
+                if not any(
+                    "/".join(parts[:i]) in paths
+                    for parts in [p.split("/")]
+                    for i in range(1, len(parts))
+                )
+            )
+            self._declared[manifest.release_hash] = found
+        return found
+
+    def _names(self, manifest: Manifest) -> list[tuple[str, str]]:
+        """Each shipped path (members of a folder too) and its digest, and
+        each declared file or folder under the name the runtime stages.
+        """
+        return [
+            *manifest.consts,
+            *((n, d) for _p, n, d in self.declared(manifest)),
+        ]
+
     def _exact(self, path: Path, manifest: Manifest) -> list[str]:
-        """Digests *manifest* ships at *path* (a declared path ends it)."""
+        """Digests *manifest* ships at *path* (a declared path or the name
+        the runtime stages it under ends it).
+        """
         rel = "/" + path.relative_to(self.work_dir).as_posix()
-        return [d for p, d in manifest.consts if rel.endswith("/" + p)]
+        return [d for p, d in self._names(manifest) if rel.endswith("/" + p)]
 
     def holds_shipped(self, path: Path, manifest: Manifest | None) -> bool:
         """Whether *path* is, or is inside, a path the release ships."""
         if manifest is None:
             return False
         rel = "/" + path.relative_to(self.work_dir).as_posix() + "/"
-        return any(f"/{p}/" in rel for p, _d in manifest.consts)
+        return any(f"/{p}/" in rel for p, _d in self._names(manifest))
+
+    def seal_plan(
+        self, manifest: Manifest, cwd: Path, root: Path
+    ) -> list[tuple[Path, tuple[str, ...], str]]:
+        """
+        Where a command may run a shipped file or folder by its literal
+        path: ``(folder, path below it, digest)``, for each place the
+        release declares (its own path, or its name where the runtime
+        stages it) in the working directory and each folder up to the
+        run's. Members of a shipped folder are sealed with it.
+        """
+        bases = [cwd]
+        while bases[-1] != root:
+            bases.append(bases[-1].parent)
+        plan: dict[Path, tuple[Path, tuple[str, ...], str]] = {}
+        for path, name, content in self.declared(manifest):
+            for base in bases:
+                for rel in {tuple(path.split("/")), (name,)}:
+                    plan[base.joinpath(*rel)] = (base, rel, content)
+        return sorted(plan.values())
+
+    def add_sealed(self, run_id: str | None, path: Path) -> None:
+        """Remember that the agent sealed *path* for a launch."""
+        record = self.run_record(run_id)
+        if run_id is None or record is None:
+            return
+        if str(path) not in record.setdefault("sealed", []):
+            record["sealed"].append(str(path))
+            self._save(run_id, record)
+
+    def check_sealed(self, run_id: str | None, path: Path, how: str) -> None:
+        """Refuse changing a sealed path, or a folder around or inside one,
+        while a job of the run is running.
+        """
+        record = self.run_record(run_id) or {}
+        for sealed in map(Path, record.get("sealed") or ()):
+            if not (
+                path == sealed
+                or path.is_relative_to(sealed)
+                or sealed.is_relative_to(path)
+            ):
+                continue
+            if any(
+                job_running(Path(d), j)
+                for d, j in (record.get("jobs") or {}).items()
+            ):
+                raise PolicyRefusedError(
+                    f"{how} refused: {sealed.name!r} is in use by a running "
+                    "task"
+                )
 
     def trusts_tree(
         self, manifest: Manifest | None, dest: Path

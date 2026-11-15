@@ -558,10 +558,12 @@ async def test_task_launch_runs_the_agents_copy_of_inputs(env: Env) -> None:
     copy = env.guard.const_store / digest(env.run / "ref.fa") / "ref.fa"
     assert copy.read_bytes() == REF
     assert copy.stat().st_mode & 0o777 == 0o640
-    # The cloud's file may change; what runs is the verified copy, which
-    # no op can reach.
+    # A shipped name takes its shipped bytes only; what runs is the verified
+    # copy, which no op can reach.
     data = base64.b64encode(b"x").decode()
-    await env.call("put_file", path=str(env.run / "ref.fa"), data=data)
+    await refused(
+        env, "put_file", "ships", path=str(env.run / "ref.fa"), data=data
+    )
     assert copy.read_bytes() == REF
     await refused(env, "put_file", "agent's own", path=str(copy), data=data)
     await refused(env, "remove", "agent's own", path=str(copy.parent))

@@ -394,6 +394,7 @@ class OpRunner:
                     and path.stat().st_size == len(data)
                     and _read(path) == data
                 )
+                admitted.same = same
                 if not same:
                     guard.check_writable(
                         op.run_id,
@@ -402,6 +403,7 @@ class OpRunner:
                         data,
                         admitted.manifest,
                     )
+                    guard.check_sealed(op.run_id, path, "put_file")
                 if guard_mod.runtime_meta(path):
                     guard.add_meta(op.run_id, path)
             case "unpack":
@@ -419,6 +421,7 @@ class OpRunner:
                     guard.check_writable(
                         op.run_id, dest, "unpack", manifest=admitted.manifest
                     )
+                    guard.check_sealed(op.run_id, dest, "unpack")
             case "poll" | "signal" | "slurm_status" | "slurm_cancel":
                 if policy.strict and not guard.job(
                     op.run_id, paths["job_dir"]
@@ -543,6 +546,8 @@ class OpRunner:
                         await self._signal(os.getpgid(pid), args["sig"])
                 return None
             case "put_file":
+                if admitted is not None and admitted.same:
+                    return None  # the same bytes are already there
                 path = _path(args["path"])
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with blobs.open_file(path, "wb") as fh:
