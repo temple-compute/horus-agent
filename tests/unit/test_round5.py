@@ -72,7 +72,13 @@ async def test_a_shipped_file_is_staged_with_its_content_only(
     )
 
 
-async def test_a_shipped_name_cannot_arrive_by_other_ops(env: Env) -> None:
+async def test_a_shipped_name_cannot_arrive_by_other_ops(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def download(_url: str, path: Path, _limit: int | None) -> None:
+        path.write_bytes(b"touch PWNED\n")
+
+    monkeypatch.setattr("horus_agent.ops.blobs.download_to", download)
     approved = _helper_release()
     policy.approve(approved, "root")
     release = approved.release_hash

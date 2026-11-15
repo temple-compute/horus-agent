@@ -356,17 +356,42 @@ class OpRunner:
             self._answered.popitem(last=False)
         return result
 
+    async def _download(self, guard: Guard, op: Op) -> tuple[Path, str]:
+        """
+        Fetch the file of a ``fetch`` into a temporary file outside the run,
+        without the run's lock (a slow server holds nothing up).
+        """
+        admitted = guard.admit(op, early=True)
+        guard.check_url(op.args["url"], downloads=True)
+        fd, name = tempfile.mkstemp(prefix="horus-fetch-")
+        os.close(fd)
+        tmp = Path(name)
+        try:
+            await blobs.download_to(
+                op.args["url"], tmp, guard.policy.max_fetch_bytes
+            )
+            del admitted
+            return tmp, await asyncio.to_thread(native.digest, tmp)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
     async def _run(self, op: Op) -> OpResult:
+        staged: tuple[Path, str] | None = None
         lock: contextlib.AbstractAsyncContextManager[Any] = (
             self._locks.setdefault(op.run_id, asyncio.Lock())
             if self.guard is not None and op.method in LOCKED and op.run_id
             else contextlib.nullcontext()
         )
         try:
+            if self.guard is not None and op.method == "fetch":
+                staged = await self._download(self.guard, op)
             async with lock:
                 admitted = None
                 if self.guard is not None:
-                    admitted = await self._admit(self.guard, op)
+                    admitted = await self._admit(
+                        self.guard, op, staged[1] if staged else None
+                    )
                     op = op.model_copy(
                         update={
                             "args": {
@@ -378,18 +403,25 @@ class OpRunner:
                             }
                         }
                     )
-                result = await self._dispatch(op, admitted)
+                result = await self._dispatch(
+                    op, admitted, staged[0] if staged else None
+                )
         except Exception as exc:  # reported to the caller
             return OpResult(
                 op_id=op.op_id,
                 error=OpError(type=type(exc).__name__, message=str(exc)),
             )
+        finally:
+            if staged is not None:
+                staged[0].unlink(missing_ok=True)
         return OpResult(op_id=op.op_id, result=result)
 
-    async def _admit(self, guard: Guard, op: Op) -> Admitted:
+    async def _admit(
+        self, guard: Guard, op: Op, content: str | None = None
+    ) -> Admitted:
         """Run the policy checks of *op*, auditing the decision."""
         try:
-            admitted = guard.admit(op)
+            admitted = guard.admit(op, content=content)
             await self._check(guard, op, admitted)
         except PolicyRefusedError as exc:
             guard.audit(op, "refused", str(exc))
@@ -431,7 +463,7 @@ class OpRunner:
                         path,
                         "put_file",
                         data,
-                        admitted.manifest,
+                        manifest=admitted.manifest,
                     )
                     guard.check_sealed(op.run_id, path, "put_file")
                 if guard_mod.runtime_meta(path):
@@ -466,7 +498,10 @@ class OpRunner:
                     )
 
     async def _dispatch(  # noqa: PLR0911, PLR0912, PLR0915
-        self, op: Op, admitted: Admitted | None = None
+        self,
+        op: Op,
+        admitted: Admitted | None = None,
+        staged: Path | None = None,
     ) -> Any:
         args = op.args
         local = self._local
@@ -586,6 +621,11 @@ class OpRunner:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 with blobs.open_file(path, "wb") as fh:
                     fh.write(b64d(args["data"]))
+                return None
+            case "fetch" if staged is not None:
+                await asyncio.to_thread(
+                    blobs.place, staged, _path(args["path"])
+                )
                 return None
             case "fetch":
                 await blobs.download_to(

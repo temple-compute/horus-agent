@@ -6,6 +6,7 @@
 #
 """Regression tests for the seventh review round of the policy work."""
 
+import asyncio
 import dataclasses
 import os
 import threading
@@ -17,7 +18,7 @@ import pytest
 from horus_agent import policy, seal
 from horus_agent.manifest import Manifest, ManifestError
 from horus_agent.protocol import PolicyRefusedError
-from tests.unit.test_guard import Env, env
+from tests.unit.test_guard import Env, env, refused
 from tests.unit.test_policy_hardening import manifest
 
 __all__ = ["env"]
@@ -222,3 +223,69 @@ def test_removal_does_not_cross_a_mount_point(
     with pytest.raises(PolicyRefusedError):
         seal.seal(run, ("cfg",), stored, frozenset({os.geteuid()}))
     assert keep.read_text() == "keep"
+
+
+# --- minors: fetch ---
+
+
+def _big_release(body: bytes) -> Manifest:
+    approved = manifest(
+        "bash run.sh",
+        inputs=[{"id": "s", "kind": "file", "path": "run.sh"}],
+        outputs=[],
+        files={"run.sh": body},
+    )
+    policy.approve(approved, "root")
+    return approved
+
+
+async def test_a_large_constant_arrives_by_fetch_with_its_hash(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    body = b"# pad\n" * (1 << 20)  # over 4 MiB
+    approved = _big_release(body)
+    served = {"data": body}
+
+    async def download(_url: str, path: Path, _limit: int | None) -> None:
+        path.write_bytes(served["data"])
+
+    monkeypatch.setattr("horus_agent.ops.blobs.download_to", download)
+    args: dict[str, Any] = {
+        "release": approved.release_hash,
+        "path": str(env.run / "run.sh"),
+        "url": "https://files.example.org/x",
+    }
+    served["data"] = body + b"touch PWNED\n"
+    await refused(env, "fetch", "ships", **args)
+    assert not (env.run / "run.sh").exists()
+    served["data"] = body
+    await env.call("fetch", **args)
+    assert (env.run / "run.sh").read_bytes() == body
+    assert not list(env.run.glob(".horus-tmp*"))
+
+
+async def test_a_slow_fetch_does_not_hold_the_run_lock(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def download(_url: str, path: Path, _limit: int | None) -> None:
+        started.set()
+        await release.wait()
+        path.write_bytes(b"data")
+
+    monkeypatch.setattr("horus_agent.ops.blobs.download_to", download)
+    fetching = asyncio.create_task(
+        env.call(
+            "fetch",
+            path=str(env.run / "a"),
+            url="https://files.example.org/x",
+        )
+    )
+    await started.wait()
+    try:
+        await asyncio.wait_for(env.call("mkdir", path=str(env.run / "b")), 2)
+    finally:
+        release.set()
+    await fetching
+    assert (env.run / "a").read_bytes() == b"data"

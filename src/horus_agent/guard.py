@@ -304,9 +304,14 @@ class Guard:
 
     # --- envelope ---------------------------------------------------------
 
-    def admit(self, op: Op) -> Admitted:
+    def admit(
+        self, op: Op, *, content: str | None = None, early: bool = False
+    ) -> Admitted:
         """
-        Check *op*'s envelope and confine its paths.
+        Check *op*'s envelope and confine its paths. A ``fetch`` passes the
+        digest of what it downloaded as *content* (the shipped file of that
+        name may be fetched), or *early* when nothing was downloaded yet
+        and the destination is only checked for what no download can fix.
 
         Raises:
             PolicyRefusedError: The op is not allowed.
@@ -354,8 +359,16 @@ class Guard:
             if isinstance(value := getattr(args, name), str)
         }
         for name in WRITES.get(op.method, ()):
+            if early and manifest is not None:
+                # Whatever the shipped file of that name is, the download
+                # decides later; everything else is refused up front.
+                content = next(iter(self._exact(paths[name], manifest)), None)
             self.check_writable(
-                op.run_id, paths[name], op.method, manifest=manifest
+                op.run_id,
+                paths[name],
+                op.method,
+                manifest=manifest,
+                content=content,
             )
             if not (op.method == "mkdir" and paths[name].is_dir()):
                 self.check_sealed(op.run_id, paths[name], op.method)
@@ -915,13 +928,15 @@ class Guard:
         record["meta"].append(str(path))
         self._save(run_id, record)
 
-    def check_writable(
+    def check_writable(  # noqa: PLR0913
         self,
         run_id: str | None,
         path: Path,
         how: str,
         data: bytes | None = None,
+        *,
         manifest: Manifest | None = None,
+        content: str | None = None,
     ) -> None:
         """
         Refuse writing *path* when it is run metadata, a job dir of the run
@@ -931,8 +946,10 @@ class Guard:
         if path.name in RESERVED_NAMES or path.name.endswith(".horus-sha256"):
             raise PolicyRefusedError(f"{how} may not write {path.name}")
         if how != "remove":
-            approved = data is not None and self.shipped(
-                path, file_digest(data), manifest
+            if data is not None:
+                content = file_digest(data)
+            approved = content is not None and self.shipped(
+                path, content, manifest
             )
             self.check_name(path, code_ok=approved)
             if (

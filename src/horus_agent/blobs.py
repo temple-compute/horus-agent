@@ -152,6 +152,27 @@ async def download_to(
     )
 
 
+def place(src: Path, dest: Path) -> None:
+    """
+    Put the downloaded *src* at *dest* in one step: copied beside it and
+    renamed over it, so a reader sees the old file or the new one.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".horus-tmp-{os.getpid()}-{dest.name}")
+    tmp.unlink(missing_ok=True)
+    try:
+        with open(src, "rb") as fin, open_file(tmp, "wb") as out:
+            while chunk := fin.read(_CHUNK):
+                out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+        if dest.is_dir() and not dest.is_symlink():
+            raise IsADirectoryError(dest)
+        tmp.replace(dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 async def download(url: str) -> bytes:
     """GET the presigned *url* into memory."""
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
