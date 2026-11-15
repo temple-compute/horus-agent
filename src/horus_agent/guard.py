@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 
 import pydantic
 
+from horus_agent.blobs import open_file
 from horus_agent.manifest import (
     Manifest,
     ManifestError,
@@ -167,6 +168,8 @@ Names a build tool or a shell runs as code when started in their folder or
 given on its command line. Below the top of a run, a file with one of them
 is staged only where the release declares the name.
 """
+EXECUTION_ID = re.compile(r"[0-9a-f]{32}")
+"""Name of the folder the runtime makes for one run of a task: uuid4 hex."""
 CODE_DIRS = frozenset({"__pycache__", "node_modules", "site-packages"})
 """Folder names interpreters search for code; never allowed."""
 _SHARED_OBJECT = re.compile(r"\.so(\.[0-9]+)*")
@@ -182,6 +185,12 @@ HORUS_OWN = frozenset({".horus", ".horus_job"}) | META_NAMES
 SIDE_NAMES = frozenset({"side-artifacts"})
 """Folders the agent makes in a working directory for a task's samples."""
 """The only hidden names the runtime and the agent write into a run."""
+HOST_FILE = ".horus_host.txt"
+"""The monitor's host snapshot: ``key=value`` lines a task's wrapper writes."""
+HOST_LINE = re.compile(r"[A-Za-z0-9_]{1,64}=[ -~]{0,512}")
+HOST_MAX_BYTES = 8 * 1024
+MONITOR_READS = frozenset({HOST_FILE, ".horus_resource.txt"})
+"""Files the resource monitor polls; their refusals are not warnings."""
 LOG_NAMES = frozenset({"stdout.log", "stderr.log"})
 META_MAX_BYTES = 64 * 1024
 WRITES = {
@@ -620,6 +629,20 @@ class Guard:
                 if not inside:
                     return
                 depth = max(len(t) for t in inside)
+                if depth < len(rel) and EXECUTION_ID.fullmatch(rel[depth]):
+                    # The runtime's per-execution folder of the task: one
+                    # level, whose content follows the working dir's rules.
+                    self.check_execution_dir(root.joinpath(*rel[: depth + 1]))
+                    depth += 1
+
+    @staticmethod
+    def check_execution_dir(path: Path) -> None:
+        """Refuse an execution folder that exists as a link or a file."""
+        if os.path.lexists(path) and (path.is_symlink() or not path.is_dir()):
+            raise PolicyRefusedError(
+                f"{path.name!r} is not a real folder, so nothing may be "
+                "staged there"
+            )
 
     @staticmethod
     def script_problem(name: str, allowed: frozenset[str]) -> str | None:
@@ -1013,8 +1036,10 @@ class Guard:
             return
         if str(path) in self.spilled:
             return
-        meta = str(path) in (record.get("meta") or ()) or (
-            in_job and path.name in ("pid", "exit_code")
+        meta = (
+            str(path) in (record.get("meta") or ())
+            or (in_job and path.name in ("pid", "exit_code"))
+            or self.host_snapshot(path)
         )
         with contextlib.suppress(FileNotFoundError):
             meta = meta and path.lstat().st_size <= META_MAX_BYTES
@@ -1022,6 +1047,26 @@ class Guard:
             raise PolicyRefusedError(
                 f"Uploads are off on this agent; {path.name} stays here"
             )
+
+    def host_snapshot(self, path: Path) -> bool:
+        """
+        Whether *path* is the host snapshot of a task (``.horus_host.txt``)
+        and passes as one: a plain file of ``key=value`` lines, small. With
+        resource usage on, it is read back like the agent's own samples.
+        """
+        if path.name != HOST_FILE or not self.policy.resource_usage:
+            return False
+        try:
+            if not stat.S_ISREG(path.lstat().st_mode):
+                return False
+            with open_file(path) as fh:
+                data = fh.read(HOST_MAX_BYTES + 1)
+        except OSError:
+            return True  # nothing to leak; the read reports it missing
+        if len(data) > HOST_MAX_BYTES:
+            return False
+        lines = data.decode(errors="replace").splitlines()
+        return all(HOST_LINE.fullmatch(line) for line in lines)
 
     def check_url(self, url: str, downloads: bool) -> None:
         """Require https and an allowed host; ``downloads``/``uploads`` on."""

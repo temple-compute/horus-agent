@@ -30,7 +30,13 @@ from typing import Any
 
 from horus_agent import native, seal
 from horus_agent.blobs import open_file
-from horus_agent.guard import SAFE_PATH, Admitted, Guard, name_problem
+from horus_agent.guard import (
+    EXECUTION_ID,
+    SAFE_PATH,
+    Admitted,
+    Guard,
+    name_problem,
+)
 from horus_agent.manifest import (
     RESERVED_ENV,
     VALUE_KINDS,
@@ -146,9 +152,18 @@ def _scan(
     if guard.policy.strict and not guard.policy.allow_same_user:
         allowed = guard.layout_names(manifest)
         mine = os.geteuid()
-        for folder in dict.fromkeys((cwd, root)):
+        between = [p for p in cwd.parents if p.is_relative_to(root)]
+        for folder in dict.fromkeys((cwd, *between)):
             with os.scandir(folder) as entries:
                 for entry in entries:
+                    # Folders between the run's and the working dir hold the
+                    # runtime's per-execution folders of the task.
+                    if (
+                        folder not in (cwd, root)
+                        and EXECUTION_ID.fullmatch(entry.name)
+                        and entry.is_dir(follow_symlinks=False)
+                    ):
+                        continue
                     if (
                         not guard.layout_allows(entry.name, allowed)
                         and entry.stat(follow_symlinks=False).st_uid == mine
