@@ -15,7 +15,6 @@ the strict defaults apply: only approved releases run.
 
 import os
 import pwd
-import stat
 import time
 import tomllib
 from dataclasses import asdict, dataclass, field, replace
@@ -142,23 +141,17 @@ def approved_dir() -> Path:
 def check_protected(path: Path) -> None:
     """
     Require *path* and every parent to be owned by root and not writable by
-    group or others, so only root can change what the agent obeys.
+    group or others, so only root can change what the agent obeys. *path*
+    is not a symlink; a root-owned symlink above it is followed and its
+    target checked the same way.
 
     Raises:
         PolicyError: Someone else could change *path*.
     """
-    for part in (path, *path.parents):
-        info = part.lstat()
-        if stat.S_ISLNK(info.st_mode):
-            raise PolicyError(f"{part} must not be a symlink")
-        if info.st_uid not in config.POLICY_OWNERS:
-            raise PolicyError(f"{part} must be owned by root")
-        if info.st_mode & 0o022 and not (
-            part != path and info.st_mode & stat.S_ISVTX
-        ):
-            raise PolicyError(
-                f"{part} must not be writable by group or others"
-            )
+    try:
+        config.protected_real_path(path)
+    except ValueError as exc:
+        raise PolicyError(str(exc)) from exc
 
 
 def load_policy(work_dir: str, api_url: str) -> Policy:
@@ -183,8 +176,8 @@ def load_policy(work_dir: str, api_url: str) -> Policy:
     if not path.exists():
         return Policy(**defaults)
     try:
-        raw = tomllib.loads(path.read_text())
-    except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        raw = tomllib.loads(config.read_protected(path))
+    except ValueError as exc:  # also bad TOML and bad UTF-8
         raise PolicyError(f"{path}: {exc}") from exc
     policy = _parse(raw, defaults, str(path))
     wd, own = Path(policy.work_dir), Path(work_dir)
@@ -198,9 +191,9 @@ def load_policy(work_dir: str, api_url: str) -> Policy:
 def configured_code_suffixes() -> tuple[str, ...]:
     """``allow_code_suffixes`` of the policy file, empty when unreadable."""
     try:
-        raw = tomllib.loads(policy_path().read_text())
+        raw = tomllib.loads(config.read_protected(policy_path()))
         return tuple(str(x) for x in raw.get("allow_code_suffixes") or ())
-    except (OSError, tomllib.TOMLDecodeError, AttributeError, TypeError):
+    except (OSError, ValueError, AttributeError, TypeError):
         return ()
 
 

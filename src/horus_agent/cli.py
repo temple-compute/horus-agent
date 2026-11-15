@@ -559,7 +559,11 @@ def _doctor_checks() -> list[tuple[str, str | None]]:
         for protected in (path, policy.approved_dir()):
             if protected.exists():
                 policy.check_protected(protected)
-        check("policy file", None)
+        real = os.path.realpath(path)
+        check(
+            "policy file" + (f" (at {real})" if real != str(path) else ""),
+            None,
+        )
     except (policy.PolicyError, OSError) as exc:
         check("policy file", str(exc))
     try:
