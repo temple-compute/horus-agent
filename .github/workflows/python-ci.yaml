@@ -20,7 +20,7 @@ jobs:
           cache: "pip"
 
       - name: Install uv and sync dependencies
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
       - name: Sync project dependencies
         run: uv sync --locked --group dev
@@ -54,7 +54,7 @@ jobs:
           cache: "pip"
 
       - name: Install uv and sync dependencies
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
       - name: Sync project dependencies
         run: uv sync --locked --group dev
@@ -80,7 +80,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
 
       - name: Build the wheel without dev sources
         run: uv build --wheel --no-sources -o dist
